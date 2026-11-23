@@ -24,6 +24,8 @@ pub struct TerminalView {
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     cell: Option<(Pixels, Pixels)>,
     selecting: bool,
+    /// El botón está presionado y se está enviando al programa.
+    mouse_reporting: bool,
     scroll_acc: f32,
     font_size: Pixels,
 }
@@ -78,6 +80,7 @@ impl TerminalView {
             bounds: Rc::new(Cell::new(None)),
             cell: None,
             selecting: false,
+            mouse_reporting: false,
             scroll_acc: 0.,
             font_size: px(13.),
         }
@@ -274,6 +277,12 @@ impl Render for TerminalView {
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     this.focus.focus(window, cx);
                     if let (Some((row, col)), Some(term)) = (this.cell_at(ev.position), &this.term) {
+                        // Con Shift se selecciona texto aunque el programa use el ratón.
+                        if term.mouse_mode() && !ev.modifiers.shift {
+                            term.send_mouse(0, row, col, true);
+                            this.mouse_reporting = true;
+                            return;
+                        }
                         if ev.click_count >= 2 {
                             term.start_selection(row, col, true);
                         } else {
@@ -286,6 +295,12 @@ impl Render for TerminalView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                if this.mouse_reporting && ev.dragging() {
+                    if let (Some((row, col)), Some(term)) = (this.cell_at(ev.position), &this.term) {
+                        term.send_mouse(32, row, col, true);
+                    }
+                    return;
+                }
                 if this.selecting && ev.dragging() {
                     if let (Some((row, col)), Some(term)) = (this.cell_at(ev.position), &this.term) {
                         term.update_selection(row, col);
@@ -295,7 +310,14 @@ impl Render for TerminalView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                    if this.mouse_reporting {
+                        this.mouse_reporting = false;
+                        if let (Some((row, col)), Some(term)) = (this.cell_at(ev.position), &this.term) {
+                            term.send_mouse(0, row, col, false);
+                        }
+                        return;
+                    }
                     this.selecting = false;
                     if let Some(term) = &this.term {
                         if term.selected_text().is_none() {
@@ -314,7 +336,13 @@ impl Render for TerminalView {
                     return;
                 }
                 this.scroll_acc -= lines as f32;
-                if term.alt_screen() {
+                if term.mouse_mode() {
+                    let (row, col) = this.cell_at(ev.position).unwrap_or((0, 0));
+                    let button = if lines > 0 { 64 } else { 65 };
+                    for _ in 0..lines.unsigned_abs() {
+                        term.send_mouse(button, row, col, true);
+                    }
+                } else if term.alt_screen() {
                     let key = if lines > 0 { "\x1b[A" } else { "\x1b[B" };
                     term.write(key.repeat(lines.unsigned_abs() as usize).into_bytes());
                 } else {

@@ -118,7 +118,7 @@ impl Terminal {
         env.insert("COLORTERM".into(), "truecolor".into());
         env.insert("TERM_PROGRAM".into(), "kuaky".into());
         let options = Options {
-            shell: Some(default_shell()),
+            shell: Some(shell_for(launch.command.as_deref())),
             working_directory: Some(launch.cwd.clone()),
             drain_on_exit: true,
             env,
@@ -138,9 +138,7 @@ impl Terminal {
         event_loop.spawn();
 
         let terminal = Self { term, notifier, events: rx, size };
-        if let Some(cmd) = &launch.command {
-            terminal.write(format!("{cmd}\r").into_bytes());
-        } else if let Some(text) = &launch.prefill {
+        if launch.command.is_none() && let Some(text) = &launch.prefill {
             terminal.write(text.clone().into_bytes());
         }
         Ok(terminal)
@@ -210,6 +208,29 @@ impl Terminal {
 
     pub fn app_cursor(&self) -> bool {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// El programa pidió recibir eventos del ratón (Claude Code, vim, htop…).
+    pub fn mouse_mode(&self) -> bool {
+        self.term.lock().mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Envía un evento de ratón en formato SGR (1006) o el clásico X10.
+    /// `button`: 0 izquierdo, 1 medio, 2 derecho, 64 rueda arriba, 65 rueda abajo,
+    /// +32 si es arrastre.
+    pub fn send_mouse(&self, button: u8, row: usize, col: usize, pressed: bool) {
+        let sgr = self.term.lock().mode().contains(TermMode::SGR_MOUSE);
+        let (x, y) = (col + 1, row + 1);
+        let bytes = if sgr {
+            format!("\x1b[<{button};{x};{y}{}", if pressed { 'M' } else { 'm' }).into_bytes()
+        } else {
+            let b = if pressed { button } else { 3 };
+            if x > 222 || y > 222 {
+                return;
+            }
+            vec![0x1b, b'[', b'M', 32 + b, 32 + x as u8, 32 + y as u8]
+        };
+        self.write(bytes);
     }
 
     /// Programas de pantalla completa (vim, less, htop) usan la pantalla alterna.
@@ -401,13 +422,22 @@ fn resolve(color: Color, colors: &alacritty_terminal::term::color::Colors, is_fg
 
 /// Shell de login del usuario: con él se cargan el PATH y la sesión que tienes
 /// en tu terminal (importante en macOS, donde las apps del Dock no heredan PATH).
-fn default_shell() -> Shell {
+///
+/// Con `command`, el shell lo ejecuta directamente (sin teclearlo, así no queda
+/// eco en pantalla) y al terminar deja un shell interactivo en la misma pestaña.
+fn shell_for(command: Option<&str>) -> Shell {
     #[cfg(unix)]
     {
         let program = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
             if cfg!(target_os = "macos") { "/bin/zsh".into() } else { "/bin/bash".into() }
         });
-        Shell::new(program, vec!["-l".into()])
+        match command {
+            Some(cmd) => {
+                let script = format!("{cmd}; exec '{}' -l", program.replace('\'', "'\\''"));
+                Shell::new(program, vec!["-l".into(), "-i".into(), "-c".into(), script])
+            }
+            None => Shell::new(program, vec!["-l".into()]),
+        }
     }
     #[cfg(windows)]
     {
@@ -415,7 +445,11 @@ fn default_shell() -> Shell {
             .map(|p| std::env::split_paths(&p).any(|d| d.join("pwsh.exe").is_file()))
             .unwrap_or(false);
         let program = if pwsh { "pwsh.exe" } else { "powershell.exe" };
-        Shell::new(program.into(), vec!["-NoLogo".into()])
+        let mut args = vec!["-NoLogo".to_string()];
+        if let Some(cmd) = command {
+            args.extend(["-NoExit".into(), "-Command".into(), cmd.to_string()]);
+        }
+        Shell::new(program.into(), args)
     }
 }
 

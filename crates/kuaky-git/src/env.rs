@@ -59,6 +59,63 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Busca la CLI de un agente: primero en el PATH de login y luego en las
+/// carpetas donde otros editores instalan agentes (p. ej. Zed guarda Claude
+/// Code en `external_agents/registry/claude-acp/<versión>/claude`).
+pub fn find_agent(name: &str) -> Option<PathBuf> {
+    if let Some(p) = find_program(name) {
+        return Some(p);
+    }
+    let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for registry in zed_agent_registries() {
+        let Ok(agents) = std::fs::read_dir(&registry) else { continue };
+        for agent in agents.filter_map(Result::ok) {
+            let Ok(versions) = std::fs::read_dir(agent.path()) else { continue };
+            candidates.extend(versions.filter_map(Result::ok).map(|v| v.path().join(&exe)).filter(|p| p.is_file()));
+        }
+    }
+    let home = home_dir();
+    candidates.extend(
+        [".claude/local", ".local/bin", ".bun/bin", ".npm-global/bin"]
+            .iter()
+            .map(|d| home.join(d).join(&exe))
+            .filter(|p| p.is_file()),
+    );
+    // La versión instalada más reciente.
+    candidates.into_iter().max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
+fn zed_agent_registries() -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut dirs = vec![
+        home.join("Library/Application Support/Zed/external_agents/registry"),
+        home.join(".local/share/zed/external_agents/registry"),
+    ];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("Zed/external_agents/registry"));
+    }
+    dirs
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// Texto para ejecutar `path` desde el shell, con comillas si hace falta.
+pub fn shell_command(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        format!("& '{}'", s.replace('\'', "''"))
+    } else if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {
+        s.into_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 /// `Command` con el PATH de login y sin abrir consola en Windows.
 pub fn command(program: &str) -> Command {
     let resolved = find_program(program).map(|p| p.into_os_string()).unwrap_or_else(|| program.into());

@@ -11,6 +11,17 @@ use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
 
 fn main() {
+    // Si kuaky se abrió desde una sesión de Claude Code, no heredar sus marcas:
+    // los agentes que se abren aquí deben comportarse como en tu terminal.
+    // Se hace antes de crear cualquier hilo.
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_") {
+            // SAFETY: todavía no hay otros hilos leyendo el entorno.
+            unsafe { std::env::remove_var(&key) };
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "kuaky=info,kuaky_usage=info".into()),

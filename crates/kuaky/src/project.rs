@@ -36,7 +36,7 @@ pub fn init(cx: &mut App) {
 }
 
 /// Agente (o shell) que se puede abrir en una terminal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Harness {
     Claude,
     Codex,
@@ -161,7 +161,8 @@ pub struct ProjectView {
     tree: Entity<FileTree>,
     panel: SidePanel,
     git: GitState,
-    installed: Vec<Harness>,
+    /// Agentes encontrados en este equipo y la ruta de su CLI.
+    installed: HashMap<Harness, PathBuf>,
     /// Abrir cada agente nuevo en su propio worktree y rama.
     isolate: bool,
     activity: Vec<ActivityRow>,
@@ -186,7 +187,7 @@ impl ProjectView {
             tree,
             panel: SidePanel::Files,
             git: GitState::default(),
-            installed: Vec::new(),
+            installed: HashMap::new(),
             isolate: false,
             focus: cx.focus_handle(),
             _subs: vec![sub],
@@ -209,8 +210,8 @@ impl ProjectView {
                 .spawn(async {
                     Harness::AGENTS
                         .into_iter()
-                        .filter(|h| h.command().is_some_and(|c| kuaky_git::find_program(c).is_some()))
-                        .collect::<Vec<_>>()
+                        .filter_map(|h| Some((h, kuaky_git::find_agent(h.command()?)?)))
+                        .collect::<HashMap<_, _>>()
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -251,7 +252,13 @@ impl ProjectView {
     }
 
     pub fn open_terminal(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
-        let installed = harness == Harness::Shell || self.installed.contains(&harness);
+        if harness != Harness::Shell && !self.installed.contains_key(&harness) {
+            // La detección en segundo plano pudo no haber terminado: buscar ahora.
+            if let Some(path) = harness.command().and_then(kuaky_git::find_agent) {
+                self.installed.insert(harness, path);
+            }
+        }
+        let installed = harness == Harness::Shell || self.installed.contains_key(&harness);
         let mut cwd = self.root.clone();
         let mut worktree = None;
         if installed && self.isolate && harness != Harness::Shell {
@@ -271,7 +278,12 @@ impl ProjectView {
             }
         }
         let launch = if installed {
-            Launch { cwd, command: harness.command().map(str::to_string), prefill: None }
+            // Si la CLI no está en el PATH del shell (p. ej. la instaló Zed), se usa su ruta completa.
+            let command = harness.command().map(|name| match self.installed.get(&harness) {
+                Some(path) if kuaky_git::find_program(name).is_none() => kuaky_git::shell_command(path),
+                _ => name.to_string(),
+            });
+            Launch { cwd, command, prefill: None }
         } else {
             // La CLI no está: abrir un shell con el comando de instalación escrito, sin ejecutarlo.
             Launch { cwd: self.root.clone(), command: None, prefill: harness.install_hint().map(str::to_string) }
@@ -455,7 +467,7 @@ impl ProjectView {
                     .gap_2()
                     .child(side_title("Nueva sesión"))
                     .children(launchers.into_iter().map(|h| {
-                        let installed = h == Harness::Shell || self.installed.contains(&h);
+                        let installed = h == Harness::Shell || self.installed.contains_key(&h);
                         let tip: SharedString = if installed {
                             format!("Abrir {} en esta carpeta", h.label()).into()
                         } else {
@@ -684,7 +696,7 @@ impl ProjectView {
 
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut launchers: Vec<Harness> = self.installed.clone();
+        let mut launchers: Vec<Harness> = Harness::AGENTS.into_iter().filter(|h| self.installed.contains_key(h)).collect();
         launchers.push(Harness::Shell);
         v_flex()
             .size_full()

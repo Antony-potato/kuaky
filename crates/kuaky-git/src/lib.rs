@@ -4,7 +4,7 @@
 mod env;
 mod parse;
 
-pub use env::{command, find_program, login_path};
+pub use env::{command, find_agent, find_program, login_path, shell_command};
 pub use parse::{Branch, Change, ChangeKind, Commit, PullRequest};
 
 use anyhow::{Context as _, bail};
