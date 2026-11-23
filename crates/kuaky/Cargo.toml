@@ -1,0 +1,18 @@
+[package]
+name = "kuaky"
+description = "Editor ligero centrado en agentes de código."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+kuaky-usage.workspace = true
+kuaky-git.workspace = true
+gpui-kit.workspace = true
+anyhow.workspace = true
+jiff.workspace = true
+dirs.workspace = true
+ignore.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

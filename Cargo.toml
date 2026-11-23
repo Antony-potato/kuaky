@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/kuaky"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[workspace.dependencies]
+kuaky-usage = { path = "crates/kuaky-usage" }
+kuaky-git = { path = "crates/kuaky-git" }
+
+# UI: versión exacta, GPUI es pre-1.0 y cambia su API entre versiones.
+gpui-kit = "=0.11.0"
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = "0.2"
+rayon = "1"
+walkdir = "2"
+dirs = "6"
+ignore = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,10 @@
+[package]
+name = "kuaky-git"
+description = "Ramas, cambios y diffs de un repositorio git."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
