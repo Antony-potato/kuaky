@@ -9,6 +9,25 @@ kuaky es un editor de escritorio ligero (macOS + Windows) centrado en agentes. A
 
 ---
 
+## Estado (2026-11-23)
+
+| Fase | Estado | Notas |
+|---|---|---|
+| 0. Fundación | ✅ | Workspace, CI macOS + Windows, repo privado en GitHub |
+| 6. Dashboard de consumo (inicio) | ✅ | Claude Code, Codex y Gemini CLI; KPIs, días, heatmap, modelos, agentes, proyectos recientes |
+| 1. Proyecto y layout | ✅ | Sesiones (izq.), pestañas (centro), archivos / cambios / ramas / PRs (der.) |
+| 2. Terminal | ✅ | `kuaky-term`: alacritty_terminal + shell de login; selección, copiar/pegar, scroll |
+| 3. Sesiones | 🟡 | Lanzadores por agente (detecta las CLIs instaladas), estado trabajando/en espera/terminó, actividad por proyecto. Falta: hooks de estado |
+| 4. Git | ✅ | Cambios locales con diff, diff entre ramas, cambiar de rama |
+| 5. PRs | ✅ | Lista con `gh` y diff de cada PR |
+| 8. Editor | 🟡 | Editor de GPUI Kit con resaltado (syntect) y guardado ⌘S. Falta: LSP, búsqueda |
+| 7. Chat ACP | ⏳ | |
+| 9. Worktrees y distribución | ⏳ | |
+
+Capturas de desarrollo: `cargo run -p kuaky --features screenshot` con `KUAKY_SCREENSHOT=archivo.png` (más `KUAKY_DEMO_TERMINAL`, `KUAKY_DEMO_PANEL`, `KUAKY_DEMO_FILE`, `KUAKY_DEMO_DIFF`).
+
+---
+
 ## 1. Hallazgo clave: ya existen apps de agentes hechas con GPUI
 
 En la lista oficial [awesome-gpui](https://github.com/zed-industries/awesome-gpui) hay más de 20 apps de agentes nativas. Varias tienen **licencia MIT o Apache**, así que podemos copiar y adaptar su código citando el origen.

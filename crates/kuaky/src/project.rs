@@ -103,7 +103,7 @@ impl Harness {
 }
 
 enum TabKind {
-    Terminal { view: Entity<TerminalView>, harness: Harness },
+    Terminal { view: Entity<TerminalView>, harness: Harness, worktree: Option<String> },
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
 }
@@ -162,6 +162,8 @@ pub struct ProjectView {
     panel: SidePanel,
     git: GitState,
     installed: Vec<Harness>,
+    /// Abrir cada agente nuevo en su propio worktree y rama.
+    isolate: bool,
     activity: Vec<ActivityRow>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
@@ -185,6 +187,7 @@ impl ProjectView {
             panel: SidePanel::Files,
             git: GitState::default(),
             installed: Vec::new(),
+            isolate: false,
             focus: cx.focus_handle(),
             _subs: vec![sub],
         };
@@ -249,8 +252,26 @@ impl ProjectView {
 
     pub fn open_terminal(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
         let installed = harness == Harness::Shell || self.installed.contains(&harness);
+        let mut cwd = self.root.clone();
+        let mut worktree = None;
+        if installed && self.isolate && harness != Harness::Shell {
+            if let Some(repo) = &self.repo {
+                let name = format!(
+                    "{}-{}",
+                    harness.command().unwrap_or("agente"),
+                    jiff::Zoned::now().strftime("%m%d-%H%M%S")
+                );
+                match repo.create_worktree(&name) {
+                    Ok(path) => {
+                        cwd = path;
+                        worktree = Some(format!("kuaky/{name}"));
+                    }
+                    Err(err) => tracing::warn!(%err, "no se pudo crear el worktree"),
+                }
+            }
+        }
         let launch = if installed {
-            Launch { cwd: self.root.clone(), command: harness.command().map(str::to_string), prefill: None }
+            Launch { cwd, command: harness.command().map(str::to_string), prefill: None }
         } else {
             // La CLI no está: abrir un shell con el comando de instalación escrito, sin ejecutarlo.
             Launch { cwd: self.root.clone(), command: None, prefill: harness.install_hint().map(str::to_string) }
@@ -259,7 +280,7 @@ impl ProjectView {
         let sub = cx.subscribe(&view, |_, _, _: &TerminalViewEvent, cx| cx.notify());
         let obs = cx.observe(&view, |_, _, cx| cx.notify());
         self._subs.extend([sub, obs]);
-        self.push_tab(TabKind::Terminal { view, harness }, window, cx);
+        self.push_tab(TabKind::Terminal { view, harness, worktree }, window, cx);
     }
 
     fn push_tab(&mut self, kind: TabKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -458,7 +479,45 @@ impl ProjectView {
                             .child(div().flex_1().child(h.label()))
                             .child(div().text_xs().text_color(style::faint()).child(if installed { "+" } else { "instalar" }))
                             .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
-                    })),
+                    }))
+                    .when(self.repo.is_some(), |d| {
+                        let on = self.isolate;
+                        d.child(
+                            h_flex()
+                                .id("isolate")
+                                .mt_1()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(if on { style::text() } else { style::muted() })
+                                .hover(|d| d.bg(style::panel_hover()))
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(
+                                        "Cada agente nuevo trabaja en su propio worktree y rama kuaky/…, sin tocar tu carpeta",
+                                    )
+                                    .build(window, cx)
+                                })
+                                .child(
+                                    div()
+                                        .w(px(26.))
+                                        .h(px(14.))
+                                        .p(px(2.))
+                                        .rounded_full()
+                                        .flex()
+                                        .when(on, |d| d.justify_end())
+                                        .bg(if on { style::soft(style::accent(), 0.8) } else { style::soft(style::faint(), 0.6) })
+                                        .child(div().size(px(10.)).rounded_full().bg(style::text())),
+                                )
+                                .child("Aislar en worktree")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.isolate = !this.isolate;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .child(
                 v_flex()
@@ -471,7 +530,7 @@ impl ProjectView {
                         d.child(div().px_2().text_xs().text_color(style::faint()).child("Ninguna todavía"))
                     })
                     .children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-                        let TabKind::Terminal { view, harness } = &tab.kind else { return None };
+                        let TabKind::Terminal { view, harness, worktree } = &tab.kind else { return None };
                         let t = view.read(cx);
                         let (status, color) = terminal_status(t, now);
                         let selected = self.active == Some(i);
@@ -498,7 +557,10 @@ impl ProjectView {
                                                 .text_color(style::muted())
                                                 .child(div().size(px(6.)).rounded_full().bg(color))
                                                 .child(status),
-                                        ),
+                                        )
+                                        .when_some(worktree.clone(), |d, w| {
+                                            d.child(div().text_xs().text_color(style::faint()).truncate().child(format!("⑂ {w}")))
+                                        }),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| this.activate(i, window, cx))),
                         )
@@ -558,7 +620,7 @@ impl ProjectView {
             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = self.active == Some(i);
                 let (icon, color, title, dirty): (&str, Hsla, SharedString, bool) = match &tab.kind {
-                    TabKind::Terminal { view, harness } => {
+                    TabKind::Terminal { view, harness, .. } => {
                         let t = view.read(cx);
                         let (_, dot) = terminal_status(t, now);
                         (harness.glyph(), dot, t.title.clone().unwrap_or_else(|| t.label.clone()), false)

@@ -67,7 +67,11 @@ impl KuakyApp {
         cx.spawn_in(window, async move |_, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(delay)).await;
             cx.update(|window, cx| {
+                // Dibujar un cuadro nuevo aunque la ventana esté tapada (macOS
+                // deja de pintar ventanas ocultas).
                 window.refresh();
+                let arena = window.draw(cx);
+                arena.clear(cx);
                 match window.render_to_image() {
                     Ok(img) => match img.save(&path) {
                         Ok(()) => tracing::info!(%path, "captura guardada"),

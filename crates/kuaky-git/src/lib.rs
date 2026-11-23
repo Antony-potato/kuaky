@@ -120,6 +120,30 @@ impl Repo {
         self.git(&["checkout", branch]).map(|_| ())
     }
 
+    /// Crea un worktree aislado con su propia rama `kuaky/<name>` a partir de
+    /// HEAD, en `~/.kuaky/worktrees/<repo>/<name>`, y devuelve su ruta.
+    pub fn create_worktree(&self, name: &str) -> anyhow::Result<PathBuf> {
+        self.create_worktree_in(&dirs_home().join(".kuaky").join("worktrees"), name)
+    }
+
+    pub fn create_worktree_in(&self, worktrees_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        if safe.is_empty() || safe.starts_with('-') {
+            bail!("nombre de worktree inválido");
+        }
+        let repo_name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into());
+        let base = worktrees_dir.join(repo_name);
+        std::fs::create_dir_all(&base)?;
+        let path = base.join(&safe);
+        let branch = format!("kuaky/{safe}");
+        let path_str = path.to_string_lossy().into_owned();
+        self.git(&["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
+        Ok(path)
+    }
+
     /// PRs abiertos del repositorio (requiere `gh` con sesión iniciada).
     pub fn pull_requests(&self) -> anyhow::Result<Vec<PullRequest>> {
         let out = gh_in(
@@ -165,6 +189,12 @@ fn run(dir: &Path, program: &str, args: &[&str]) -> anyhow::Result<String> {
         bail!("{}", err.trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn null_device() -> &'static str {
@@ -229,6 +259,22 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].subject, "segundo");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn creates_isolated_worktree() {
+        let dir = temp_repo();
+        std::fs::write(dir.join("a.txt"), "uno\n").unwrap();
+        git_in(&dir, &["add", "."]).unwrap();
+        git_in(&dir, &["commit", "-q", "-m", "primero"]).unwrap();
+        let repo = Repo::discover(&dir).unwrap();
+        let name = format!("prueba-{}", rand_suffix());
+        let wt = repo.create_worktree_in(&dir.join("wt"), &name).unwrap();
+        assert!(wt.join("a.txt").is_file());
+        let wt_repo = Repo::discover(&wt).unwrap();
+        assert_eq!(wt_repo.current_branch().unwrap(), format!("kuaky/{name}"));
+        git_in(&dir, &["worktree", "remove", "--force", &wt.to_string_lossy()]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }
