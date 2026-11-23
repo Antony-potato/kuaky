@@ -1,7 +1,7 @@
 //! Raíz de la ventana: barra de título y pantalla actual (inicio o proyecto).
 
 use crate::home::{HomeEvent, HomeView, tilde};
-use crate::project::{ProjectEvent, ProjectView};
+use crate::project::ProjectView;
 use crate::style;
 use gpui_kit::component::{TitleBar, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -34,8 +34,14 @@ impl KuakyApp {
             HomeEvent::OpenProject(path) => this.open_project(path.clone(), window, cx),
             HomeEvent::PickFolder => this.pick_folder(window, cx),
         });
+        // Cuando termina de cargar el consumo, la vista de proyecto actualiza su actividad.
+        let obs = cx.observe(&home, |this, home, cx| {
+            if let (Some(project), Some(events)) = (&this.project, home.read(cx).events()) {
+                project.update(cx, |p, cx| p.set_usage(&events, cx));
+            }
+        });
         // Abrir directo una carpeta pasada por línea de comandos: `kuaky ~/proyecto`.
-        let mut this = Self { home, project: None, _subscriptions: vec![sub] };
+        let mut this = Self { home, project: None, _subscriptions: vec![sub, obs] };
         if let Some(arg) = std::env::args().nth(1) {
             let path = PathBuf::from(arg);
             if path.is_dir() {
@@ -78,11 +84,15 @@ impl KuakyApp {
 
     fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
-        let project = cx.new(|cx| ProjectView::new(path, window, cx));
-        let sub = cx.subscribe_in(&project, window, |this, _, event: &ProjectEvent, _, cx| match event {
-            ProjectEvent::GoHome => this.go_home(cx),
-        });
-        self._subscriptions.push(sub);
+        let usage = self.home.read(cx).events();
+        let project = cx.new(|cx| ProjectView::new(path, usage, window, cx));
+        #[cfg(feature = "screenshot")]
+        if let Ok(which) = std::env::var("KUAKY_DEMO_TERMINAL") {
+            let harness = if which == "claude" { crate::project::Harness::Claude } else { crate::project::Harness::Shell };
+            project.update(cx, |p, cx| p.open_terminal(harness, window, cx));
+        }
+        #[cfg(feature = "screenshot")]
+        project.update(cx, |p, cx| p.demo(window, cx));
         self.project = Some(project);
         cx.notify();
     }

@@ -9,7 +9,8 @@ publish.workspace = true
 [dependencies]
 kuaky-usage.workspace = true
 kuaky-git.workspace = true
-gpui-kit.workspace = true
+kuaky-term.workspace = true
+gpui-kit = { workspace = true, features = ["syntect"] }
 anyhow.workspace = true
 jiff.workspace = true
 dirs.workspace = true

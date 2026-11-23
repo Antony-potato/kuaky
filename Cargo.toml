@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 kuaky-usage = { path = "crates/kuaky-usage" }
 kuaky-git = { path = "crates/kuaky-git" }
+kuaky-term = { path = "crates/kuaky-term" }
 
 # UI: versión exacta, GPUI es pre-1.0 y cambia su API entre versiones.
 gpui-kit = "=0.11.0"
@@ -32,5 +33,11 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# Poca información de depuración: el build completo de GPUI ocupa varios GB si no.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false

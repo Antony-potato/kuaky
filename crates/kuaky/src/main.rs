@@ -1,7 +1,11 @@
 mod app;
+mod diff_view;
+mod file_tree;
+mod file_view;
 mod home;
 mod project;
 mod style;
+mod terminal_view;
 
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
@@ -19,6 +23,8 @@ fn main() {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
             app::init(cx);
+            project::init(cx);
+            file_view::init(cx);
 
             let mut options = TitleBar::window_options();
             // KUAKY_WINDOW_SIZE=1360x1700 sirve para capturas de desarrollo.

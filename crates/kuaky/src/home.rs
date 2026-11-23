@@ -39,6 +39,11 @@ impl HomeView {
         this
     }
 
+    /// Eventos de consumo ya cargados (para la actividad de cada proyecto).
+    pub fn events(&self) -> Option<Arc<Vec<UsageEvent>>> {
+        self.events.clone()
+    }
+
     /// Vuelve a leer los logs en segundo plano.
     pub fn reload(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
