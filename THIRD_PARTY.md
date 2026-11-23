@@ -4,6 +4,8 @@ Archivos copiados o adaptados de otros proyectos. Cada archivo adaptado indica s
 
 | Archivo de kuaky | Origen | Licencia |
 |---|---|---|
-| _(ninguno todavía)_ | | |
+| `crates/kuaky/assets/icons/*.svg` | [LobeHub Icons](https://github.com/lobehub/lobe-icons), paquete `@lobehub/icons-static-svg` 1.106.0. Los monocromáticos (`anthropic`, `openai`, `grok`, `opencode`) se recolorearon a `#E8EAEE` para el tema oscuro | MIT |
 
 Formatos de logs de agentes documentados a partir de splitrail (MIT), ccusage (MIT) y tokscale (MIT); el código de `kuaky-usage` es propio.
+
+Los logotipos son marcas de sus respectivos dueños (Anthropic, OpenAI, Google, xAI, SST/opencode) y se usan solo para identificar cada herramienta.

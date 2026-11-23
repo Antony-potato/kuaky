@@ -487,7 +487,7 @@ impl ProjectView {
                             .when(!installed, |d| d.opacity(0.45))
                             .hover(|d| d.bg(style::panel_hover()))
                             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
-                            .child(glyph_badge(h.glyph(), h.color()))
+                            .child(harness_badge(h))
                             .child(div().flex_1().child(h.label()))
                             .child(div().text_xs().text_color(style::faint()).child(if installed { "+" } else { "instalar" }))
                             .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
@@ -556,7 +556,7 @@ impl ProjectView {
                                 .cursor_pointer()
                                 .when(selected, |d| d.bg(style::panel_hover()))
                                 .hover(|d| d.bg(style::panel_hover()))
-                                .child(glyph_badge(harness.glyph(), harness.color()))
+                                .child(harness_badge(*harness))
                                 .child(
                                     v_flex()
                                         .flex_1()
@@ -597,7 +597,7 @@ impl ProjectView {
                                     .gap_2()
                                     .px_2()
                                     .py_1()
-                                    .child(glyph_badge(style::agent_glyph(a.agent), style::agent_color(a.agent)))
+                                    .child(crate::icons::logo(crate::icons::agent(a.agent), px(18.)))
                                     .child(
                                         v_flex()
                                             .flex_1()
@@ -631,17 +631,22 @@ impl ProjectView {
             .bg(style::panel())
             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = self.active == Some(i);
-                let (icon, color, title, dirty): (&str, Hsla, SharedString, bool) = match &tab.kind {
+                let text_icon = |glyph: &'static str, color: Hsla| div().text_xs().text_color(color).child(glyph).into_any_element();
+                let (icon, status, title, dirty): (AnyElement, Option<Hsla>, SharedString, bool) = match &tab.kind {
                     TabKind::Terminal { view, harness, .. } => {
                         let t = view.read(cx);
                         let (_, dot) = terminal_status(t, now);
-                        (harness.glyph(), dot, t.title.clone().unwrap_or_else(|| t.label.clone()), false)
+                        let icon = match harness.agent() {
+                            Some(_) => harness_badge(*harness),
+                            None => text_icon(harness.glyph(), style::muted().into()),
+                        };
+                        (icon, Some(dot), t.title.clone().unwrap_or_else(|| t.label.clone()), false)
                     }
                     TabKind::File(f) => {
                         let f = f.read(cx);
-                        ("◇", style::muted().into(), f.title().into(), f.dirty)
+                        (text_icon("◇", style::muted().into()), None, f.title().into(), f.dirty)
                     }
-                    TabKind::Diff(d) => ("±", style::accent().into(), d.read(cx).title.clone(), false),
+                    TabKind::Diff(d) => (text_icon("±", style::accent().into()), None, d.read(cx).title.clone(), false),
                 };
                 h_flex()
                     .id(("tab", tab.id))
@@ -656,7 +661,8 @@ impl ProjectView {
                     .text_color(if active { style::text() } else { style::muted() })
                     .when(active, |d| d.bg(style::bg()))
                     .hover(|d| d.text_color(style::text()))
-                    .child(div().text_xs().text_color(color).child(icon))
+                    .child(icon)
+                    .when_some(status, |d, c| d.child(div().size(px(6.)).flex_none().rounded_full().bg(c)))
                     .child(div().truncate().child(title))
                     .when(dirty, |d| d.child(div().text_color(style::accent()).child("●")))
                     .child(
@@ -721,7 +727,7 @@ impl ProjectView {
                     .text_sm()
                     .cursor_pointer()
                     .hover(|d| d.bg(style::panel_hover()))
-                    .child(glyph_badge(h.glyph(), h.color()))
+                    .child(harness_badge(h))
                     .child(h.label())
                     .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
             })))
@@ -1059,6 +1065,14 @@ fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
 
 fn side_title(text: &'static str) -> impl IntoElement {
     div().px_2().pb_1().text_xs().text_color(style::muted()).child(text.to_uppercase())
+}
+
+/// Logo del agente; la terminal simple usa el símbolo `›`.
+fn harness_badge(h: Harness) -> AnyElement {
+    match h.agent() {
+        Some(agent) => crate::icons::logo(crate::icons::agent(agent), px(18.)).into_any_element(),
+        None => glyph_badge(h.glyph(), h.color()).into_any_element(),
+    }
 }
 
 fn glyph_badge(glyph: &'static str, color: Rgba) -> impl IntoElement {

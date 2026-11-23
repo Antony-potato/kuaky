@@ -1,5 +1,6 @@
 //! Ventana de inicio: consumo de tokens de todos los agentes.
 
+use crate::icons;
 use crate::style::{self, human, thousands};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -352,7 +353,7 @@ impl HomeView {
                     h_flex().gap_4().text_sm().children(r.providers.iter().map(|(p, t)| {
                         h_flex()
                             .gap_1p5()
-                            .child(div().size(px(8.)).rounded_full().bg(style::provider_color(*p)))
+                            .child(provider_badge(*p, 14.))
                             .child(div().text_color(style::muted()).child(format!(
                                 "{} {:.0}%",
                                 p.name(),
@@ -364,7 +365,7 @@ impl HomeView {
                 .children(r.models.iter().take(SHOWN).map(|m| {
                     let share = (m.input_total + m.output) as f32 / max as f32;
                     table_row(
-                        div().size(px(8.)).rounded_full().bg(style::provider_color(m.provider)).into_any_element(),
+                        provider_badge(m.provider, 16.),
                         style::model_name(&m.model),
                         share,
                         style::provider_color(m.provider),
@@ -632,19 +633,15 @@ fn table_row(icon: AnyElement, name: String, share: f32, color: Rgba, values: [S
 }
 
 fn agent_badge(agent: Agent) -> AnyElement {
-    let color = style::agent_color(agent);
-    div()
-        .size(px(18.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .bg(style::soft(color, 0.18))
-        .text_color(color)
-        .text_xs()
-        .font_weight(FontWeight::BOLD)
-        .child(style::agent_glyph(agent))
-        .into_any_element()
+    icons::logo(icons::agent(agent), px(18.)).into_any_element()
+}
+
+/// Logo del proveedor o, si no hay, un punto de su color.
+fn provider_badge(p: kuaky_usage::Provider, size: f32) -> AnyElement {
+    match icons::provider(p) {
+        Some(image) => icons::logo(image, px(size)).into_any_element(),
+        None => div().size(px(8.)).rounded_full().bg(style::provider_color(p)).into_any_element(),
+    }
 }
 
 fn placeholder(text: &'static str) -> impl IntoElement {

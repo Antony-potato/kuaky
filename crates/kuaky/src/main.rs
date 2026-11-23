@@ -3,6 +3,7 @@ mod diff_view;
 mod file_tree;
 mod file_view;
 mod home;
+mod icons;
 mod project;
 mod style;
 mod terminal_view;
