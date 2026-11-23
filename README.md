@@ -11,7 +11,7 @@ Plataformas: macOS y Windows.
 
 ```bash
 cargo run            # abre kuaky
-cargo test           # pruebas
+cargo test --workspace   # pruebas
 cargo run --release -p kuaky-usage --example resumen   # consumo local en la terminal
 ```
 
