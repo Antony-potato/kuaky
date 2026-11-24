@@ -126,6 +126,14 @@ pub fn new_status_file() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Claude Code's session ID from any hook line (`session_id` in the payload).
+pub fn parse_session_id(line: &str) -> Option<String> {
+    let (_, payload) = line.split_once('\t')?;
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    let id = payload.get("session_id")?.as_str()?;
+    crate::agent_history::valid_id(id).then(|| id.to_string())
+}
+
 /// Extracts a concise title from a `UserPromptSubmit` hook line, if present.
 pub fn parse_prompt(line: &str) -> Option<String> {
     let (event, payload) = line.split_once('\t')?;

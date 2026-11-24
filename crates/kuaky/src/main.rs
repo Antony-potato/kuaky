@@ -1,3 +1,4 @@
+mod agent_history;
 mod agent_status;
 mod app;
 mod chat_view;

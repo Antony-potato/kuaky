@@ -31,6 +31,8 @@ pub struct TerminalView {
     pub exited: bool,
     pub last_output: Option<Instant>,
     pub started_at: jiff::Timestamp,
+    /// The agent's conversation ID (from hooks, or the one being resumed).
+    pub agent_session: Option<String>,
     pub state_changed_at: Option<jiff::Timestamp>,
     /// Estado reportado por los hooks del agente, si los tiene.
     pub agent_state: Option<AgentState>,
@@ -105,6 +107,7 @@ impl TerminalView {
             exited: false,
             last_output: None,
             started_at: jiff::Timestamp::now(),
+            agent_session: None,
             state_changed_at: None,
             agent_state: None,
             previous_state: None,
@@ -154,11 +157,17 @@ impl TerminalView {
                     offset += consumed;
                     let chunk = &new[..consumed];
                     let prompt = chunk.lines().find_map(agent_status::parse_prompt);
+                    let session = chunk.lines().filter_map(agent_status::parse_session_id).last();
                     let latest = chunk.lines().filter_map(agent_status::parse_line).last();
-                    if prompt.is_some() || latest.is_some() {
+                    if prompt.is_some() || latest.is_some() || session.is_some() {
                         let alive = this
                             .update(cx, |this, cx| {
                                 let mut changed = false;
+                                if session.is_some() && this.agent_session != session {
+                                    this.agent_session = session;
+                                    cx.emit(TerminalViewEvent::TitleChanged);
+                                    changed = true;
+                                }
                                 if let Some(p) = prompt {
                                     if this.first_prompt.is_none() {
                                         this.first_prompt = Some(p.into());

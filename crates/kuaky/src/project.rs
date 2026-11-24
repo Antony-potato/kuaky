@@ -115,12 +115,17 @@ impl Harness {
         Harness::AGENTS.into_iter().chain([Harness::Shell]).find(|h| h.key() == key)
     }
 
-    /// Arguments to resume the latest conversation in the folder.
-    fn resume_args(self) -> &'static str {
-        match self {
-            Harness::Claude => " --continue",
-            Harness::Codex => " resume --last",
-            _ => "",
+    /// Arguments to resume a conversation: the given one, or the latest in the folder.
+    fn resume_args(self, conversation: Option<&str>) -> String {
+        let id = conversation.filter(|id| crate::agent_history::valid_id(id));
+        match (self, id) {
+            (Harness::Claude, Some(id)) => format!(" --resume {id}"),
+            (Harness::Claude, None) => " --continue".into(),
+            (Harness::Antigravity, Some(id)) => format!(" --conversation {id}"),
+            (Harness::Antigravity, None) => " --continue".into(),
+            (Harness::Codex, Some(id)) => format!(" resume {id}"),
+            (Harness::Codex, None) => " resume --last".into(),
+            _ => String::new(),
         }
     }
 
@@ -331,6 +336,7 @@ impl ProjectView {
         let key = root.to_string_lossy().into_owned();
         state::update(cx, |s| state::touch_recent(s, &key));
         let saved = state::get(cx).projects.get(&key).cloned().unwrap_or_default();
+        let previous = with_agent_history(saved.sessions.clone(), &root);
         let lsp = cx.new(|_| crate::lsp::LspStore::new(root.clone()));
         let lsp_sub = cx.subscribe_in(&lsp, window, |this, _, ev: &crate::lsp::LspStoreEvent, window, cx| match ev {
             crate::lsp::LspStoreEvent::OpenLocation { path, line, column } => {
@@ -359,7 +365,7 @@ impl ProjectView {
             activity_open: false,
             limits: Vec::new(),
             focus: cx.focus_handle(),
-            previous: saved.sessions.clone(),
+            previous,
             quick_open: None,
             rename_modal: None,
             merge_modal: None,
@@ -407,17 +413,27 @@ impl ProjectView {
             .tabs
             .iter()
             .filter_map(|t| match &t.kind {
-                TabKind::Terminal { harness, worktree, cwd, view, custom_name, custom_color } if !view.read(cx).exited => Some(SavedSession {
-                    harness: harness.key().to_string(),
-                    cwd: cwd.to_string_lossy().into_owned(),
-                    worktree: worktree.clone(),
-                    custom_name: custom_name.clone(),
-                    custom_color: *custom_color,
-                }),
+                TabKind::Terminal { harness, worktree, cwd, view, custom_name, custom_color } if !view.read(cx).exited => {
+                    let v = view.read(cx);
+                    let conversation = v.agent_session.clone().or_else(|| match harness {
+                        Harness::Antigravity => crate::agent_history::agy_current(cwd, v.started_at),
+                        _ => None,
+                    });
+                    Some(SavedSession {
+                        harness: harness.key().to_string(),
+                        cwd: cwd.to_string_lossy().into_owned(),
+                        worktree: worktree.clone(),
+                        custom_name: custom_name.clone(),
+                        custom_color: *custom_color,
+                        conversation,
+                        from_history: false,
+                        updated: None,
+                    })
+                }
                 _ => None,
             })
             .collect();
-        for p in &self.previous {
+        for p in self.previous.iter().filter(|p| !p.from_history) {
             if !sessions.contains(p) {
                 sessions.push(p.clone());
             }
@@ -436,7 +452,8 @@ impl ProjectView {
         let Some(harness) = Harness::from_key(&saved.harness) else { return };
         let cwd = PathBuf::from(&saved.cwd);
         let cwd = if cwd.is_dir() { cwd } else { self.root.clone() };
-        self.spawn_terminal(harness, cwd, saved.worktree, true, saved.custom_name, saved.custom_color, window, cx);
+        let conversation = saved.conversation.clone().or(Some(String::new()));
+        self.spawn_terminal(harness, cwd, saved.worktree, conversation, saved.custom_name, saved.custom_color, window, cx);
     }
 
     fn open_rename_modal(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -675,7 +692,7 @@ impl ProjectView {
                 }
             }
         }
-        self.spawn_terminal(harness, cwd, worktree, false, None, None, window, cx);
+        self.spawn_terminal(harness, cwd, worktree, None, None, None, window, cx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -684,7 +701,8 @@ impl ProjectView {
         harness: Harness,
         cwd: PathBuf,
         worktree: Option<String>,
-        resume: bool,
+        // `None` = new conversation; `Some("")` = latest in the folder; `Some(id)` = that one.
+        resume: Option<String>,
         custom_name: Option<String>,
         custom_color: Option<u32>,
         window: &mut Window,
@@ -707,7 +725,10 @@ impl ProjectView {
                     _ => name.to_string(),
                 }
             };
-            let mut full = if resume { format!("{base}{}", harness.resume_args()) } else { base };
+            let mut full = match &resume {
+                Some(id) => format!("{base}{}", harness.resume_args(Some(id.as_str()).filter(|s| !s.is_empty()))),
+                None => base,
+            };
             if !cfg.extra_args.trim().is_empty() {
                 full.push(' ');
                 full.push_str(cfg.extra_args.trim());
@@ -726,6 +747,12 @@ impl ProjectView {
         }
         let launch = Launch { cwd, command, prefill: None, env };
         self.add_terminal(harness, launch, worktree, status_file, custom_name, custom_color, window, cx);
+        if let Some(id) = resume.filter(|id| crate::agent_history::valid_id(id)) {
+            if let Some(Tab { kind: TabKind::Terminal { view, .. }, .. }) = self.tabs.last() {
+                view.update(cx, |v, _| v.agent_session = Some(id));
+            }
+            self.persist(cx);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -745,8 +772,11 @@ impl ProjectView {
         let sub = cx.subscribe_in(&view, window, move |this, view, ev: &TerminalViewEvent, window, cx| {
             match ev {
                 TerminalViewEvent::Exited => this.persist(cx),
-                TerminalViewEvent::AgentState => this.on_agent_state(view, harness, window, cx),
-                TerminalViewEvent::TitleChanged => {}
+                TerminalViewEvent::AgentState => {
+                    this.on_agent_state(view, harness, window, cx);
+                    this.persist(cx);
+                }
+                TerminalViewEvent::TitleChanged => this.persist(cx),
             }
             cx.notify();
         });
@@ -1776,7 +1806,14 @@ impl ProjectView {
                                 let h = Harness::from_key(&p.harness)?;
                                 let title = p.custom_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| h.label().to_string());
                                 let detail = p.worktree.clone().unwrap_or_else(|| {
-                                    if h.resume_args().is_empty() { "reopen".into() } else { "resume conversation".into() }
+                                    if p.from_history {
+                                        let when = p.updated.map(|t| format!(" · {}", ago(t))).unwrap_or_default();
+                                        format!("{} history{when}", h.label())
+                                    } else if h.resume_args(None).is_empty() {
+                                        "reopen".into()
+                                    } else {
+                                        "resume conversation".into()
+                                    }
                                 });
                                 Some(
                                     h_flex()
@@ -3272,6 +3309,29 @@ fn split_path(path: &str) -> (String, String) {
         Some((dir, file)) => (dir.to_string(), file.to_string()),
         None => (String::new(), path.to_string()),
     }
+}
+
+/// Saved sessions plus the agent's own recent conversations in this folder
+/// that kuaky does not already know, so they can be resumed.
+fn with_agent_history(mut sessions: Vec<SavedSession>, root: &Path) -> Vec<SavedSession> {
+    const MAX_FROM_HISTORY: usize = 6;
+    let known: Vec<String> = sessions.iter().filter_map(|s| s.conversation.clone()).collect();
+    let extra = crate::agent_history::agy_conversations(root)
+        .into_iter()
+        .filter(|c| !known.contains(&c.id))
+        .take(MAX_FROM_HISTORY)
+        .map(|c| SavedSession {
+            harness: Harness::Antigravity.key().to_string(),
+            cwd: root.to_string_lossy().into_owned(),
+            worktree: None,
+            custom_name: Some(c.title),
+            custom_color: None,
+            conversation: Some(c.id),
+            from_history: true,
+            updated: c.updated,
+        });
+    sessions.extend(extra);
+    sessions
 }
 
 fn ago(ts: jiff::Timestamp) -> String {
