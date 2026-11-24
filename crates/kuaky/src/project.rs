@@ -1414,6 +1414,18 @@ impl ProjectView {
             return;
         }
         let removed = self.tabs.remove(index);
+        // Closing the last open session of a metro line archives the line.
+        match &removed.kind {
+            TabKind::Terminal { view, harness, .. } if *harness != Harness::Shell => {
+                let uid = view.read(cx).uid.clone();
+                self.archive_if_last(&uid, cx);
+            }
+            TabKind::Chat { view, .. } => {
+                let uid = view.read(cx).uid.clone();
+                self.archive_if_last(&uid, cx);
+            }
+            _ => {}
+        }
         if let TabKind::File(f) = &removed.kind {
             if let Some(uri) = f.read(cx).lsp_uri() {
                 self.lsp.update(cx, |s, _| s.detach(&uri));

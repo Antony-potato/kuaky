@@ -19,10 +19,12 @@ pub(super) enum BoardFilter {
     NeedsYou,
     Finished,
     All,
+    /// Solo las archivadas (en las demás vistas no salen).
+    Archived,
 }
 
 impl BoardFilter {
-    const ALL: [BoardFilter; 4] = [BoardFilter::Active, BoardFilter::NeedsYou, BoardFilter::Finished, BoardFilter::All];
+    const ALL: [BoardFilter; 5] = [BoardFilter::Active, BoardFilter::NeedsYou, BoardFilter::Finished, BoardFilter::All, BoardFilter::Archived];
 
     fn label(self) -> &'static str {
         match self {
@@ -30,6 +32,7 @@ impl BoardFilter {
             BoardFilter::NeedsYou => "Needs you",
             BoardFilter::Finished => "Finished",
             BoardFilter::All => "All",
+            BoardFilter::Archived => "Archived",
         }
     }
 }
@@ -315,9 +318,25 @@ impl ProjectView {
             _sub: None,
         });
         if let Some(id) = line {
+            // Una línea archivada se abre en la vista de archivadas.
+            if self.lines.get(&id).is_some_and(|l| l.archived) {
+                if let Some(b) = &mut self.board {
+                    b.filter = BoardFilter::Archived;
+                }
+            }
             self.select_line(id, window, cx);
         }
         cx.notify();
+    }
+
+    /// Se cerró una sesión: si era la última abierta de su línea, la línea se archiva.
+    pub(super) fn archive_if_last(&mut self, uid: &str, cx: &mut Context<Self>) {
+        let Some(line) = self.lines.line_of(uid) else { return };
+        let id = line.id.clone();
+        let live = self.trains(cx);
+        if !line.sessions.iter().any(|s| s.uid != uid && live.contains_key(&s.uid)) {
+            self.lines.set_archived(&id, true);
+        }
     }
 
     fn close_board(&mut self, cx: &mut Context<Self>) {
@@ -696,7 +715,7 @@ impl ProjectView {
 
     pub(super) fn mini_map(&self, cx: &mut Context<Self>) -> AnyElement {
         let trains = self.trains(cx);
-        let lines: Vec<(&Line, usize)> = self.lines.ordered(false);
+        let lines: Vec<(&Line, usize)> = self.lines.ordered(false).into_iter().filter(|(l, _)| !l.archived).collect();
         let collapsed = self.mini_map_collapsed;
         let shown = 5;
         v_flex()
@@ -809,6 +828,8 @@ impl ProjectView {
             .ordered(true)
             .into_iter()
             .filter(|(l, _)| match filter {
+                BoardFilter::Archived => l.archived,
+                _ if l.archived => false,
                 BoardFilter::Active => !l.is_finished(),
                 BoardFilter::NeedsYou => self.line_trains(l, &trains).iter().any(|(_, t)| t.needs_you),
                 BoardFilter::Finished => l.is_finished(),
@@ -1056,6 +1077,7 @@ impl ProjectView {
                     BoardFilter::NeedsYou => "No agent is waiting for you.",
                     BoardFilter::Finished => "Nothing finished yet.",
                     BoardFilter::All => "No lines yet.",
+                    BoardFilter::Archived => "No archived lines. A line is archived when you close its last session, or with Archive line.",
                 })
                 .into_any_element()
         } else {
