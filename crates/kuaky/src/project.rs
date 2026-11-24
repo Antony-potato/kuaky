@@ -4,9 +4,11 @@
 
 use crate::agent_status::AgentState;
 use crate::chat_view::{ChatEvent, ChatLaunch, ChatStatus, ChatView};
+use crate::conflict_view::{ConflictEvent, ConflictView};
 use crate::diff_view::DiffView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
+use crate::graph_view::{GraphEvent, GraphView};
 use crate::home::tilde;
 use crate::icons;
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
@@ -20,7 +22,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use kuaky_git::{Branch, Change, PullRequest, Repo, Worktree};
+use kuaky_git::{Branch, Change, MergeMethod, MergeOutcome, MergePreview, PrMergeMethod, PullRequest, Repo, Worktree};
 use kuaky_term::Launch;
 use kuaky_usage::{Agent, AgentLimits, UsageEvent};
 use std::{
@@ -152,6 +154,15 @@ struct RenameSession {
     _sub: Subscription,
 }
 
+struct MergeModal {
+    branch: String,
+    base: String,
+    worktree: Option<PathBuf>,
+    preview: Option<Result<MergePreview, String>>,
+    busy: bool,
+    error: Option<String>,
+}
+
 enum TabKind {
     Terminal {
         view: Entity<TerminalView>,
@@ -163,6 +174,7 @@ enum TabKind {
     },
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
+    Conflicts(Entity<ConflictView>),
     #[allow(dead_code)]
     Chat { view: Entity<ChatView>, harness: Harness },
     Search(Entity<SearchView>),
@@ -229,6 +241,9 @@ struct GitState {
     worktrees: Vec<Worktree>,
     prs: Option<Result<Vec<PullRequest>, String>>,
     prs_loading: bool,
+    pr_action_error: Option<String>,
+    pr_merging: Option<u64>,
+    is_merging: bool,
 }
 
 pub struct ProjectView {
@@ -238,6 +253,7 @@ pub struct ProjectView {
     active: Option<usize>,
     next_id: usize,
     tree: Entity<FileTree>,
+    graph: Entity<GraphView>,
     /// Active top-right panel (`None` when hidden).
     panel: Option<SidePanel>,
     /// Embedded terminals in the bottom-right zone.
@@ -262,6 +278,11 @@ pub struct ProjectView {
     previous: Vec<SavedSession>,
     quick_open: Option<Entity<QuickOpen>>,
     rename_modal: Option<RenameSession>,
+    merge_modal: Option<MergeModal>,
+    /// Terminal currently resolving merge conflicts via an agent.
+    conflict_agent_view: Option<Entity<TerminalView>>,
+    /// Shown after the conflict-resolution agent finishes so the user can approve & complete merge.
+    merge_approval_ready: bool,
     layout: Entity<ResizableState>,
     lsp: Entity<crate::lsp::LspStore>,
     _subs: Vec<Subscription>,
@@ -274,6 +295,20 @@ impl ProjectView {
             FileTreeEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
         });
         let repo = Repo::discover(&root);
+        let graph = cx.new(|cx| GraphView::new(repo.clone(), cx));
+        let graph_sub = cx.subscribe_in(&graph, window, |this, _, ev: &GraphEvent, window, cx| match ev {
+            GraphEvent::OpenCommit { hash, short_hash, subject } => {
+                let Some(repo) = this.repo.clone() else { return };
+                let h = hash.clone();
+                this.open_diff(
+                    format!("Commit {short_hash}"),
+                    subject.clone(),
+                    move || repo.diff_commit(&h),
+                    window,
+                    cx,
+                );
+            }
+        });
         let layout = cx.new(|_| ResizableState::default());
         let layout_sub = cx.subscribe(&layout, |_, layout, _: &ResizablePanelEvent, cx| {
             let sizes = layout.read(cx).sizes().clone();
@@ -310,6 +345,7 @@ impl ProjectView {
             active: None,
             next_id: 0,
             tree,
+            graph,
             panel: Some(SidePanel::Files),
             right_terminals: Vec::new(),
             active_right_terminal: None,
@@ -326,9 +362,12 @@ impl ProjectView {
             previous: saved.sessions.clone(),
             quick_open: None,
             rename_modal: None,
+            merge_modal: None,
+            conflict_agent_view: None,
+            merge_approval_ready: false,
             layout,
             lsp,
-            _subs: vec![sub, layout_sub, right_split_sub, lsp_sub],
+            _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
         };
         this.detect_agents(cx);
         this.start_git_refresh(cx);
@@ -547,6 +586,26 @@ impl ProjectView {
                 self.open_rename_modal(id, window, cx);
             }
         }
+        if std::env::var("KUAKY_DEMO_MERGE_MODAL").is_ok() {
+            self.merge_modal = Some(MergeModal {
+                branch: "kuaky/claude-1124".into(),
+                base: self.git.default_branch.clone().unwrap_or_else(|| "main".into()),
+                worktree: None,
+                preview: Some(Ok(MergePreview::Clean)),
+                busy: false,
+                error: None,
+            });
+        }
+        if std::env::var("KUAKY_DEMO_CONFLICTS").is_ok() {
+            if let Some(repo) = self.repo.clone() {
+                let demo_path = std::env::temp_dir().join("kuaky-demo-conflict.rs");
+                let sample = "fn greet(name: &str) -> String {\n<<<<<<< HEAD\n    format!(\"Hello, {name}!\")\n=======\n    format!(\"Welcome back, {name}!\")\n>>>>>>> feature/greeting\n}\n";
+                let _ = std::fs::write(&demo_path, sample);
+                let agents = vec![Harness::Claude, Harness::Antigravity];
+                let view = cx.new(|cx| ConflictView::new(repo, vec![demo_path.to_string_lossy().into_owned()], agents, cx));
+                self.push_tab(TabKind::Conflicts(view), window, cx);
+            }
+        }
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
             if let Ok(mode) = std::env::var("KUAKY_DEMO_LSP") {
@@ -726,6 +785,28 @@ impl ProjectView {
         let t = view.read(cx);
         let Some(state) = t.agent_state.clone() else { return };
         let was_working = t.previous_state == Some(AgentState::Working);
+        if matches!(state, AgentState::Done) && self.conflict_agent_view.as_ref() == Some(view) {
+            self.conflict_agent_view = None;
+            self.merge_approval_ready = true;
+            if let Some(repo) = self.repo.clone() {
+                self.open_diff(
+                    "Conflict resolution diff".into(),
+                    "review changes before completing merge".into(),
+                    move || repo.diff_worktree(),
+                    window,
+                    cx,
+                );
+            }
+            self.notify(
+                format!("{} resolved conflicts", harness.label()),
+                "Review the diff and click Complete merge.".into(),
+                false,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let (title, message) = match &state {
             AgentState::NeedsYou(msg) => (format!("{} needs your permission", harness.label()), msg.clone()),
             AgentState::Done if was_working => (format!("{} finished", harness.label()), "Your turn.".to_string()),
@@ -790,10 +871,8 @@ impl ProjectView {
                 .children(worktrees.into_iter().enumerate().map(|(i, wt)| {
                     let branch = wt.branch.clone().unwrap_or_else(|| "(detached)".into());
                     let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let path_q = kuaky_git::shell_command(&wt.path);
                     let (wt1, wt2, wt3) = (wt.clone(), wt.clone(), wt.clone());
-                    let (b1, b2, b3, b4) = (base.clone(), branch.clone(), branch.clone(), branch.clone());
-                    let root = self.root.clone();
+                    let (b1, b2, b3) = (base.clone(), branch.clone(), branch.clone());
                     v_flex()
                         .px_2()
                         .py_1()
@@ -840,15 +919,11 @@ impl ProjectView {
                                     let text = format!("git push -u origin {b2} && gh pr create --fill --head {b2}");
                                     this.prefilled_shell(wt3.path.clone(), text, window, cx);
                                 })))
-                                .child(action(("wt-merge", i), "merge").on_click(cx.listener({
-                                    let root = root.clone();
-                                    move |this, _, window, cx| {
-                                        this.prefilled_shell(root.clone(), format!("git merge --no-ff {b3}"), window, cx);
+                                .child(action(("wt-merge", i), "merge / discard").on_click(cx.listener({
+                                    let wt_path = wt.path.clone();
+                                    move |this, _, _, cx| {
+                                        this.open_merge_modal(b3.clone(), Some(wt_path.clone()), cx);
                                     }
-                                })))
-                                .child(action(("wt-remove", i), "remove").on_click(cx.listener(move |this, _, window, cx| {
-                                    let text = format!("git worktree remove {path_q} && git branch -D {b4}");
-                                    this.prefilled_shell(root.clone(), text, window, cx);
                                 }))),
                         )
                 }))
@@ -1020,7 +1095,7 @@ impl ProjectView {
             loop {
                 let r = repo.clone();
                 let with_branches = first;
-                let (branch, changes, branches, default_branch, worktrees) = cx
+                let (branch, changes, branches, default_branch, worktrees, is_merging) = cx
                     .background_executor()
                     .spawn(async move {
                         (
@@ -1029,16 +1104,25 @@ impl ProjectView {
                             r.branches().unwrap_or_default(),
                             if with_branches { r.default_branch() } else { None },
                             r.worktrees().unwrap_or_default(),
+                            r.is_merging(),
                         )
                     })
                     .await;
                 let alive = this
                     .update(cx, |this, cx| {
+                        let branches_changed = this.git.branches != branches || this.git.branch != branch;
                         this.git.branch = branch;
                         this.git.branches = branches;
                         this.git.worktrees = worktrees;
+                        this.git.is_merging = is_merging;
+                        if !is_merging {
+                            this.merge_approval_ready = false;
+                        }
                         if first {
                             this.git.default_branch = default_branch;
+                        }
+                        if branches_changed {
+                            this.graph.update(cx, |g, cx| g.refresh(cx));
                         }
                         if this.git.changes != changes {
                             this.git.changes = changes;
@@ -1085,8 +1169,277 @@ impl ProjectView {
             if panel == SidePanel::Prs && self.git.prs.is_none() {
                 self.load_prs(cx);
             }
+            if panel == SidePanel::Graph {
+                self.graph.update(cx, |g, cx| g.refresh(cx));
+            }
         }
         cx.notify();
+    }
+
+    fn open_merge_modal(&mut self, branch: String, worktree: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        let base = self.git.branch.clone().or_else(|| self.git.default_branch.clone()).unwrap_or_else(|| "main".into());
+        self.merge_modal = Some(MergeModal {
+            branch: branch.clone(),
+            base: base.clone(),
+            worktree,
+            preview: None,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { repo.preview_merge(&base, &branch).map_err(|e| format!("{e:#}")) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(m) = &mut this.merge_modal {
+                    m.preview = Some(res);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_merge(&mut self, method: MergeMethod, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(modal) = self.merge_modal.as_mut() else { return };
+        if modal.busy {
+            return;
+        }
+        let branch = modal.branch.clone();
+        modal.busy = true;
+        modal.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let b = branch.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move { repo.merge_branch(&b, method).map_err(|e| format!("{e:#}")) })
+                .await;
+            this.update_in(cx, |this, window, cx| match res {
+                Ok(MergeOutcome::Merged) => {
+                    this.merge_modal = None;
+                    this.graph.update(cx, |g, cx| g.refresh(cx));
+                    this.notify(format!("Merged {branch}"), "Branch merged cleanly.".into(), false, window, cx);
+                    cx.notify();
+                }
+                Ok(MergeOutcome::Conflicts(files)) => {
+                    this.merge_modal = None;
+                    this.git.is_merging = true;
+                    this.open_conflicts(files, window, cx);
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(m) = &mut this.merge_modal {
+                        m.busy = false;
+                        m.error = Some(err);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_discard(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        let Some(modal) = self.merge_modal.as_mut() else { return };
+        if modal.busy {
+            return;
+        }
+        let branch = modal.branch.clone();
+        let wt = modal.worktree.clone();
+        modal.busy = true;
+        modal.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { repo.discard_branch(&branch, wt.as_deref()).map_err(|e| format!("{e:#}")) })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    this.merge_modal = None;
+                    this.graph.update(cx, |g, cx| g.refresh(cx));
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(m) = &mut this.merge_modal {
+                        m.busy = false;
+                        m.error = Some(err);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_pr_merge(&mut self, number: u64, method: PrMergeMethod, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        if self.git.pr_merging.is_some() {
+            return;
+        }
+        self.git.pr_merging = Some(number);
+        self.git.pr_action_error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { repo.pr_merge(number, method).map_err(|e| format!("{e:#}")) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.git.pr_merging = None;
+                match res {
+                    Ok(()) => {
+                        this.load_prs(cx);
+                        this.graph.update(cx, |g, cx| g.refresh(cx));
+                        this.notify(format!("Merged PR #{number}"), "Pull request merged.".into(), false, window, cx);
+                    }
+                    Err(err) => this.git.pr_action_error = Some(err),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_conflicts(&mut self, files: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        let agents: Vec<Harness> = self.available_harnesses(cx).into_iter().filter(|h| *h != Harness::Shell).collect();
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Conflicts(_))) {
+            if let TabKind::Conflicts(v) = &self.tabs[i].kind {
+                v.update(cx, |v, cx| {
+                    v.set_agents(agents, cx);
+                    v.reload(cx);
+                });
+            }
+            self.activate(i, window, cx);
+            return;
+        }
+        let view = cx.new(|cx| ConflictView::new(repo, files, agents, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &ConflictEvent, window, cx| match ev {
+            ConflictEvent::ResolveWithAgent { harness, files } => {
+                this.resolve_conflicts_with_agent(*harness, files.clone(), window, cx);
+            }
+            ConflictEvent::MergeFinished => {
+                this.merge_approval_ready = false;
+                this.git.is_merging = false;
+                this.graph.update(cx, |g, cx| g.refresh(cx));
+                if let Some(i) = this.tabs.iter().position(|t| matches!(t.kind, TabKind::Conflicts(_))) {
+                    this.close_tab(i, window, cx);
+                }
+                cx.notify();
+            }
+        });
+        self._subs.push(sub);
+        self.push_tab(TabKind::Conflicts(view), window, cx);
+    }
+
+    fn resolve_conflicts_with_agent(&mut self, harness: Harness, files: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let file_list = if files.is_empty() {
+            "all conflicted files".to_string()
+        } else {
+            files.join(", ")
+        };
+        let prompt = format!(
+            "Resolve the git merge conflicts in the following files: {file_list}. Keep the intent of both sides where appropriate, remove all conflict markers, and run the project tests to verify everything passes. Do NOT run git commit."
+        );
+        let cfg = state::get(cx).settings.agent(harness.key());
+        let base = if !cfg.binary_path.trim().is_empty() {
+            kuaky_git::shell_command(Path::new(cfg.binary_path.trim()))
+        } else if let Some(name) = harness.command() {
+            match self.installed.get(&harness) {
+                Some(path) if kuaky_git::find_program(name).is_none() => kuaky_git::shell_command(path),
+                _ => name.to_string(),
+            }
+        } else {
+            return;
+        };
+        let mut cmd = base;
+        if !cfg.extra_args.trim().is_empty() {
+            cmd.push(' ');
+            cmd.push_str(cfg.extra_args.trim());
+        }
+        let mut env = Vec::new();
+        let mut status_file = None;
+        if harness == Harness::Claude && cfg!(unix) {
+            if let (Some(settings), Some(file)) = (crate::agent_status::claude_settings(), crate::agent_status::new_status_file()) {
+                cmd = format!("{cmd} --settings {}", kuaky_git::shell_command(settings));
+                env.push(("KUAKY_STATUS_FILE".to_string(), file.to_string_lossy().into_owned()));
+                status_file = Some(file);
+            }
+        }
+        let escaped_prompt = format!("'{}'", prompt.replace('\'', "'\\''"));
+        let full_cmd = format!("{cmd} {escaped_prompt}");
+        let launch = Launch { cwd: self.root.clone(), command: Some(full_cmd), prefill: None, env };
+        self.add_terminal(
+            harness,
+            launch,
+            None,
+            status_file,
+            Some("Resolve conflicts".into()),
+            Some(0xf87171),
+            window,
+            cx,
+        );
+        if let Some(TabKind::Terminal { view, .. }) = self.tabs.last().map(|t| &t.kind) {
+            self.conflict_agent_view = Some(view.clone());
+        }
+    }
+
+    fn complete_active_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { repo.complete_merge(None).map_err(|e| format!("{e:#}")) })
+                .await;
+            this.update_in(cx, |this, window, cx| match res {
+                Ok(()) => {
+                    this.merge_approval_ready = false;
+                    this.git.is_merging = false;
+                    this.graph.update(cx, |g, cx| g.refresh(cx));
+                    if let Some(i) = this.tabs.iter().position(|t| matches!(t.kind, TabKind::Conflicts(_))) {
+                        this.close_tab(i, window, cx);
+                    }
+                    this.notify("Merge completed".into(), "All conflicts resolved and committed.".into(), false, window, cx);
+                    cx.notify();
+                }
+                Err(err) => {
+                    this.notify("Cannot complete merge".into(), err, false, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn abort_active_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { repo.abort_merge() }).await;
+            this.update_in(cx, |this, window, cx| {
+                if res.is_ok() {
+                    this.merge_approval_ready = false;
+                    this.git.is_merging = false;
+                    this.graph.update(cx, |g, cx| g.refresh(cx));
+                    if let Some(i) = this.tabs.iter().position(|t| matches!(t.kind, TabKind::Conflicts(_))) {
+                        this.close_tab(i, window, cx);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn checkout(&mut self, branch: String, cx: &mut Context<Self>) {
@@ -1495,6 +1848,14 @@ impl ProjectView {
                         None,
                         false,
                     ),
+                    TabKind::Conflicts(_) => (
+                        icons::ui("git-merge-conflict", px(14.), style::bad()).into_any_element(),
+                        None,
+                        "Merge Conflicts".into(),
+                        false,
+                        Some(0xf87171),
+                        false,
+                    ),
                     TabKind::Search(_) => {
                         (icons::ui("search", px(14.), style::accent()).into_any_element(), None, "Search".into(), false, None, false)
                     }
@@ -1561,6 +1922,7 @@ impl ProjectView {
                 TabKind::Terminal { view, .. } => view.clone().into_any_element(),
                 TabKind::File(v) => v.clone().into_any_element(),
                 TabKind::Diff(v) => v.clone().into_any_element(),
+                TabKind::Conflicts(v) => v.clone().into_any_element(),
                 TabKind::Chat { view, .. } => view.clone().into_any_element(),
                 TabKind::Search(v) => v.clone().into_any_element(),
             },
@@ -1570,6 +1932,54 @@ impl ProjectView {
             .size_full()
             .min_w_0()
             .when(!self.tabs.is_empty(), |d| d.child(self.tab_bar(cx)))
+            .when(self.merge_approval_ready, |d| {
+                d.child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(style::soft(style::good(), 0.5))
+                        .bg(style::soft(style::good(), 0.1))
+                        .text_xs()
+                        .child(icons::ui("git-merge", px(14.), style::good()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(style::text())
+                                .child("Agent finished resolving conflicts. Review the diff and approve to finish merging."),
+                        )
+                        .child(
+                            div()
+                                .id("banner-complete-merge")
+                                .px_2p5()
+                                .py_1()
+                                .rounded_md()
+                                .font_weight(FontWeight::MEDIUM)
+                                .cursor_pointer()
+                                .bg(style::good())
+                                .text_color(style::bg())
+                                .child("Complete merge")
+                                .on_click(cx.listener(|this, _, window, cx| this.complete_active_merge(window, cx))),
+                        )
+                        .child(
+                            div()
+                                .id("banner-dismiss")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(style::muted())
+                                .hover(|d| d.text_color(style::text()))
+                                .child("Dismiss")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.merge_approval_ready = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(div().flex_1().min_h_0().child(content))
     }
 
@@ -1975,6 +2385,14 @@ impl ProjectView {
         if self.repo.is_none() {
             return panel_message("This folder is not a git repository.").into_any_element();
         }
+        let conflicted: Vec<String> = self
+            .git
+            .changes
+            .iter()
+            .filter(|c| c.kind == kuaky_git::ChangeKind::Conflicted)
+            .map(|c| c.path.clone())
+            .collect();
+        let has_conflicts = !conflicted.is_empty() || self.git.is_merging;
         div()
             .id("changes")
             .size_full()
@@ -1983,6 +2401,79 @@ impl ProjectView {
                 v_flex()
                     .p_2()
                     .gap_0p5()
+                    .when(has_conflicts, |d| {
+                        let files = conflicted.clone();
+                        d.child(
+                            v_flex()
+                                .mb_2()
+                                .p_2()
+                                .gap_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(style::soft(style::bad(), 0.5))
+                                .bg(style::soft(style::bad(), 0.08))
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .text_xs()
+                                        .text_color(style::bad())
+                                        .child(icons::ui("git-merge-conflict", px(13.), style::bad()))
+                                        .child(if files.is_empty() {
+                                            "Merge in progress".to_string()
+                                        } else {
+                                            format!("{} conflicted file(s)", files.len())
+                                        }),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .child(
+                                            div()
+                                                .id("open-conflict-resolver")
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .bg(style::accent())
+                                                .text_color(style::bg())
+                                                .child("Resolve conflicts")
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.open_conflicts(files.clone(), window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("changes-complete-merge")
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .border_1()
+                                                .border_color(style::soft(style::good(), 0.5))
+                                                .text_color(style::good())
+                                                .child("Complete merge")
+                                                .on_click(cx.listener(|this, _, window, cx| this.complete_active_merge(window, cx))),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("changes-abort-merge")
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .text_color(style::muted())
+                                                .hover(|d| d.text_color(style::bad()))
+                                                .child("Abort")
+                                                .on_click(cx.listener(|this, _, window, cx| this.abort_active_merge(window, cx))),
+                                        ),
+                                ),
+                        )
+                    })
                     .when(self.git.changes.is_empty(), |d| d.child(panel_message("No local changes.")))
                     .when(!self.git.changes.is_empty(), |d| {
                         d.child(
@@ -2092,7 +2583,29 @@ impl ProjectView {
                                     ))),
                             )
                             .when(!b.current, |d| {
+                                let merge_branch = b.name.clone();
+                                let wt_path = self
+                                    .git
+                                    .worktrees
+                                    .iter()
+                                    .find(|w| !w.main && w.branch.as_deref() == Some(b.name.as_str()))
+                                    .map(|w| w.path.clone());
                                 d.child(
+                                    div()
+                                        .id(("branch-merge", i))
+                                        .flex_none()
+                                        .p_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(style::bg()))
+                                        .tooltip(|window, cx| Tooltip::new("Merge, squash, or discard branch").build(window, cx))
+                                        .child(icons::ui("git-merge", px(12.), style::muted()))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.open_merge_modal(merge_branch.clone(), wt_path.clone(), cx);
+                                        })),
+                                )
+                                .child(
                                     div()
                                         .id(("checkout", i))
                                         .flex_none()
@@ -2171,6 +2684,40 @@ impl ProjectView {
                                 .when(pr.is_draft, |d| d.child("draft"))
                                 .when_some(review, |d, (t, c)| d.child(div().text_color(c).child(t))),
                         )
+                        .when(!pr.is_draft, |d| {
+                            let merging_this = self.git.pr_merging == Some(number);
+                            let pr_btn = |tag: &'static str, label: &'static str, method: PrMergeMethod| {
+                                div()
+                                    .id((tag, number as usize))
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::border())
+                                    .text_color(style::muted())
+                                    .hover(|d| d.bg(style::bg()).text_color(style::accent()))
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.run_pr_merge(number, method, window, cx);
+                                    }))
+                            };
+                            d.child(
+                                h_flex()
+                                    .mt_1()
+                                    .gap_1()
+                                    .items_center()
+                                    .when(merging_this, |d| d.child(div().text_xs().text_color(style::accent()).child("Merging…")))
+                                    .when(!merging_this, |d| {
+                                        d.child(icons::ui("git-merge", px(11.), style::faint()))
+                                            .child(pr_btn("pr-merge", "Merge", PrMergeMethod::Merge))
+                                            .child(pr_btn("pr-squash", "Squash", PrMergeMethod::Squash))
+                                            .child(pr_btn("pr-rebase", "Rebase", PrMergeMethod::Rebase))
+                                    }),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             let Some(repo) = this.repo.clone() else { return };
                             this.open_diff(format!("PR #{number}"), title.clone(), move || repo.pr_diff(number), window, cx);
@@ -2192,16 +2739,208 @@ impl ProjectView {
                             cx.notify();
                         }),
                     ))
+                    .when_some(self.git.pr_action_error.clone(), |d, e| {
+                        d.child(div().px_2().py_1().text_xs().text_color(style::bad()).child(e))
+                    })
                     .child(body),
             )
             .into_any_element()
     }
 
-    fn graph_panel(&self, _: &mut Context<Self>) -> impl IntoElement {
+    fn graph_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.repo.is_none() {
             return panel_message("This folder is not a git repository.").into_any_element();
         }
-        panel_message("Git commit graph ready for Part E.").into_any_element()
+        v_flex()
+            .size_full()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .justify_between()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(style::border())
+                    .child(div().text_xs().text_color(style::faint()).child("click a commit to view diff"))
+                    .child(
+                        div()
+                            .id("graph-refresh")
+                            .p_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .tooltip(|window, cx| Tooltip::new("Refresh graph").build(window, cx))
+                            .child(icons::ui("refresh-cw", px(12.), style::muted()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.graph.update(cx, |g, cx| g.refresh(cx));
+                            })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(self.graph.clone()))
+            .into_any_element()
+    }
+
+    fn merge_overlay(&self, modal: &MergeModal, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = modal.busy;
+        let has_wt = modal.worktree.is_some();
+        div()
+            .id("merge-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(style::soft(style::bg(), 0.55))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.merge_modal.as_ref().is_some_and(|m| m.busy) {
+                    this.merge_modal = None;
+                    cx.notify();
+                }
+            }))
+            .child(
+                v_flex()
+                    .id("merge-box")
+                    .w(px(440.))
+                    .p_4()
+                    .gap_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(style::border())
+                    .bg(style::panel())
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(icons::ui("git-merge", px(16.), style::accent()))
+                                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Merge or Discard")),
+                            )
+                            .child(
+                                div()
+                                    .id("merge-close")
+                                    .p_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .child(icons::ui("x", px(13.), style::muted()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.merge_modal = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(style::muted())
+                            .child(div().text_color(style::text()).font_weight(FontWeight::MEDIUM).child(modal.branch.clone()))
+                            .child("→")
+                            .child(div().text_color(style::accent()).child(modal.base.clone())),
+                    )
+                    .child(
+                        div().p_3().rounded_lg().bg(style::bg()).border_1().border_color(style::border()).child(match &modal.preview {
+                            None => div().text_xs().text_color(style::muted()).child("Checking merge preview (git merge-tree)…").into_any_element(),
+                            Some(Ok(MergePreview::Clean)) => h_flex()
+                                .gap_2()
+                                .items_center()
+                                .text_xs()
+                                .text_color(style::good())
+                                .child(icons::ui("check", px(14.), style::good()))
+                                .child("Clean ✓ — no merge conflicts detected.")
+                                .into_any_element(),
+                            Some(Ok(MergePreview::Conflicts(files))) => v_flex()
+                                .gap_1p5()
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .items_center()
+                                        .text_xs()
+                                        .text_color(style::bad())
+                                        .child(icons::ui("git-merge-conflict", px(14.), style::bad()))
+                                        .child(format!("Conflicts in {} file(s):", files.len())),
+                                )
+                                .children(files.iter().take(10).map(|f| {
+                                    div()
+                                        .pl_4()
+                                        .text_xs()
+                                        .font_family(style::mono_font())
+                                        .text_color(style::muted())
+                                        .truncate()
+                                        .child(f.clone())
+                                }))
+                                .into_any_element(),
+                            Some(Err(err)) => div().text_xs().text_color(style::bad()).child(err.clone()).into_any_element(),
+                        }),
+                    )
+                    .when_some(modal.error.clone(), |d, e| {
+                        d.child(div().text_xs().text_color(style::bad()).child(e))
+                    })
+                    .child(
+                        h_flex()
+                            .mt_1()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id("modal-discard")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::soft(style::bad(), 0.45))
+                                    .text_color(style::bad())
+                                    .hover(|d| d.bg(style::soft(style::bad(), 0.12)))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(if has_wt {
+                                            "Delete worktree and force-delete branch"
+                                        } else {
+                                            "Force-delete branch"
+                                        })
+                                        .build(window, cx)
+                                    })
+                                    .child("Discard")
+                                    .on_click(cx.listener(|this, _, _, cx| this.run_discard(cx))),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("modal-squash")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::border())
+                                    .text_color(style::text())
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .child(if busy { "Working…" } else { "Squash" })
+                                    .on_click(cx.listener(|this, _, window, cx| this.run_merge(MergeMethod::Squash, window, cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("modal-merge")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .cursor_pointer()
+                                    .bg(style::accent())
+                                    .text_color(style::bg())
+                                    .child(if busy { "Working…" } else { "Merge" })
+                                    .on_click(cx.listener(|this, _, window, cx| this.run_merge(MergeMethod::Merge, window, cx))),
+                            ),
+                    ),
+            )
     }
 
     fn rename_overlay(&self, modal: &RenameSession, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2432,6 +3171,7 @@ impl Render for ProjectView {
                 )
             })
             .when_some(self.rename_modal.as_ref().map(|m| self.rename_overlay(m, cx)), |d, el| d.child(el))
+            .when_some(self.merge_modal.as_ref().map(|m| self.merge_overlay(m, cx)), |d, el| d.child(el))
     }
 }
 

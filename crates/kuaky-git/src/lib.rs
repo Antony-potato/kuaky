@@ -1,11 +1,40 @@
 //! Información de git y GitHub de un proyecto, usando las CLIs `git` y `gh`
 //! (así se reusan tu configuración y tu sesión de GitHub).
 
+pub mod conflicts;
 mod env;
+pub mod graph;
 mod parse;
 
+pub use conflicts::{ConflictBlock, ConflictChoice, ConflictFile};
 pub use env::{command, find_agent, find_program, login_path, shell_command};
+pub use graph::{GraphCommit, GraphRow, LaneEdge, RefBadge, RefKind};
 pub use parse::{Branch, Change, ChangeKind, Commit, PullRequest, Worktree};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergePreview {
+    Clean,
+    Conflicts(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged,
+    Conflicts(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrMergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
 
 use anyhow::{Context as _, bail};
 use std::path::{Path, PathBuf};
@@ -184,6 +213,174 @@ impl Repo {
     pub fn pr_diff(&self, number: u64) -> anyhow::Result<String> {
         gh_in(&self.root, &["pr", "diff", &number.to_string(), "--color", "never"])
     }
+
+    pub fn pr_merge(&self, number: u64, method: PrMergeMethod) -> anyhow::Result<()> {
+        let flag = match method {
+            PrMergeMethod::Merge => "--merge",
+            PrMergeMethod::Squash => "--squash",
+            PrMergeMethod::Rebase => "--rebase",
+        };
+        gh_in(&self.root, &["pr", "merge", &number.to_string(), flag])?;
+        Ok(())
+    }
+
+    /// Commit history with lane assignment across all local/remote refs.
+    pub fn graph_log(&self, limit: usize) -> anyhow::Result<Vec<GraphRow>> {
+        let out = self.git(&[
+            "log",
+            "--all",
+            "--topo-order",
+            "-z",
+            &format!("--max-count={limit}"),
+            "--format=%H%x00%h%x00%P%x00%D%x00%an%x00%at%x00%s",
+        ])?;
+        Ok(graph::assign_lanes(graph::parse_graph_commits(&out)))
+    }
+
+    /// Unified patch for a single commit (handles root commits too).
+    pub fn diff_commit(&self, hash: &str) -> anyhow::Result<String> {
+        if hash.starts_with('-') {
+            bail!("invalid commit hash");
+        }
+        self.git(&["--no-pager", "show", "--no-color", "--format=", "--patch", "--find-renames", hash])
+    }
+
+    /// Non-destructive merge preview using `git merge-tree --write-tree` (git >= 2.38).
+    /// Does not touch the index or working tree.
+    pub fn preview_merge(&self, base: &str, branch: &str) -> anyhow::Result<MergePreview> {
+        if base.starts_with('-') || branch.starts_with('-') {
+            bail!("invalid branch name");
+        }
+        let out = command("git")
+            .current_dir(&self.root)
+            .args(["merge-tree", "--write-tree", "--name-only", base, branch])
+            .output()
+            .context("failed to run git merge-tree")?;
+        if out.status.success() {
+            return Ok(MergePreview::Clean);
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(1) {
+            let msg = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+            bail!("{msg}");
+        }
+        let mut files: Vec<String> = Vec::new();
+        let mut lines = stdout.lines();
+        // First line is the tree OID.
+        let _ = lines.next();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if !files.contains(&line.to_string()) {
+                files.push(line.to_string());
+            }
+        }
+        if files.is_empty() {
+            for line in stdout.lines() {
+                if let Some(rest) = line.split("Merge conflict in ").nth(1) {
+                    let p = rest.trim().to_string();
+                    if !p.is_empty() && !files.contains(&p) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        Ok(MergePreview::Conflicts(files))
+    }
+
+    /// Merges or squashes `branch` into the current checked-out branch.
+    pub fn merge_branch(&self, branch: &str, method: MergeMethod) -> anyhow::Result<MergeOutcome> {
+        if branch.starts_with('-') {
+            bail!("invalid branch name");
+        }
+        let args: Vec<&str> = match method {
+            MergeMethod::Merge => vec!["merge", "--no-ff", branch],
+            MergeMethod::Squash => vec!["merge", "--squash", branch],
+        };
+        let out = command("git")
+            .current_dir(&self.root)
+            .args(&args)
+            .output()
+            .context("failed to run git merge")?;
+        if out.status.success() {
+            if method == MergeMethod::Squash {
+                self.git(&["commit", "-m", &format!("Squash merge branch '{branch}'")])?;
+            }
+            return Ok(MergeOutcome::Merged);
+        }
+        let conflicts = self.conflicted_files().unwrap_or_default();
+        if !conflicts.is_empty() {
+            return Ok(MergeOutcome::Conflicts(conflicts));
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let msg = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+        bail!("{msg}");
+    }
+
+    pub fn conflicted_files(&self) -> anyhow::Result<Vec<String>> {
+        let out = self.git(&["diff", "--name-only", "--diff-filter=U"])?;
+        Ok(out.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+    }
+
+    pub fn is_merging(&self) -> bool {
+        self.git(&["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+    }
+
+    pub fn stage_file(&self, rel_path: &str) -> anyhow::Result<()> {
+        self.git(&["add", "--", rel_path])?;
+        Ok(())
+    }
+
+    pub fn complete_merge(&self, message: Option<&str>) -> anyhow::Result<()> {
+        let remaining = self.conflicted_files()?;
+        for path in &remaining {
+            let full = self.root.join(path);
+            if let Ok(content) = std::fs::read_to_string(&full) {
+                if conflicts::has_conflict_markers(&content) {
+                    bail!("Unresolved conflict markers remain in {path}");
+                }
+            }
+            self.stage_file(path)?;
+        }
+        match message {
+            Some(msg) if !msg.trim().is_empty() => {
+                self.git(&["commit", "-m", msg.trim()])?;
+            }
+            _ => {
+                if self.is_merging() {
+                    self.git(&["commit", "--no-edit"])?;
+                } else {
+                    self.git(&["commit", "-m", "Complete merge"])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn abort_merge(&self) -> anyhow::Result<()> {
+        if self.is_merging() {
+            self.git(&["merge", "--abort"])?;
+        } else {
+            self.git(&["reset", "--merge"])?;
+        }
+        Ok(())
+    }
+
+    /// Removes the worktree (if provided) and force-deletes the branch.
+    pub fn discard_branch(&self, branch: &str, worktree: Option<&Path>) -> anyhow::Result<()> {
+        if branch.starts_with('-') {
+            bail!("invalid branch name");
+        }
+        if let Some(wt) = worktree {
+            let s = wt.to_string_lossy().into_owned();
+            self.git(&["worktree", "remove", "--force", &s])?;
+        }
+        self.git(&["branch", "-D", branch])?;
+        Ok(())
+    }
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -238,8 +435,12 @@ mod tests {
         dir
     }
 
-    fn rand_suffix() -> u128 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    fn rand_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        format!("{ns}-{n}")
     }
 
     #[test]
@@ -299,6 +500,55 @@ mod tests {
         std::fs::write(wt.join("b.txt"), "nuevo\n").unwrap();
         assert!(repo.diff_worktree_branch("main", entry).unwrap().contains("+nuevo"));
         git_in(&dir, &["worktree", "remove", "--force", &wt.to_string_lossy()]).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn previews_merges_and_builds_graph() {
+        let dir = temp_repo();
+        std::fs::write(dir.join("file.txt"), "base\n").unwrap();
+        git_in(&dir, &["add", "."]).unwrap();
+        git_in(&dir, &["commit", "-q", "-m", "initial"]).unwrap();
+
+        // Clean branch
+        git_in(&dir, &["checkout", "-q", "-b", "clean-feat"]).unwrap();
+        std::fs::write(dir.join("other.txt"), "hi\n").unwrap();
+        git_in(&dir, &["add", "."]).unwrap();
+        git_in(&dir, &["commit", "-q", "-m", "add other"]).unwrap();
+
+        // Conflicting branch
+        git_in(&dir, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(dir.join("file.txt"), "main change\n").unwrap();
+        git_in(&dir, &["commit", "-q", "-am", "main edit"]).unwrap();
+
+        git_in(&dir, &["checkout", "-q", "-b", "conflict-feat", "HEAD~1"]).unwrap();
+        std::fs::write(dir.join("file.txt"), "feature change\n").unwrap();
+        git_in(&dir, &["commit", "-q", "-am", "feature edit"]).unwrap();
+
+        git_in(&dir, &["checkout", "-q", "main"]).unwrap();
+        let repo = Repo::discover(&dir).unwrap();
+
+        assert_eq!(repo.preview_merge("main", "clean-feat").unwrap(), MergePreview::Clean);
+        let preview = repo.preview_merge("main", "conflict-feat").unwrap();
+        assert_eq!(preview, MergePreview::Conflicts(vec!["file.txt".into()]));
+
+        // Graph covers all branches
+        let graph = repo.graph_log(50).unwrap();
+        assert_eq!(graph.len(), 4);
+        assert!(graph.iter().any(|r| r.commit.is_head));
+
+        // Real conflict merge -> resolve -> complete
+        let outcome = repo.merge_branch("conflict-feat", MergeMethod::Merge).unwrap();
+        assert_eq!(outcome, MergeOutcome::Conflicts(vec!["file.txt".into()]));
+        assert!(repo.is_merging());
+        std::fs::write(dir.join("file.txt"), "resolved\n").unwrap();
+        repo.complete_merge(None).unwrap();
+        assert!(!repo.is_merging());
+
+        // Discard clean-feat
+        repo.discard_branch("clean-feat", None).unwrap();
+        assert!(!repo.branches().unwrap().iter().any(|b| b.name == "clean-feat"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

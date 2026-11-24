@@ -1,9 +1,11 @@
 mod agent_status;
 mod app;
 mod chat_view;
+mod conflict_view;
 mod diff_view;
 mod file_tree;
 mod file_view;
+mod graph_view;
 mod home;
 mod icons;
 mod lsp;
