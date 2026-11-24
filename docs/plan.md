@@ -20,12 +20,12 @@ kuaky es un editor de escritorio ligero (macOS + Windows) centrado en agentes. A
 | 3. Sesiones | ✅ | Lanzadores por agente, actividad por proyecto. Claude Code: estado exacto con hooks (`--settings`, sin tocar tus ajustes) y avisos cuando termina o pide permiso. Codex/Gemini: estado aproximado |
 | 4. Git | ✅ | Cambios locales con diff, diff entre ramas, cambiar de rama |
 | 5. PRs | ✅ | Lista con `gh` y diff de cada PR |
-| 8. Editor | 🟡 | Editor de GPUI Kit con resaltado (syntect) y guardado ⌘S. Falta: LSP, búsqueda |
+| 8. Editor | ✅ | Editor de GPUI Kit con resaltado (syntect) y guardado ⌘S; búsqueda en proyecto (⌘⇧F, regex, mayúsculas, `.gitignore`); LSP (`kuaky-lsp` + servidores de Zed: vtsls, basedpyright, json, bash y rust-analyzer) con subrayados de diagnósticos, hover, autocompletado (`Ctrl+Space`) e ir a definición (`F12` / ⌘+clic) |
 | 7. Chat ACP | ✅ | `kuaky-acp`: cliente ACP propio (JSON-RPC por stdio, sin runtime async), probado contra un agente falso. Chat con Markdown, pensamiento, herramientas, permisos con botones, plan y diffs de cada edición. Claude Code vía `claude-agent-acp` (el que instaló Zed); también Antigravity (`agy acp`), Gemini (`--acp`), Codex (`codex-acp`) y OpenCode (`acp`) si están instalados |
 | 9. Worktrees y distribución | 🟡 | Worktree por sesión con cambios / terminal / crear PR / fusionar / eliminar; `kuaky.app` con ícono (`script/bundle-macos.sh`). Falta: instalador de Windows, auto-actualización |
 | Uso diario | ✅ | Menús nativos, paneles redimensionables, ⌘P, estado persistente y sesiones para reanudar |
 
-Capturas de desarrollo: `cargo run -p kuaky --features screenshot` con `KUAKY_SCREENSHOT=archivo.png` (más `KUAKY_DEMO_TERMINAL`, `KUAKY_DEMO_PANEL`, `KUAKY_DEMO_FILE`, `KUAKY_DEMO_DIFF`).
+Capturas de desarrollo: `cargo run -p kuaky --features screenshot` con `KUAKY_SCREENSHOT=archivo.png` (más `KUAKY_DEMO_TERMINAL`, `KUAKY_DEMO_PANEL`, `KUAKY_DEMO_FILE`, `KUAKY_DEMO_LSP`, `KUAKY_DEMO_DIFF`).
 
 ---
 

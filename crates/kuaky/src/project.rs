@@ -3,6 +3,7 @@
 
 use crate::agent_status::AgentState;
 use crate::chat_view::{ChatEvent, ChatLaunch, ChatStatus, ChatView};
+use crate::search_view::{SearchEvent, SearchView};
 use crate::diff_view::DiffView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
@@ -25,12 +26,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile]);
+actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewTerminal, Some("Project")),
         KeyBinding::new("cmd-p", QuickOpenFile, Some("Project")),
+        KeyBinding::new("cmd-shift-f", SearchProject, Some("Project")),
+        KeyBinding::new("ctrl-shift-f", SearchProject, Some("Project")),
         KeyBinding::new("ctrl-p", QuickOpenFile, Some("Project")),
         KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Project")),
         KeyBinding::new("cmd-w", CloseTab, Some("Project")),
@@ -146,6 +149,7 @@ enum TabKind {
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
     Chat { view: Entity<ChatView>, harness: Harness },
+    Search(Entity<SearchView>),
 }
 
 struct Tab {
@@ -214,6 +218,7 @@ pub struct ProjectView {
     previous: Vec<SavedSession>,
     quick_open: Option<Entity<QuickOpen>>,
     layout: Entity<ResizableState>,
+    lsp: Entity<crate::lsp::LspStore>,
     _subs: Vec<Subscription>,
 }
 
@@ -237,6 +242,12 @@ impl ProjectView {
         let key = root.to_string_lossy().into_owned();
         state::update(cx, |s| state::touch_recent(s, &key));
         let saved = state::get(cx).projects.get(&key).cloned().unwrap_or_default();
+        let lsp = cx.new(|_| crate::lsp::LspStore::new(root.clone()));
+        let lsp_sub = cx.subscribe_in(&lsp, window, |this, _, ev: &crate::lsp::LspStoreEvent, window, cx| match ev {
+            crate::lsp::LspStoreEvent::OpenLocation { path, line, column } => {
+                this.open_file_at(path.clone(), *line, *column, window, cx)
+            }
+        });
         let mut this = Self {
             activity: usage.map(|u| activity_for(&root, &u)).unwrap_or_default(),
             root,
@@ -254,7 +265,8 @@ impl ProjectView {
             previous: saved.sessions.clone(),
             quick_open: None,
             layout,
-            _subs: vec![sub, layout_sub],
+            lsp,
+            _subs: vec![sub, layout_sub, lsp_sub],
         };
         this.detect_agents(cx);
         this.start_git_refresh(cx);
@@ -381,6 +393,11 @@ impl ProjectView {
         }
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
+            if let Ok(mode) = std::env::var("KUAKY_DEMO_LSP") {
+                if let Some(TabKind::File(f)) = self.active.and_then(|i| self.tabs.get(i)).map(|t| &t.kind) {
+                    f.update(cx, |f, cx| f.demo_lsp(mode, window, cx));
+                }
+            }
         }
         match std::env::var("KUAKY_DEMO_CHAT").as_deref() {
             // Agente falso de las pruebas de kuaky-acp: no usa red ni tokens.
@@ -653,6 +670,33 @@ impl ProjectView {
         self.push_tab(TabKind::Chat { view, harness }, window, cx);
     }
 
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Search(_))) {
+            if let TabKind::Search(v) = &self.tabs[i].kind {
+                v.update(cx, |v, cx| v.focus(window, cx));
+            }
+            self.active = Some(i);
+            cx.notify();
+            return;
+        }
+        let view = cx.new(|cx| SearchView::new(self.root.clone(), window, cx));
+        self._subs.push(cx.subscribe_in(&view, window, |this, _, ev: &SearchEvent, window, cx| match ev {
+            SearchEvent::Open { path, line, column } => this.open_file_at(path.clone(), *line, *column, window, cx),
+        }));
+        self.tabs.push(Tab { id: self.next_id, kind: TabKind::Search(view) });
+        self.next_id += 1;
+        self.active = Some(self.tabs.len() - 1);
+        cx.notify();
+    }
+
+    /// Abre un archivo y pone el cursor en `line`/`column` (base 0).
+    pub fn open_file_at(&mut self, path: PathBuf, line: u32, column: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file(path.clone(), window, cx);
+        if let Some(TabKind::File(f)) = self.active.and_then(|i| self.tabs.get(i)).map(|t| &t.kind) {
+            f.update(cx, |f, cx| f.goto(line, column, window, cx));
+        }
+    }
+
     fn push_tab(&mut self, kind: TabKind, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.push(Tab { id: self.next_id, kind });
         self.next_id += 1;
@@ -673,7 +717,12 @@ impl ProjectView {
         if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(index);
+        let removed = self.tabs.remove(index);
+        if let TabKind::File(f) = &removed.kind {
+            if let Some(uri) = f.read(cx).lsp_uri() {
+                self.lsp.update(cx, |s, _| s.detach(&uri));
+            }
+        }
         self.persist(cx);
         if self.tabs.is_empty() {
             self.active = None;
@@ -694,7 +743,8 @@ impl ProjectView {
             self.activate(i, window, cx);
             return;
         }
-        let view = cx.new(|cx| FileView::new(path.clone(), window, cx));
+        let lsp = self.lsp.clone();
+        let view = cx.new(|cx| FileView::new(path.clone(), Some(lsp), window, cx));
         self._subs.push(cx.observe(&view, |_, _, cx| cx.notify()));
         self.tree.update(cx, |t, cx| t.select(&path, cx));
         self.push_tab(TabKind::File(view), window, cx);
@@ -1092,6 +1142,7 @@ impl ProjectView {
                         (text_icon("◇", style::muted().into()), None, f.title().into(), f.dirty)
                     }
                     TabKind::Diff(d) => (text_icon("±", style::accent().into()), None, d.read(cx).title.clone(), false),
+                    TabKind::Search(_) => (text_icon("⌕", style::accent().into()), None, "Buscar".into(), false),
                     TabKind::Chat { view, harness } => {
                         let (_, dot) = chat_status(view.read(cx));
                         (harness_badge(*harness), Some(dot), format!("{} · chat", harness.label()).into(), false)
@@ -1139,6 +1190,7 @@ impl ProjectView {
                 TabKind::File(v) => v.clone().into_any_element(),
                 TabKind::Diff(v) => v.clone().into_any_element(),
                 TabKind::Chat { view, .. } => view.clone().into_any_element(),
+                TabKind::Search(v) => v.clone().into_any_element(),
             },
             None => self.empty_state(cx).into_any_element(),
         };
@@ -1493,6 +1545,7 @@ impl Render for ProjectView {
                 }
             }))
             .on_action(cx.listener(|this, _: &QuickOpenFile, window, cx| this.toggle_quick_open(window, cx)))
+            .on_action(cx.listener(|this, _: &SearchProject, window, cx| this.open_search(window, cx)))
             .size_full()
             .relative()
             .bg(style::bg())

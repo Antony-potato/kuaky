@@ -14,6 +14,7 @@ kuaky-usage = { path = "crates/kuaky-usage" }
 kuaky-git = { path = "crates/kuaky-git" }
 kuaky-term = { path = "crates/kuaky-term" }
 kuaky-acp = { path = "crates/kuaky-acp" }
+kuaky-lsp = { path = "crates/kuaky-lsp" }
 
 # UI: versión exacta, GPUI es pre-1.0 y cambia su API entre versiones.
 gpui-kit = "=0.11.0"

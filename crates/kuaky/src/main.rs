@@ -6,8 +6,10 @@ mod file_tree;
 mod file_view;
 mod home;
 mod icons;
+mod lsp;
 mod project;
 mod quick_open;
+mod search_view;
 mod state;
 mod style;
 mod terminal_view;
@@ -53,9 +55,22 @@ fn main() {
                 })
                 .unwrap_or((1360., 900.));
             options.window_bounds = Some(WindowBounds::centered(None, size(px(w), px(h)), cx));
+            // Capturas de desarrollo: ventana fuera de la pantalla y sin robar el
+            // foco, para no interrumpir a quien esté usando la Mac.
+            let capture = cfg!(feature = "screenshot") && std::env::var_os("KUAKY_SCREENSHOT").is_some();
+            if capture {
+                options.window_bounds = Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(-30000.), px(-30000.)),
+                    size: size(px(w), px(h)),
+                }));
+                options.focus = false;
+                options.show = true;
+            }
             options.window_min_size = Some(size(px(960.), px(640.)));
             gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| app::KuakyApp::new(window, cx)))
                 .expect("no se pudo abrir la ventana");
-            cx.activate(true);
+            if !capture {
+                cx.activate(true);
+            }
         });
 }

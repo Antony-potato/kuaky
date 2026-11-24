@@ -11,7 +11,10 @@ kuaky-usage.workspace = true
 kuaky-git.workspace = true
 kuaky-term.workspace = true
 kuaky-acp.workspace = true
+kuaky-lsp.workspace = true
+lsp-types = "0.97"
 similar = "3"
+regex = "1"
 gpui-kit = { workspace = true, features = ["syntect"] }
 anyhow.workspace = true
 serde.workspace = true
