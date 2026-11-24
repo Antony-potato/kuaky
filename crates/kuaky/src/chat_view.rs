@@ -693,9 +693,6 @@ impl ChatView {
             cx.notify();
             return;
         }
-        if self.title.is_none() {
-            cx.emit(ChatEvent::Title(crate::lines::short(&text, 48)));
-        }
         cx.emit(ChatEvent::Prompt(text));
         self.status = ChatStatus::Running;
         self.scroll.scroll_to_bottom();

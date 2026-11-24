@@ -115,6 +115,9 @@ pub struct Line {
     /// El nombre lo puso el usuario: no se cambia solo.
     #[serde(default)]
     pub named: bool,
+    /// El nombre ya viene del título que puso el agente: no se cambia con títulos nuevos.
+    #[serde(default)]
+    pub titled: bool,
     pub created: Timestamp,
     pub updated: Timestamp,
     #[serde(default)]
@@ -269,6 +272,7 @@ impl LineStore {
             archived: false,
             merged: false,
             named,
+            titled: false,
             created: now,
             updated: now,
             next_station: 0,
@@ -333,7 +337,8 @@ impl LineStore {
             }
         }
         line.push(short(prompt, 60), prompt.to_string(), StationState::Active, StationSource::Prompt, Some(uid.to_string()), now);
-        if !line.named && line.stations.iter().filter(|s| s.source == StationSource::Prompt).count() == 1 {
+        // Nombre provisional hasta que el agente ponga su título.
+        if !line.named && !line.titled && line.stations.iter().filter(|s| s.source == StationSource::Prompt).count() == 1 {
             line.name = short(prompt, 48);
         }
         touch_session(line, uid, now);
@@ -373,9 +378,15 @@ impl LineStore {
                 line.push(short(title, 60), String::new(), StationState::Active, StationSource::Title, Some(uid.to_string()), now);
             }
         }
-        // Sin prompts, el primer título nombra la línea.
-        if !line.named && line.stations.len() == 1 && line.stations[0].source == StationSource::Title {
-            line.name = short(title, 48);
+        // El primer título del agente de la sesión principal nombra la línea
+        // (reemplaza el prompt provisional). Si lo renombraste tú, no se toca.
+        let primary = line.sessions.iter().find(|s| s.uid == uid).is_some_and(|s| s.role.is_none() || s.role.as_deref() == Some("relay"));
+        if !line.named && !line.titled && primary {
+            let name = clean_title(title);
+            if !name.is_empty() {
+                line.name = short(&name, 48);
+                line.titled = true;
+            }
         }
         touch_session(line, uid, now);
         trim(line);
@@ -626,6 +637,11 @@ fn trim(line: &mut Line) {
 }
 
 /// Primera línea, sin espacios repetidos, recortada a `max` caracteres.
+/// Quita adornos del título (p. ej. el `✳ ` que Claude Code pone delante).
+pub fn clean_title(title: &str) -> String {
+    title.trim().trim_start_matches(|c: char| !c.is_alphanumeric() && c != '¿' && c != '¡' && c != '(' && c != '"').trim().to_string()
+}
+
 pub fn short(text: &str, max: usize) -> String {
     let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     let collapsed: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -669,13 +685,41 @@ mod tests {
         store.on_title("s1", "Fix LSP underline");
         store.on_prompt("s1", "Ahora corre los tests");
         let line = store.get(&id).unwrap();
-        assert_eq!(line.name, "Arregla el subrayado de errores del LSP");
+        assert_eq!(line.name, "Fix LSP underline", "el título del agente reemplaza al prompt");
         assert_eq!(line.stations.len(), 2);
         assert_eq!(line.stations[0].title, "Fix LSP underline");
         assert_eq!(line.stations[0].state, StationState::Done);
         assert_eq!(line.stations[1].state, StationState::Active);
         store.on_turn_done("s1");
         assert_eq!(store.get(&id).unwrap().stations[1].state, StationState::Done);
+    }
+
+    #[test]
+    fn line_name_comes_from_the_first_agent_title() {
+        let mut store = LineStore::in_memory();
+        let id = store.create("New Claude Code chat", LineKind::Task, None, false);
+        store.attach(&id, session("s1"));
+        store.on_prompt("s1", "se me reinicio algo y al entrar al tablero se borraron mis preferencias");
+        assert!(store.get(&id).unwrap().name.starts_with("se me reinicio algo"), "nombre provisional: el prompt");
+        store.on_title("s1", "✳ Caché de Firestore");
+        assert_eq!(store.get(&id).unwrap().name, "Caché de Firestore");
+        store.on_title("s1", "Corriendo tests");
+        assert_eq!(store.get(&id).unwrap().name, "Caché de Firestore", "títulos después no la renombran");
+
+        // El título de un revisor no renombra la línea.
+        let other = store.create("New Claude Code chat", LineKind::Task, None, false);
+        store.attach(&other, session("main"));
+        store.on_prompt("main", "arregla el login");
+        let mut reviewer = session("rev");
+        reviewer.role = Some("review".into());
+        store.attach(&other, reviewer);
+        store.on_title("rev", "Reviewing diff");
+        assert_eq!(store.get(&other).unwrap().name, "arregla el login");
+
+        // Un nombre puesto por ti se respeta.
+        store.rename(&other, "Login");
+        store.on_title("main", "Fix login redirect");
+        assert_eq!(store.get(&other).unwrap().name, "Login");
     }
 
     #[test]

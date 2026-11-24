@@ -1781,7 +1781,11 @@ impl ProjectView {
                                     TabKind::Chat { view, harness } => {
                                         let v = view.read(cx);
                                         let (status, dot) = chat_status(v);
-                                        let title = v.title.clone().unwrap_or_else(|| format!("{} · chat", harness.label()));
+                                        let title = v
+                                            .title
+                                            .clone()
+                                            .or_else(|| v.first_prompt().map(|p| crate::lines::short(p, 40)))
+                                            .unwrap_or_else(|| format!("{} · chat", harness.label()));
                                         (*harness, title.into(), format!("chat · {status}"), dot, None, None, false)
                                     }
                                     _ => return None,
@@ -2224,7 +2228,12 @@ impl ProjectView {
                     TabKind::Chat { view, harness } => {
                         let v = view.read(cx);
                         let (_, dot) = chat_status(v);
-                        let title = v.title.clone().map(|t| crate::lines::short(&t, 28)).unwrap_or_else(|| format!("{} · chat", harness.label()));
+                        let title = v
+                            .title
+                            .clone()
+                            .or_else(|| v.first_prompt().map(str::to_string))
+                            .map(|t| crate::lines::short(&t, 28))
+                            .unwrap_or_else(|| format!("{} · chat", harness.label()));
                         (harness_badge(*harness), Some(dot), title.into(), false, None, false)
                     }
                 };
