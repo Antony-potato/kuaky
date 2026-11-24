@@ -9,7 +9,7 @@ mod parse;
 pub use conflicts::{ConflictBlock, ConflictChoice, ConflictFile};
 pub use env::{command, find_agent, find_program, login_path, shell_command};
 pub use graph::{GraphCommit, GraphRow, LaneEdge, RefBadge, RefKind};
-pub use parse::{Branch, Change, ChangeKind, Commit, PullRequest, Worktree};
+pub use parse::{Branch, Change, ChangeKind, Commit, PrDetail, PullRequest, Worktree};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergePreview {
@@ -238,7 +238,7 @@ impl Repo {
                 "--limit",
                 "50",
                 "--json",
-                "number,title,author,headRefName,baseRefName,isDraft,updatedAt,url,reviewDecision,additions,deletions",
+                "number,title,author,headRefName,baseRefName,isDraft,updatedAt,url,reviewDecision,additions,deletions,mergeable,mergeStateStatus",
             ],
         )?;
         parse::pull_requests(&out)
@@ -246,6 +246,12 @@ impl Repo {
 
     pub fn pr_diff(&self, number: u64) -> anyhow::Result<String> {
         gh_in(&self.root, &["pr", "diff", &number.to_string(), "--color", "never"])
+    }
+
+    /// Descripción, estado de merge y conteos de un PR.
+    pub fn pr_detail(&self, number: u64) -> anyhow::Result<PrDetail> {
+        let out = gh_in(&self.root, &["pr", "view", &number.to_string(), "--json", "body,mergeable,mergeStateStatus,changedFiles,state,commits"])?;
+        Ok(serde_json::from_str(&out)?)
     }
 
     pub fn pr_merge(&self, number: u64, method: PrMergeMethod) -> anyhow::Result<()> {

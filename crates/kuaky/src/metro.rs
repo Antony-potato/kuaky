@@ -93,9 +93,9 @@ pub(super) struct Board {
 
 /// Sesión viva sobre una línea.
 #[derive(Clone)]
-struct Train {
+pub(super) struct Train {
     harness: Harness,
-    tab: usize,
+    pub(super) tab: usize,
     working: bool,
     needs_you: bool,
 }
@@ -170,7 +170,7 @@ impl ProjectView {
     }
 
     /// Sesiones vivas por `uid`.
-    fn trains(&self, cx: &App) -> HashMap<String, Train> {
+    pub(super) fn trains(&self, cx: &App) -> HashMap<String, Train> {
         let mut out = HashMap::new();
         for (i, tab) in self.tabs.iter().enumerate() {
             if let TabKind::Chat { view, harness } = &tab.kind {
@@ -360,7 +360,7 @@ impl ProjectView {
     }
 
     /// Lleva a la terminal de la sesión; si está cerrada, la retoma.
-    fn focus_session(&mut self, uid: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_session(&mut self, uid: &str, window: &mut Window, cx: &mut Context<Self>) {
         let live = self.tabs.iter().position(|t| match &t.kind {
             TabKind::Terminal { view, .. } => view.read(cx).uid == uid && !view.read(cx).exited,
             TabKind::Chat { view, .. } => view.read(cx).uid == uid,

@@ -1,7 +1,7 @@
 //! Settings modal (⌘,): visible agents, binary paths, extra arguments, and worktrees directory.
 
 use crate::icons;
-use crate::project::Harness;
+use crate::project::{Harness, SidePanel};
 use crate::state::{self, AgentConfig};
 use crate::style;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -27,6 +27,8 @@ pub struct SettingsView {
     agents: Vec<AgentRowState>,
     detected: HashMap<Harness, PathBuf>,
     worktrees_input: Entity<InputState>,
+    hidden_panels: Vec<String>,
+    merge_method: String,
     _subs: Vec<Subscription>,
 }
 
@@ -82,7 +84,14 @@ impl SettingsView {
             }
         }));
 
-        let this = Self { agents, detected: HashMap::new(), worktrees_input, _subs: subs };
+        let this = Self {
+            agents,
+            detected: HashMap::new(),
+            worktrees_input,
+            hidden_panels: saved.hidden_panels.clone(),
+            merge_method: if saved.pr_merge_method.is_empty() { "merge".into() } else { saved.pr_merge_method.clone() },
+            _subs: subs,
+        };
         this.detect(cx);
         this
     }
@@ -128,11 +137,96 @@ impl SettingsView {
             );
         }
         let worktrees_dir = self.worktrees_input.read(cx).value().trim().to_string();
+        let (hidden, method) = (self.hidden_panels.clone(), self.merge_method.clone());
         state::update(cx, |s| {
             s.settings.agents = map;
             s.settings.worktrees_dir = worktrees_dir;
+            s.settings.hidden_panels = hidden;
+            s.settings.pr_merge_method = method;
         });
         cx.emit(SettingsEvent::Changed);
+    }
+
+    fn toggle_panel(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(i) = self.hidden_panels.iter().position(|h| h == key) {
+            self.hidden_panels.remove(i);
+        } else if SidePanel::ALL.len() - self.hidden_panels.len() > 1 {
+            self.hidden_panels.push(key.to_string());
+        }
+        self.save(cx);
+        cx.notify();
+    }
+
+    fn panels_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(div().text_xs().text_color(style::muted()).child("RIGHT PANEL TABS"))
+            .child(
+                v_flex()
+                    .p_1()
+                    .rounded_lg()
+                    .bg(style::bg())
+                    .border_1()
+                    .border_color(style::border())
+                    .children(SidePanel::ALL.into_iter().map(|p| {
+                        let on = !self.hidden_panels.iter().any(|h| h == p.key());
+                        let key = p.key();
+                        h_flex()
+                            .id(SharedString::from(format!("panel-toggle-{key}")))
+                            .px_2()
+                            .py_1p5()
+                            .gap_3()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .child(switch(on))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(div().text_sm().child(p.label()))
+                                    .child(div().text_xs().text_color(style::faint()).whitespace_normal().child(p.about())),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(key, cx)))
+                    })),
+            )
+    }
+
+    fn merge_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let options = [("merge", "Merge commit"), ("squash", "Squash"), ("rebase", "Rebase")];
+        v_flex()
+            .gap_2()
+            .child(div().text_xs().text_color(style::muted()).child("PULL REQUESTS"))
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .rounded_lg()
+                    .bg(style::bg())
+                    .border_1()
+                    .border_color(style::border())
+                    .child(div().text_xs().text_color(style::faint()).child("The Merge button merges with"))
+                    .child(h_flex().gap_1().children(options.into_iter().map(|(key, label)| {
+                        let selected = self.merge_method == key;
+                        div()
+                            .id(SharedString::from(format!("merge-method-{key}")))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .text_sm()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(if selected { style::accent().into() } else { style::border() })
+                            .text_color(if selected { style::accent() } else { style::muted() })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.merge_method = key.to_string();
+                                this.save(cx);
+                                cx.notify();
+                            }))
+                    }))),
+            )
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -270,6 +364,8 @@ impl Render for SettingsView {
                                             )
                                     })),
                             )
+                            .child(self.panels_section(cx))
+                            .child(self.merge_section(cx))
                             .child(
                                 v_flex()
                                     .gap_2()
@@ -319,4 +415,15 @@ impl Render for SettingsView {
                     ),
             )
     }
+}
+
+fn switch(on: bool) -> impl IntoElement {
+    div()
+        .w(px(26.))
+        .h(px(15.))
+        .p(px(2.))
+        .flex_none()
+        .rounded_full()
+        .bg(if on { style::accent().into() } else { style::border() })
+        .child(div().size(px(11.)).rounded_full().bg(style::text()).when(on, |d| d.ml(px(11.))))
 }

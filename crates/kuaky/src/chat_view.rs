@@ -79,6 +79,9 @@ pub enum ChatEvent {
     RelayAuto(bool),
     /// Modo seguir: el agente está leyendo o editando este archivo.
     Follow { path: PathBuf, line: u32 },
+    OpenPr(u64),
+    /// Merge (o resolver y merge) del PR de esta sesión.
+    MergePr(u64),
 }
 
 /// Conexión con otra sesión (revisor ↔ autor), mostrada arriba del chat.
@@ -213,6 +216,10 @@ pub struct ChatView {
     pub relay: Option<RelayBanner>,
     /// Seguir al agente: kuaky abre los archivos que lee o edita.
     pub follow: bool,
+    /// PRs que el agente enlazó en sus respuestas (`…/pull/N`).
+    pub mentioned_prs: Vec<u64>,
+    /// PR de esta sesión: (número, tiene conflictos). Lo pone el proyecto.
+    pub pr: Option<(u64, bool)>,
     last_followed: Option<(String, Option<u32>)>,
     client: Option<Arc<Client>>,
     turns: Vec<Turn>,
@@ -285,6 +292,8 @@ impl ChatView {
             title: None,
             relay: None,
             follow: false,
+            mentioned_prs: Vec::new(),
+            pr: None,
             last_followed: None,
             client: None,
             turns: Vec::new(),
@@ -372,6 +381,11 @@ impl ChatView {
                     // Lo repetido por `session/load` no cuenta como turno en curso.
                     for t in &mut this.turns {
                         t.started = None;
+                    }
+                    // Mensajes que llegaron mientras conectaba.
+                    if !this.queue.is_empty() {
+                        let next = this.queue.remove(0);
+                        this.dispatch(next.text, next.images, cx);
                     }
                     cx.emit(ChatEvent::Session(info.id));
                     cx.emit(ChatEvent::Status);
@@ -555,6 +569,7 @@ impl ChatView {
             }
             Event::TurnEnded(reason) => {
                 self.status = ChatStatus::Ready;
+                self.scan_prs();
                 if let Some(turn) = self.turns.last_mut() {
                     turn.duration = turn.started.map(|s| s.elapsed());
                     if reason != "end_turn" {
@@ -615,6 +630,20 @@ impl ChatView {
                 cx.notify();
             }
             _ => {}
+        }
+    }
+
+    /// Enlaces a PRs en las respuestas del agente.
+    fn scan_prs(&mut self) {
+        for turn in &self.turns {
+            for item in &turn.items {
+                if let Item::Agent(text) = item {
+                    for n in crate::project::pr_numbers_in(text) {
+                        self.mentioned_prs.retain(|m| *m != n);
+                        self.mentioned_prs.push(n);
+                    }
+                }
+            }
         }
     }
 
@@ -1624,6 +1653,33 @@ impl ChatView {
             .border_color(style::border())
             .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(title))
             .child(h_flex().gap_1().items_center().text_xs().text_color(status_color).child(div().size(px(6.)).rounded_full().bg(status_color)).child(status_label))
+            .when_some(self.pr, |d, (n, conflicts)| {
+                d.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .id("chat-pr")
+                                .gap_1()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(style::muted())
+                                .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                                .tooltip(|window, cx| Tooltip::new("This session's pull request").build(window, cx))
+                                .child(crate::icons::ui("git-pull-request", px(12.), style::muted()))
+                                .child(format!("#{n}"))
+                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChatEvent::OpenPr(n)))),
+                        )
+                        .child(
+                            crate::pr_view::merge_button("chat-pr-merge", conflicts, true)
+                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChatEvent::MergePr(n)))),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("follow-agent")

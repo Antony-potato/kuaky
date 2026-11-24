@@ -81,6 +81,42 @@ pub struct PullRequest {
     pub additions: u64,
     #[serde(default)]
     pub deletions: u64,
+    /// `MERGEABLE`, `CONFLICTING` o `UNKNOWN` (GitHub lo calcula en segundo plano).
+    #[serde(default)]
+    pub mergeable: String,
+    /// `CLEAN`, `DIRTY` (conflictos), `BEHIND`, `BLOCKED`, `UNSTABLE`…
+    #[serde(default)]
+    pub merge_state_status: String,
+}
+
+impl PullRequest {
+    pub fn has_conflicts(&self) -> bool {
+        self.mergeable == "CONFLICTING" || self.merge_state_status == "DIRTY"
+    }
+}
+
+/// Lo que muestra la vista de un PR (Overview).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDetail {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub mergeable: String,
+    #[serde(default)]
+    pub merge_state_status: String,
+    #[serde(default)]
+    pub changed_files: u64,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub commits: Vec<serde_json::Value>,
+}
+
+impl PrDetail {
+    pub fn has_conflicts(&self) -> bool {
+        self.mergeable == "CONFLICTING" || self.merge_state_status == "DIRTY"
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

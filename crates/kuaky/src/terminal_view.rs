@@ -151,6 +151,14 @@ impl TerminalView {
         }
     }
 
+    /// Pastes `text` and presses Enter (sends it to the agent).
+    pub fn submit_text(&self, text: &str) {
+        if let Some(term) = &self.term {
+            term.paste(text);
+            term.write(b"\r".to_vec());
+        }
+    }
+
     /// Pastes `text` once the program has started and its output settled
     /// (agents ignore input while they boot). Gives up after 30 s.
     pub fn paste_when_ready(&mut self, text: String, cx: &mut Context<Self>) {

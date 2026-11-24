@@ -34,6 +34,9 @@ pub struct State {
     /// Projects open as tabs when kuaky was closed (in tab order).
     #[serde(default)]
     pub open: Vec<String>,
+    /// Left sidebar folded into a thin rail.
+    #[serde(default)]
+    pub left_collapsed: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
@@ -44,6 +47,12 @@ pub struct Settings {
     /// Custom base directory for git worktrees (defaults to `~/.kuaky/worktrees`).
     #[serde(default)]
     pub worktrees_dir: String,
+    /// Right-panel tabs the user hid (`files`, `changes`, `branches`, `prs`, `graph`).
+    #[serde(default)]
+    pub hidden_panels: Vec<String>,
+    /// How the single "Merge" button merges PRs: `merge`, `squash` or `rebase`.
+    #[serde(default)]
+    pub pr_merge_method: String,
 }
 
 impl Settings {

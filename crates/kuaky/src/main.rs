@@ -13,6 +13,7 @@ mod icons;
 mod lines;
 mod lsp;
 mod project;
+mod pr_view;
 mod quick_open;
 mod review_view;
 mod search_view;

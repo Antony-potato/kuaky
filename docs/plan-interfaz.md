@@ -115,3 +115,12 @@ Fuentes:
 3. C (uso restante).
 4. D (sesiones con nombre).
 5. E (Graph → merge → conflictos con agente).
+
+### Actualización (24-nov)
+
+- **PRs:** un solo botón *Merge* (método en Settings → Pull requests). Si el PR tiene conflictos, *Resolve & merge*: la sesión que hizo el PR (o una nueva en su worktree) resuelve los conflictos y, al terminar su turno, kuaky revisa que ya se pueda unir y hace el merge.
+- **Vista del PR:** solo *Overview* (descripción, estado) y *Files changed*.
+- **Sesión ↔ PR:** cada sesión muestra su PR (por la rama de su carpeta o por el enlace que el agente escribió en el chat); el PR muestra qué sesión lo hizo. Merge desde el chat o desde la barra izquierda.
+- **Pestañas del panel derecho configurables** en Settings, con una línea que explica cada una (Branches incluye los worktrees).
+- **Centro dividido:** los archivos, diffs y PRs se abren a la derecha del chat; el chat solo se quita si lo cierras. El × de la barra de pestañas esconde ese lado.
+- **Barra izquierda:** *New session* más chico y la barra se pliega (⌘B) a una columna de íconos.

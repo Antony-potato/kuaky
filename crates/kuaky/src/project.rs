@@ -34,10 +34,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject]);
+actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject, ToggleSidebar]);
 
 #[path = "metro.rs"]
 mod metro;
+#[path = "prs.rs"]
+mod prs;
+pub(crate) use prs::pr_numbers_in;
 pub use metro::LiveSummary;
 
 /// How to open an agent chat (ACP).
@@ -79,6 +82,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, Some("Project")),
         KeyBinding::new("cmd-shift-]", NextTab, Some("Project")),
         KeyBinding::new("cmd-shift-[", PrevTab, Some("Project")),
+        KeyBinding::new("cmd-b", ToggleSidebar, Some("Project")),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
@@ -88,6 +92,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-w", CloseTab, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-tab", NextTab, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-b", ToggleSidebar, Some("Project && !Terminal")),
     ]);
 }
 
@@ -231,6 +236,7 @@ enum TabKind {
     Chat { view: Entity<ChatView>, harness: Harness },
     Search(Entity<SearchView>),
     Review(Entity<crate::review_view::ReviewView>),
+    Pr(Entity<crate::pr_view::PrView>),
 }
 
 struct Tab {
@@ -271,7 +277,7 @@ struct RightTerminal {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum SidePanel {
+pub(crate) enum SidePanel {
     Files,
     Changes,
     Branches,
@@ -280,15 +286,36 @@ enum SidePanel {
 }
 
 impl SidePanel {
-    const ALL: [SidePanel; 5] = [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs, SidePanel::Graph];
+    pub(crate) const ALL: [SidePanel; 5] = [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs, SidePanel::Graph];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             SidePanel::Files => "Files",
             SidePanel::Changes => "Changes",
             SidePanel::Branches => "Branches",
             SidePanel::Prs => "Pull Requests",
             SidePanel::Graph => "Graph",
+        }
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            SidePanel::Files => "files",
+            SidePanel::Changes => "changes",
+            SidePanel::Branches => "branches",
+            SidePanel::Prs => "prs",
+            SidePanel::Graph => "graph",
+        }
+    }
+
+    /// One line for Settings, so each tab is clear.
+    pub(crate) fn about(self) -> &'static str {
+        match self {
+            SidePanel::Files => "Project file tree.",
+            SidePanel::Changes => "Uncommitted changes in this folder.",
+            SidePanel::Branches => "Branches and worktrees (separate folders where an agent works on its own branch without touching yours).",
+            SidePanel::Prs => "Open pull requests: merge, resolve conflicts, see which session made each one.",
+            SidePanel::Graph => "Commit history as a graph, like VS Code.",
         }
     }
 
@@ -377,6 +404,20 @@ pub struct ProjectView {
     relays: Vec<metro::Relay>,
     /// Chat al que se está siguiendo (abre los archivos que toca su agente).
     following: Option<Entity<ChatView>>,
+    /// Center split: the session shown on the left and the file/diff/PR on the
+    /// right (tab ids). Opening a file never hides the chat.
+    shown_session: Option<usize>,
+    shown_doc: Option<usize>,
+    /// The right (document) side was closed with its ×.
+    doc_hidden: bool,
+    center_split: Entity<ResizableState>,
+    /// Left sidebar folded into a thin rail.
+    left_collapsed: bool,
+    layout_collapsed: Entity<ResizableState>,
+    /// Sesión (uid) → PR que hizo.
+    session_prs: HashMap<String, u64>,
+    /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
+    pending_merges: HashMap<String, u64>,
     mini_map_collapsed: bool,
     /// Shown in the window (other projects stay open in the background).
     visible: bool,
@@ -474,6 +515,14 @@ impl ProjectView {
             board: None,
             relays: Vec::new(),
             following: None,
+            shown_session: None,
+            shown_doc: None,
+            doc_hidden: false,
+            center_split: cx.new(|_| ResizableState::default()),
+            left_collapsed: state::get(cx).left_collapsed || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_COLLAPSED").is_ok()),
+            layout_collapsed: cx.new(|_| ResizableState::default()),
+            session_prs: HashMap::new(),
+            pending_merges: HashMap::new(),
             mini_map_collapsed: false,
             visible: true,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
@@ -481,6 +530,7 @@ impl ProjectView {
         this.start_map_refresh(cx);
         this.detect_agents(cx);
         this.start_git_refresh(cx);
+        this.start_pr_refresh(cx);
         this.start_limits_refresh(cx);
         for file in &saved.files {
             let path = this.root.join(file);
@@ -511,6 +561,10 @@ impl ProjectView {
 
     pub fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
         self.detect_agents(cx);
+        // A hidden tab can't stay open.
+        if self.panel.is_some_and(|p| !self.visible_panels(cx).contains(&p)) {
+            self.panel = self.visible_panels(cx).first().copied();
+        }
         cx.notify();
     }
 
@@ -1018,6 +1072,10 @@ impl ProjectView {
         let t = view.read(cx);
         let Some(state) = t.agent_state.clone() else { return };
         let was_working = t.previous_state == Some(AgentState::Working);
+        if matches!(state, AgentState::Done) && was_working {
+            let uid = t.uid.clone();
+            self.finish_pending_merge(&uid, window, cx);
+        }
         if matches!(state, AgentState::Done) && self.conflict_agent_view.as_ref() == Some(view) {
             self.conflict_agent_view = None;
             self.merge_approval_ready = true;
@@ -1101,6 +1159,14 @@ impl ProjectView {
                 .border_b_1()
                 .border_color(style::border())
                 .child(div().px_2().text_xs().text_color(style::faint()).child(format!("WORKTREES · base {base}")))
+                .child(
+                    div()
+                        .px_2()
+                        .text_xs()
+                        .text_color(style::faint())
+                        .whitespace_normal()
+                        .child("Separate folders where an agent works on its own branch without touching your files."),
+                )
                 .children(worktrees.into_iter().enumerate().map(|(i, wt)| {
                     let branch = wt.branch.clone().unwrap_or_else(|| "(detached)".into());
                     let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1218,6 +1284,8 @@ impl ProjectView {
                     let uid = view.read(cx).uid.clone();
                     this.lines.on_turn_done(&uid);
                     this.relay_turn_done(&uid, cx);
+                    this.finish_pending_merge(&uid, window, cx);
+                    this.sync_session_prs(cx);
                     this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx)
                 }
                 ChatEvent::Status => {}
@@ -1225,6 +1293,15 @@ impl ProjectView {
                     if view.read(cx).follow {
                         this.following = Some(view.clone());
                         this.open_file_at(path.clone(), line.saturating_sub(1), 0, window, cx);
+                    }
+                }
+                ChatEvent::OpenPr(n) => this.open_pr(*n, window, cx),
+                ChatEvent::MergePr(n) => {
+                    let conflicts = this.open_prs().iter().find(|p| p.number == *n).is_some_and(|p| p.has_conflicts());
+                    if conflicts {
+                        this.resolve_and_merge(*n, window, cx);
+                    } else {
+                        this.merge_pr(*n, window, cx);
                     }
                 }
                 ChatEvent::RelayAuto(on) => {
@@ -1322,11 +1399,24 @@ impl ProjectView {
             }
         }
         self.persist(cx);
+        let was_session = is_session(&removed.kind);
+        if self.shown_session == Some(removed.id) {
+            self.shown_session = None;
+        }
+        if self.shown_doc == Some(removed.id) {
+            self.shown_doc = None;
+        }
         if self.tabs.is_empty() {
             self.active = None;
             window.focus(&self.focus, cx);
         } else {
-            let next = index.min(self.tabs.len() - 1);
+            // Next tab of the same kind (closing a file keeps the chat in place).
+            let same = |t: &Tab| is_session(&t.kind) == was_session;
+            let next = (index..self.tabs.len())
+                .chain((0..index).rev())
+                .find(|&i| same(&self.tabs[i]))
+                .or_else(|| self.shown_session.and_then(|id| self.tabs.iter().position(|t| t.id == id)))
+                .unwrap_or(index.min(self.tabs.len() - 1));
             self.activate(next, window, cx);
         }
         cx.notify();
@@ -1399,6 +1489,20 @@ impl ProjectView {
 
     // ── git ─────────────────────────────────────────────────────────────
 
+    /// Open PRs every 2 minutes (to link each session with its PR).
+    fn start_pr_refresh(&self, cx: &mut Context<Self>) {
+        if self.repo.is_none() || kuaky_git::find_program("gh").is_none() {
+            return;
+        }
+        cx.spawn(async move |this, cx| loop {
+            if this.update(cx, |this, cx| this.load_prs(cx)).is_err() {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_secs(120)).await;
+        })
+        .detach();
+    }
+
     fn start_limits_refresh(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
@@ -1452,6 +1556,9 @@ impl ProjectView {
                         this.git.branch = branch;
                         this.git.branches = branches;
                         this.git.worktrees = worktrees;
+                        if this.git.prs.is_some() {
+                            this.sync_session_prs(cx);
+                        }
                         this.git.is_merging = is_merging;
                         if !is_merging {
                             this.merge_approval_ready = false;
@@ -1492,6 +1599,7 @@ impl ProjectView {
             this.update(cx, |this, cx| {
                 this.git.prs_loading = false;
                 this.git.prs = Some(prs.map_err(|e| format!("{e:#}")));
+                this.sync_session_prs(cx);
                 cx.notify();
             })
             .ok();
@@ -1613,36 +1721,6 @@ impl ProjectView {
                     }
                     cx.notify();
                 }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn run_pr_merge(&mut self, number: u64, method: PrMergeMethod, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repo) = self.repo.clone() else { return };
-        if self.git.pr_merging.is_some() {
-            return;
-        }
-        self.git.pr_merging = Some(number);
-        self.git.pr_action_error = None;
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move { repo.pr_merge(number, method).map_err(|e| format!("{e:#}")) })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                this.git.pr_merging = None;
-                match res {
-                    Ok(()) => {
-                        this.load_prs(cx);
-                        this.graph.update(cx, |g, cx| g.refresh(cx));
-                        this.notify(format!("Merged PR #{number}"), "Pull request merged.".into(), false, window, cx);
-                    }
-                    Err(err) => this.git.pr_action_error = Some(err),
-                }
-                cx.notify();
             })
             .ok();
         })
@@ -1839,6 +1917,10 @@ impl ProjectView {
                                     TabKind::Chat { view, .. } => view.read(cx).uid.clone(),
                                     _ => String::new(),
                                 };
+                                let pr = self.session_prs.get(&uid).copied().map(|n| {
+                                    let conflicts = self.open_prs().iter().find(|p| p.number == n).is_some_and(|p| p.has_conflicts());
+                                    (n, conflicts)
+                                });
                                 let dragged = DraggedSession { uid, title: title.clone() };
                                 Some(
                                     h_flex()
@@ -1867,6 +1949,26 @@ impl ProjectView {
                                                         .child(div().size(px(6.)).flex_none().rounded_full().bg(dot_color))
                                                         .child(div().flex_1().min_w_0().truncate().child(status_line)),
                                                 )
+                                                .when_some(pr, |d, (n, conflicts)| {
+                                                    d.child(
+                                                        h_flex()
+                                                            .id(("session-pr", tab_id))
+                                                            .gap_1()
+                                                            .text_xs()
+                                                            .text_color(if conflicts { style::bad() } else { style::accent() })
+                                                            .cursor_pointer()
+                                                            .hover(|d| d.text_color(style::text()))
+                                                            .tooltip(move |window, cx| {
+                                                                Tooltip::new(if conflicts { "PR with conflicts · open" } else { "Open this session's PR" }).build(window, cx)
+                                                            })
+                                                            .child(icons::ui("git-pull-request", px(11.), if conflicts { style::bad() } else { style::accent() }))
+                                                            .child(format!("PR #{n}{}", if conflicts { " · conflicts" } else { "" }))
+                                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.open_pr(n, window, cx);
+                                                            })),
+                                                    )
+                                                })
                                                 .when_some(worktree, |d, w| {
                                                     d.child(
                                                         h_flex()
@@ -1932,6 +2034,78 @@ impl ProjectView {
                                 .map(|e| e.into_any_element())
     }
 
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.left_collapsed = !self.left_collapsed;
+        let collapsed = self.left_collapsed;
+        state::update(cx, |s| s.left_collapsed = collapsed);
+        if collapsed {
+            self.new_session_menu = false;
+        }
+        cx.notify();
+    }
+
+    /// Folded sidebar: expand, new session, and one icon per open session.
+    fn sidebar_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = Instant::now();
+        v_flex()
+            .w(px(44.))
+            .h_full()
+            .flex_none()
+            .py_2()
+            .gap_1()
+            .items_center()
+            .border_r_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .child(sidebar_toggle(true).on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))))
+            .child(
+                div()
+                    .id("rail-new-session")
+                    .p_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(|window, cx| Tooltip::new("New session").build(window, cx))
+                    .child(icons::ui("plus", px(15.), style::accent()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.left_collapsed = false;
+                        this.new_session_menu = true;
+                        cx.notify();
+                    })),
+            )
+            .child(div().w(px(20.)).h(px(1.)).my_1().bg(style::border()))
+            .children(self.tabs.iter().enumerate().filter(|(_, t)| is_session(&t.kind)).map(|(i, tab)| {
+                let (harness, dot, title): (Harness, Hsla, String) = match &tab.kind {
+                    TabKind::Terminal { view, harness, custom_name, .. } => {
+                        let t = view.read(cx);
+                        let (_, dot) = terminal_status(t, now);
+                        (*harness, dot, custom_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| t.auto_title().to_string()))
+                    }
+                    TabKind::Chat { view, harness } => {
+                        let v = view.read(cx);
+                        let (_, dot) = chat_status(v);
+                        (*harness, dot, v.title.clone().or_else(|| v.first_prompt().map(|p| crate::lines::short(p, 40))).unwrap_or_default())
+                    }
+                    _ => return div().into_any_element(),
+                };
+                let selected = self.shown_session == Some(tab.id);
+                let tip: SharedString = title.into();
+                div()
+                    .id(("rail-session", tab.id))
+                    .relative()
+                    .p_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(style::panel_hover()))
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .child(harness_badge(harness))
+                    .child(div().absolute().top(px(3.)).right(px(3.)).size(px(7.)).rounded_full().border_1().border_color(style::panel()).bg(dot))
+                    .on_click(cx.listener(move |this, _, window, cx| this.activate(i, window, cx)))
+                    .into_any_element()
+            }))
+    }
+
     fn left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         let harnesses = self.available_harnesses(cx);
@@ -1949,24 +2123,32 @@ impl ProjectView {
                     .border_color(style::border())
                     .child(
                         h_flex()
-                            .id("new-session-btn")
-                            .px_3()
-                            .py_1p5()
-                            .gap_2()
-                            .justify_between()
+                            .gap_1()
                             .items_center()
-                            .rounded_lg()
-                            .cursor_pointer()
-                            .bg(style::accent())
-                            .text_color(style::bg())
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("New session")
-                            .child(icons::ui("plus", px(14.), style::bg()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.new_session_menu = !this.new_session_menu;
-                                cx.notify();
-                            })),
+                            .child(
+                                h_flex()
+                                    .id("new-session-btn")
+                                    .flex_1()
+                                    .px_2()
+                                    .py_1()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::accent_alpha(0.5))
+                                    .text_color(style::accent())
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .hover(|d| d.bg(style::accent_alpha(0.1)))
+                                    .child(icons::ui("plus", px(13.), style::accent()))
+                                    .child("New session")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.new_session_menu = !this.new_session_menu;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(sidebar_toggle(false).on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))),
                     )
                     .when(self.new_session_menu, |d| {
                         let isolated = self.isolate;
@@ -2215,7 +2397,7 @@ impl ProjectView {
     fn follow_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let chat = self.following.clone().filter(|c| c.read(cx).follow)?;
         let chat_tab = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Chat { view, .. } if *view == chat))?;
-        if self.active == Some(chat_tab) {
+        if self.shown_session == Some(self.tabs[chat_tab].id) {
             return None;
         }
         let label = chat.read(cx).launch.label;
@@ -2278,7 +2460,7 @@ impl ProjectView {
             .bg(style::panel())
             // Sessions (terminals and chats) live in the left sidebar, not here.
             .children(self.tabs.iter().enumerate().filter(|(_, t)| !is_session(&t.kind)).map(|(i, tab)| {
-                let active = self.active == Some(i);
+                let active = self.shown_doc == Some(tab.id);
                 let tab_id = tab.id;
                 let (icon, status, title, dirty, accent_color, can_rename): (
                     AnyElement,
@@ -2325,6 +2507,14 @@ impl ProjectView {
                         icons::ui("list-checks", px(14.), style::accent()).into_any_element(),
                         None,
                         r.read(cx).title.clone(),
+                        false,
+                        None,
+                        false,
+                    ),
+                    TabKind::Pr(v) => (
+                        icons::ui("git-pull-request", px(14.), style::accent()).into_any_element(),
+                        None,
+                        format!("PR #{}", v.read(cx).number).into(),
                         false,
                         None,
                         false,
@@ -2391,25 +2581,107 @@ impl ProjectView {
                         }),
                     )
             }))
+            .child(div().flex_1())
+            .when(self.shown_session.is_some(), |d| {
+                d.child(
+                    div()
+                        .id("close-doc-pane")
+                        .flex_none()
+                        .mx_2()
+                        .p_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .tooltip(|window, cx| Tooltip::new("Hide this side (tabs stay open)").build(window, cx))
+                        .child(icons::ui("panel-right-close", px(14.), style::muted()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.doc_hidden = true;
+                            if let Some(i) = this.shown_session.and_then(|id| this.tabs.iter().position(|t| t.id == id)) {
+                                this.active = Some(i);
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
+    fn tab_view(kind: &TabKind) -> AnyElement {
+        match kind {
+            TabKind::Terminal { view, .. } => view.clone().into_any_element(),
+            TabKind::File(v) => v.clone().into_any_element(),
+            TabKind::Diff(v) => v.clone().into_any_element(),
+            TabKind::Conflicts(v) => v.clone().into_any_element(),
+            TabKind::Chat { view, .. } => view.clone().into_any_element(),
+            TabKind::Search(v) => v.clone().into_any_element(),
+            TabKind::Review(v) => v.clone().into_any_element(),
+            TabKind::Pr(v) => v.clone().into_any_element(),
+        }
+    }
+
+    /// Keeps track of what each side of the center shows (called from render).
+    fn update_shown(&mut self) {
+        if let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) {
+            if is_session(&tab.kind) {
+                self.shown_session = Some(tab.id);
+            } else {
+                if self.shown_doc != Some(tab.id) {
+                    self.doc_hidden = false;
+                }
+                self.shown_doc = Some(tab.id);
+            }
+        }
+        if self.shown_session.is_some_and(|id| !self.tabs.iter().any(|t| t.id == id)) {
+            self.shown_session = self.tabs.iter().rev().find(|t| is_session(&t.kind)).map(|t| t.id);
+        }
+        if self.shown_doc.is_some_and(|id| !self.tabs.iter().any(|t| t.id == id)) {
+            self.shown_doc = self.tabs.iter().rev().find(|t| !is_session(&t.kind)).map(|t| t.id);
+        }
     }
 
     fn center(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let content = match self.active.and_then(|i| self.tabs.get(i)) {
-            Some(tab) => match &tab.kind {
-                TabKind::Terminal { view, .. } => view.clone().into_any_element(),
-                TabKind::File(v) => v.clone().into_any_element(),
-                TabKind::Diff(v) => v.clone().into_any_element(),
-                TabKind::Conflicts(v) => v.clone().into_any_element(),
-                TabKind::Chat { view, .. } => view.clone().into_any_element(),
-                TabKind::Search(v) => v.clone().into_any_element(),
-                TabKind::Review(v) => v.clone().into_any_element(),
-            },
-            None => self.empty_state(cx).into_any_element(),
+        let session = self.shown_session.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        let doc = self.shown_doc.filter(|_| !self.doc_hidden).and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        let doc_pane = doc.map(|i| {
+            v_flex()
+                .size_full()
+                .min_w_0()
+                .child(self.tab_bar(cx))
+                .child(div().flex_1().min_h_0().child(Self::tab_view(&self.tabs[i].kind)))
+        });
+        let session_pane = session.map(|i| {
+            div()
+                .id("session-pane")
+                .size_full()
+                .min_w_0()
+                // Clicking in the session makes it the active tab (⌘W, shortcuts).
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if this.active != Some(i) {
+                            this.active = Some(i);
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(Self::tab_view(&self.tabs[i].kind))
+        });
+        let content = match (session_pane, doc_pane) {
+            (Some(s), Some(d)) => h_resizable("center-split")
+                .with_state(&self.center_split)
+                .child(resizable_panel().size_range(px(320.)..Pixels::MAX).child(s))
+                .child(resizable_panel().size_range(px(280.)..Pixels::MAX).child(d))
+                .into_any_element(),
+            (Some(s), None) => s.into_any_element(),
+            (None, Some(d)) => d.into_any_element(),
+            (None, None) => v_flex()
+                .size_full()
+                .when(self.tabs.iter().any(|t| !is_session(&t.kind)), |d| d.child(self.tab_bar(cx)))
+                .child(div().flex_1().min_h_0().child(self.empty_state(cx)))
+                .into_any_element(),
         };
         v_flex()
             .size_full()
             .min_w_0()
-            .when(self.tabs.iter().any(|t| !is_session(&t.kind)), |d| d.child(self.tab_bar(cx)))
             .when_some(self.follow_bar(cx), |d, bar| d.child(bar))
             .when(self.merge_approval_ready, |d| {
                 d.child(
@@ -2500,6 +2772,20 @@ impl ProjectView {
             .child(div().text_xs().text_color(style::faint()).child(shortcuts))
     }
 
+    /// Right-panel tabs not hidden in Settings.
+    fn visible_panels(&self, cx: &App) -> Vec<SidePanel> {
+        let hidden = &state::get(cx).settings.hidden_panels;
+        SidePanel::ALL.into_iter().filter(|p| !hidden.iter().any(|h| h == p.key())).collect()
+    }
+
+    fn pr_merge_method(&self, cx: &App) -> PrMergeMethod {
+        match state::get(cx).settings.pr_merge_method.as_str() {
+            "squash" => PrMergeMethod::Squash,
+            "rebase" => PrMergeMethod::Rebase,
+            _ => PrMergeMethod::Merge,
+        }
+    }
+
     fn right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let counts: HashMap<SidePanel, usize> = HashMap::from([
             (SidePanel::Changes, self.git.changes.len()),
@@ -2513,7 +2799,7 @@ impl ProjectView {
             .gap_1()
             .border_b_1()
             .border_color(style::border())
-            .children(SidePanel::ALL.into_iter().map(|p| {
+            .children(self.visible_panels(cx).into_iter().map(|p| {
                 let selected = self.panel == Some(p);
                 let count = counts.get(&p).copied().unwrap_or(0);
                 let tip: SharedString = p.label().into();
@@ -3137,79 +3423,7 @@ impl ProjectView {
             Some(Ok(prs)) if prs.is_empty() => panel_message("No open PRs.").into_any_element(),
             Some(Ok(prs)) => v_flex()
                 .gap_0p5()
-                .children(prs.iter().map(|pr| {
-                    let number = pr.number;
-                    let title = pr.title.clone();
-                    let review = match pr.review_decision.as_deref() {
-                        Some("APPROVED") => Some(("approved", style::good())),
-                        Some("CHANGES_REQUESTED") => Some(("changes requested", style::bad())),
-                        _ => None,
-                    };
-                    v_flex()
-                        .id(("pr", number as usize))
-                        .px_2()
-                        .py_1p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(style::panel_hover()))
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .text_sm()
-                                .child(div().text_color(style::muted()).child(format!("#{number}")))
-                                .child(div().truncate().child(pr.title.clone())),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(style::faint())
-                                .child(pr.author.login.clone())
-                                .child(format!("{} → {}", pr.head_ref_name, pr.base_ref_name))
-                                .child(div().text_color(style::good()).child(format!("+{}", pr.additions)))
-                                .child(div().text_color(style::bad()).child(format!("−{}", pr.deletions)))
-                                .when(pr.is_draft, |d| d.child("draft"))
-                                .when_some(review, |d, (t, c)| d.child(div().text_color(c).child(t))),
-                        )
-                        .when(!pr.is_draft, |d| {
-                            let merging_this = self.git.pr_merging == Some(number);
-                            let pr_btn = |tag: &'static str, label: &'static str, method: PrMergeMethod| {
-                                div()
-                                    .id((tag, number as usize))
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .border_1()
-                                    .border_color(style::border())
-                                    .text_color(style::muted())
-                                    .hover(|d| d.bg(style::bg()).text_color(style::accent()))
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.run_pr_merge(number, method, window, cx);
-                                    }))
-                            };
-                            d.child(
-                                h_flex()
-                                    .mt_1()
-                                    .gap_1()
-                                    .items_center()
-                                    .when(merging_this, |d| d.child(div().text_xs().text_color(style::accent()).child("Merging…")))
-                                    .when(!merging_this, |d| {
-                                        d.child(icons::ui("git-merge", px(11.), style::faint()))
-                                            .child(pr_btn("pr-merge", "Merge", PrMergeMethod::Merge))
-                                            .child(pr_btn("pr-squash", "Squash", PrMergeMethod::Squash))
-                                            .child(pr_btn("pr-rebase", "Rebase", PrMergeMethod::Rebase))
-                                    }),
-                            )
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let Some(repo) = this.repo.clone() else { return };
-                            this.open_diff(format!("PR #{number}"), title.clone(), move || repo.pr_diff(number), window, cx);
-                        }))
-                }))
+                .children(prs.iter().map(|pr| self.pr_row(pr, cx)))
                 .into_any_element(),
         };
         div()
@@ -3583,6 +3797,7 @@ impl ProjectView {
 
 impl Render for ProjectView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.update_shown();
         v_flex()
             .key_context("Project")
             .track_focus(&self.focus)
@@ -3606,6 +3821,7 @@ impl Render for ProjectView {
             }))
             .on_action(cx.listener(|this, _: &QuickOpenFile, window, cx| this.toggle_quick_open(window, cx)))
             .on_action(cx.listener(|this, _: &SearchProject, window, cx| this.open_search(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .size_full()
             .relative()
             .bg(style::bg())
@@ -3613,11 +3829,27 @@ impl Render for ProjectView {
                 div().flex_1().min_h_0().child({
                     let saved = state::get(cx);
                     let (left, right) = (saved.left_width.unwrap_or(248.).max(220.), saved.right_width.unwrap_or(300.));
-                    h_resizable("project-layout")
-                        .with_state(&self.layout)
-                        .child(resizable_panel().size(px(left)).size_range(px(220.)..px(420.)).child(self.left_sidebar(cx)))
-                        .child(resizable_panel().child(self.center(cx)))
-                        .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx)))
+                    if self.left_collapsed {
+                        h_flex()
+                            .size_full()
+                            .child(self.sidebar_rail(cx))
+                            .child(
+                                div().flex_1().min_w_0().h_full().child(
+                                    h_resizable("project-layout-folded")
+                                        .with_state(&self.layout_collapsed)
+                                        .child(resizable_panel().child(self.center(cx)))
+                                        .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx))),
+                                ),
+                            )
+                            .into_any_element()
+                    } else {
+                        h_resizable("project-layout")
+                            .with_state(&self.layout)
+                            .child(resizable_panel().size(px(left)).size_range(px(220.)..px(420.)).child(self.left_sidebar(cx)))
+                            .child(resizable_panel().child(self.center(cx)))
+                            .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx)))
+                            .into_any_element()
+                    }
                 }),
             )
             .child(self.status_bar(cx))
@@ -3826,4 +4058,24 @@ fn activity_for(root: &Path, events: &[UsageEvent]) -> Vec<ActivityRow> {
     let mut rows: Vec<ActivityRow> = by_session.into_values().collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.last));
     rows
+}
+
+/// Fold/unfold button for the left sidebar.
+fn sidebar_toggle(collapsed: bool) -> Stateful<Div> {
+    let tip = if cfg!(target_os = "macos") {
+        if collapsed { "Show sidebar (⌘B)" } else { "Hide sidebar (⌘B)" }
+    } else if collapsed {
+        "Show sidebar (Ctrl+B)"
+    } else {
+        "Hide sidebar (Ctrl+B)"
+    };
+    div()
+        .id(if collapsed { "sidebar-expand" } else { "sidebar-collapse" })
+        .flex_none()
+        .p_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(style::panel_hover()))
+        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .child(icons::ui(if collapsed { "panel-left-open" } else { "panel-left-close" }, px(15.), style::muted()))
 }
