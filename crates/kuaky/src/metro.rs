@@ -344,6 +344,21 @@ impl ProjectView {
         cx.notify();
     }
 
+    /// Clic en una línea: la elige; clic otra vez en la elegida: la suelta.
+    fn toggle_line(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.board.as_ref().is_some_and(|b| b.selected.as_deref() == Some(id.as_str())) {
+            if let Some(b) = &mut self.board {
+                b.selected = None;
+                b.menu = None;
+                b.name_input = None;
+                b._sub = None;
+            }
+            cx.notify();
+            return;
+        }
+        self.select_line(id, window, cx);
+    }
+
     fn select_line(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.lines.get(&id).map(|l| l.name.clone()) else { return };
         let input = cx.new(|cx| {
@@ -930,12 +945,10 @@ impl ProjectView {
                 .pr_2()
                 .cursor_pointer()
                 .rounded_l(px(10.))
-                .border_l_4()
-                .border_color(if is_sel { c.into() } else { style::transparent() })
-                .when(is_sel, |d| d.bg(style::soft(c, 0.10)))
+                .when(is_sel, |d| d.bg(style::panel_hover()))
                 .when(dim, |d| d.opacity(0.55))
                 .hover(|d| d.bg(style::panel_hover()).opacity(1.))
-                .on_click(cx.listener(move |this, _, window, cx| this.select_line(id.clone(), window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| this.toggle_line(id.clone(), window, cx)))
                 .child(
                     h_flex()
                         .gap_1p5()
@@ -995,7 +1008,7 @@ impl ProjectView {
                         .rounded_full()
                         .cursor_pointer()
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                        .on_click(cx.listener(move |this, _, window, cx| this.select_line(id.clone(), window, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| this.toggle_line(id.clone(), window, cx)))
                         .into_any_element(),
                 );
                 overlay.push(
