@@ -97,3 +97,23 @@ fn file_writes_and_commands_are_reported() {
     }
     assert!(wrote && commands && located);
 }
+
+#[test]
+fn agent_death_is_reported() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mock_agent.py");
+    let client = Client::spawn(&PathBuf::from("python3"), &[script.to_string_lossy().into_owned()], &std::env::temp_dir(), &[]).unwrap();
+    let session = client.new_session(&std::env::temp_dir()).unwrap();
+    assert!(!client.is_closed());
+    client.prompt(&session, "die").unwrap();
+    let events = client.events();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match events.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Event::Exited) => break,
+            Ok(_) => {}
+            Err(e) => panic!("no Exited: {e}"),
+        }
+        assert!(std::time::Instant::now() < deadline);
+    }
+    assert!(client.is_closed());
+}

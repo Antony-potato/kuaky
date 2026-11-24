@@ -194,9 +194,16 @@ pub struct Client {
     pub capabilities: AgentCapabilities,
     /// Carpetas donde el agente puede escribir por `fs/write_text_file`.
     roots: Arc<Mutex<Vec<PathBuf>>>,
+    /// El proceso del agente cerró su salida (murió o terminó).
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Client {
+    /// ¿Murió el proceso del agente?
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     /// Lanza el agente y hace `initialize`.
     pub fn spawn(program: &Path, args: &[String], cwd: &Path, env: &[(String, String)]) -> anyhow::Result<Client> {
         let mut cmd = Command::new(program);
@@ -215,8 +222,10 @@ impl Client {
         let pending: Pending = Arc::default();
         let (tx, rx) = flume::unbounded();
         let roots: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(vec![cwd.to_path_buf()]));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         {
+            let closed = closed.clone();
             let tx = tx.clone();
             let pending = pending.clone();
             let stdin = stdin.clone();
@@ -230,6 +239,7 @@ impl Client {
                     let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
                     handle_incoming(msg, &pending, &stdin, &tx, &roots);
                 }
+                closed.store(true, Ordering::SeqCst);
                 for (_, waiter) in pending.lock().unwrap().drain() {
                     let _ = waiter.send(Err("el agente terminó".into()));
                 }
@@ -247,6 +257,7 @@ impl Client {
             agent_name: None,
             capabilities: AgentCapabilities::default(),
             roots,
+            closed,
         };
         let init = client.request(
             "initialize",

@@ -41,6 +41,8 @@ while True:
               "currentValue": p["value"], "options": [{"value": "a", "name": "A"}, {"value": "b", "name": "B"}]}]}})
     elif method == "session/prompt":
         s = msg["params"]["sessionId"]
+        if any(b.get("text") == "die" for b in msg["params"].get("prompt", [])):
+            sys.exit(1)  # simula que el proceso del agente se cae
         update(s, {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "pensando"}})
         update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hola "}})
         update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "mundo"}})

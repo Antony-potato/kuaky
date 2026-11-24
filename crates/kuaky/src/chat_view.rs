@@ -256,6 +256,8 @@ pub struct ChatView {
     /// Seguir el final mientras llega texto. Lo apaga subir con la rueda;
     /// lo enciende volver al final, "Jump to latest" o mandar un mensaje.
     stick_bottom: bool,
+    /// Reconexiones recientes (para no reintentar en bucle).
+    reconnects: Vec<Instant>,
     focus: FocusHandle,
     _sub: Subscription,
 }
@@ -330,6 +332,7 @@ impl ChatView {
             input,
             scroll: ScrollHandle::new(),
             stick_bottom: true,
+            reconnects: Vec::new(),
             focus: cx.focus_handle(),
             _sub: sub,
         };
@@ -352,7 +355,28 @@ impl ChatView {
     }
 
     fn connect(&self, cx: &mut Context<Self>) {
-        let launch = self.launch.clone();
+        self.connect_with(false, cx);
+    }
+
+    /// Vuelve a abrir el agente tras morir su proceso: retoma la misma conversación
+    /// (`session/load`) sin repetir en pantalla lo que ya se ve.
+    fn reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.status == ChatStatus::Connecting {
+            return;
+        }
+        self.client = None;
+        self.status = ChatStatus::Connecting;
+        self.reconnects.push(Instant::now());
+        cx.emit(ChatEvent::Status);
+        cx.notify();
+        self.connect_with(true, cx);
+    }
+
+    fn connect_with(&self, again: bool, cx: &mut Context<Self>) {
+        let mut launch = self.launch.clone();
+        if again {
+            launch.resume = self.session.clone().or(launch.resume);
+        }
         // Preferencias de la última vez (solo para sesiones nuevas): modelo primero,
         // porque las demás opciones (esfuerzo…) pueden depender de él.
         let mut prefs: Vec<(String, String)> = if launch.resume.is_none() {
@@ -367,10 +391,15 @@ impl ChatView {
                 .spawn(async move {
                     let env = vec![("PATH".to_string(), kuaky_git::login_path().to_string_lossy().into_owned())];
                     let client = Arc::new(Client::spawn(&launch.program, &launch.args, &launch.cwd, &env)?);
+                    let resumed = launch.resume.is_some() && client.capabilities.load_session;
                     let mut info = match &launch.resume {
                         Some(id) if client.capabilities.load_session => client.load_session(&launch.cwd, id)?,
                         _ => client.new_session_info(&launch.cwd)?,
                     };
+                    if again {
+                        // Lo que repite `session/load` ya está en pantalla.
+                        client.events().drain();
+                    }
                     for (id, value) in &prefs {
                         let applies = info.config.iter().any(|o| &o.id == id && &o.current != value && o.options.iter().any(|v| &v.value == value));
                         if !applies {
@@ -386,10 +415,10 @@ impl ChatView {
                             Err(_) => {}
                         }
                     }
-                    anyhow::Ok((client, info))
+                    anyhow::Ok((client, info, resumed))
                 })
                 .await;
-            let (client, info) = match result {
+            let (client, info, resumed) = match result {
                 Ok(ok) => ok,
                 Err(err) => {
                     this.update(cx, |this, cx| {
@@ -399,7 +428,12 @@ impl ChatView {
                         } else {
                             text
                         };
-                        this.status = ChatStatus::Error(hint);
+                        if again {
+                            this.current_turn().items.push(Item::Notice(format!("Could not reconnect: {hint}")));
+                            this.status = ChatStatus::Exited;
+                        } else {
+                            this.status = ChatStatus::Error(hint);
+                        }
                         cx.emit(ChatEvent::Status);
                         cx.notify();
                     })
@@ -410,6 +444,13 @@ impl ChatView {
             let events = client.events();
             let ok = this
                 .update(cx, |this, cx| {
+                    if again {
+                        this.current_turn().items.push(Item::Notice(if resumed {
+                            "Reconnected to the agent; the conversation continues.".into()
+                        } else {
+                            "Reconnected in a new session: this agent can't resume, so it doesn't remember the messages above.".into()
+                        }));
+                    }
                     this.session = Some(info.id.clone());
                     this.config = info.config;
                     this.client = Some(client);
@@ -430,7 +471,7 @@ impl ChatView {
                         this.open_config = Some(id);
                     }
                     #[cfg(feature = "screenshot")]
-                    if let Ok(prompt) = std::env::var("KUAKY_DEMO_CHAT_PROMPT") {
+                    if let Some(prompt) = std::env::var("KUAKY_DEMO_CHAT_PROMPT").ok().filter(|_| !again) {
                         this.dispatch(prompt, Vec::new(), cx);
                     }
                     cx.notify();
@@ -649,13 +690,41 @@ impl ChatView {
                 }
             }
             Event::Error(e) => {
-                self.status = ChatStatus::Ready;
-                self.current_turn().items.push(Item::Notice(format!("Error: {e}")));
+                // Si el agente ya se cayó, este error es solo el turno que quedó cortado.
+                if self.status != ChatStatus::Exited && self.status != ChatStatus::Connecting {
+                    self.status = ChatStatus::Ready;
+                    self.current_turn().items.push(Item::Notice(format!("Error: {e}")));
+                }
                 cx.emit(ChatEvent::Status);
             }
             Event::Exited => {
+                let was_running = self.status == ChatStatus::Running;
                 self.status = ChatStatus::Exited;
+                self.client = None;
+                if let Some(turn) = self.turns.last_mut() {
+                    if was_running {
+                        turn.duration = turn.started.map(|s| s.elapsed());
+                    }
+                }
+                self.current_turn().items.push(Item::Notice(if was_running {
+                    "The agent process stopped in the middle of the turn.".into()
+                } else {
+                    "The agent process stopped.".into()
+                }));
                 cx.emit(ChatEvent::Status);
+                // Un reintento solo (no más de 2 en 5 minutos, por si se cae en bucle).
+                self.reconnects.retain(|t| t.elapsed() < Duration::from_secs(300));
+                if self.reconnects.len() < 2 && !crate::app::quitting() {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.status == ChatStatus::Exited {
+                                this.reconnect(cx);
+                            }
+                        });
+                    })
+                    .detach();
+                }
             }
         }
     }
@@ -848,6 +917,10 @@ impl ChatView {
     fn dispatch(&mut self, text: String, images: Vec<Attachment>, cx: &mut Context<Self>) {
         let (Some(client), Some(session)) = (self.client.clone(), self.session.clone()) else {
             self.queue.insert(0, Queued { text, images });
+            // Sin agente vivo: se reconecta y el mensaje sale al conectar.
+            if self.status == ChatStatus::Exited {
+                self.reconnect(cx);
+            }
             return;
         };
         let n = self.turns.iter().filter(|t| t.user.is_some()).count() + 1;
@@ -873,6 +946,16 @@ impl ChatView {
         self.last_event = Instant::now();
         if let Err(err) = client.prompt_blocks(&session, &blocks) {
             self.current_turn().items.push(Item::Notice(format!("Failed to send: {err:#}")));
+            if client.is_closed() {
+                // El proceso murió: reconectar y reenviar este mensaje.
+                if let Some(turn) = self.turns.pop() {
+                    if let Some(user) = turn.user {
+                        self.queue.insert(0, Queued { text: user.text, images });
+                    }
+                }
+                self.status = ChatStatus::Exited;
+                self.reconnect(cx);
+            }
             cx.notify();
             return;
         }
@@ -2485,6 +2568,50 @@ impl Render for ChatView {
                         .text_color(style::accent())
                         .child(crate::icons::ui("pencil", px(11.), style::accent()))
                         .child(format!("Editing message #{n} — sending starts a new version (the current one is kept). Esc cancels.")),
+                )
+            })
+            // El agente se cayó: avisar y dejar reconectar (escribir y enviar también reconecta).
+            .when(self.status == ChatStatus::Exited, |d| {
+                d.child(
+                    h_flex()
+                        .w_full()
+                        .max_w(px(Self::COLUMN))
+                        .mx_auto()
+                        .px_3()
+                        .py_1p5()
+                        .gap_2()
+                        .items_center()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(style::border())
+                        .text_xs()
+                        .child(div().size(px(6.)).rounded_full().bg(style::faint()))
+                        .child(div().flex_1().text_color(style::muted()).child("The agent isn't running. Sending a message reconnects it."))
+                        .child(
+                            div()
+                                .id("chat-reconnect")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(style::border())
+                                .text_color(style::text())
+                                .cursor_pointer()
+                                .hover(|d| d.bg(style::panel_hover()))
+                                .child("Reconnect")
+                                .on_click(cx.listener(|this, _, _, cx| this.reconnect(cx))),
+                        ),
+                )
+            })
+            .when(self.status == ChatStatus::Connecting && !self.reconnects.is_empty(), |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .max_w(px(Self::COLUMN))
+                        .mx_auto()
+                        .text_xs()
+                        .text_color(style::faint())
+                        .child("Reconnecting to the agent…"),
                 )
             })
             .child(
