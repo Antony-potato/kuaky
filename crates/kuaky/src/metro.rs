@@ -705,21 +705,31 @@ impl ProjectView {
         let trains = self.trains(cx);
         let mut used: Vec<usize> = Vec::new();
         let mut out: Vec<AnyElement> = Vec::new();
-        for (line, depth) in self.lines.ordered(true) {
-            let tabs: Vec<usize> = self.line_trains(line, &trains).into_iter().map(|(_, t)| t.tab).collect();
-            if tabs.is_empty() {
-                continue;
-            }
+        // Solo las líneas con sesiones abiertas; las sub-líneas cuelgan de su línea como árbol.
+        let shown: Vec<(&Line, usize, Vec<usize>)> = self
+            .lines
+            .ordered(true)
+            .into_iter()
+            .filter_map(|(line, depth)| {
+                let tabs: Vec<usize> = self.line_trains(line, &trains).into_iter().map(|(_, t)| t.tab).collect();
+                (!tabs.is_empty()).then_some((line, depth, tabs))
+            })
+            .collect();
+        for (k, (line, depth, tabs)) in shown.iter().enumerate() {
+            let (line, depth) = (*line, *depth);
+            // ¿Le quedan hermanos abajo en el nivel `level`? (├ / │ si sí; └ si es el último)
+            let more_at = |level: usize| shown[k + 1..].iter().take_while(|(_, d, _)| *d >= level).any(|(_, d, _)| *d == level);
+            let guides: Vec<bool> = (1..=depth).map(more_at).collect();
+            let mut block = v_flex();
             let (state, state_color) = self.line_state(line, &trains);
             let total = line.stations.len();
             let done = line.done_count();
             let id = line.id.clone();
             let _ = state_color;
-            out.push(
+            block = block.child(
                 h_flex()
                     .id(SharedString::from(format!("line-head-{}", line.id)))
                     .mt_2()
-                    .ml(px(depth as f32 * 10.))
                     .px_2()
                     .gap_1()
                     .items_center()
@@ -730,8 +740,6 @@ impl ProjectView {
                     .hover(|d| d.text_color(style::muted()))
                     .group(SharedString::from(format!("line-g-{}", line.id)))
                     .relative()
-                    // Sub-línea: se ve como rama del tema de arriba.
-                    .when(depth > 0, |d| d.child(icons::ui("corner-down-right", px(11.), style::faint())))
                     .child(div().min_w_0().truncate().child(line.name.clone()))
                     .when(total > 0, |d| d.child(div().flex_none().child(format!("· {done}/{total}"))))
                     .child(div().flex_1())
@@ -770,12 +778,13 @@ impl ProjectView {
                     .on_click(cx.listener(move |this, _, window, cx| this.open_board(Some(id.clone()), window, cx)))
                     .into_any_element(),
             );
-            for i in tabs {
+            for &i in tabs {
                 if let Some(row) = self.tabs.get(i).and_then(|tab| self.session_row(i, tab, now, cx)) {
-                    out.push(div().ml(px(depth as f32 * 10.)).child(row).into_any_element());
+                    block = block.child(row);
                     used.push(i);
                 }
             }
+            out.push(if depth == 0 { block.into_any_element() } else { tree_branch(block, &guides) });
         }
         let rest: Vec<usize> =
             (0..self.tabs.len()).filter(|i| !used.contains(i) && self.tabs.get(*i).is_some_and(|t| super::is_session(&t.kind))).collect();
@@ -791,6 +800,7 @@ impl ProjectView {
     }
 
     // ── Mini mapa (panel derecho) ───────────────────────────────────────
+
 
     pub(super) fn mini_map(&self, cx: &mut Context<Self>) -> AnyElement {
         let trains = self.trains(cx);
@@ -1739,4 +1749,32 @@ mod tests {
         assert!(!reviewer_is_done("Two problems: the LGTM check in foo() is wrong."));
         assert!(!reviewer_is_done("1. src/a.rs:10 leaks the handle"));
     }
+}
+
+/// Sub-línea en la barra izquierda: su bloque con guías de árbol a la izquierda
+/// (├ o └ hacia su encabezado; │ por los niveles de arriba que siguen).
+fn tree_branch(block: Div, guides: &[bool]) -> AnyElement {
+    const W: f32 = 14.;
+    const X: f32 = 9.;
+    // Altura del medio del encabezado (lleva mt_2).
+    const MID: f32 = 19.;
+    let n = guides.len();
+    // En GPUI lo absoluto se ubica respecto a su padre directo: las guías van
+    // como hijos directos del bloque.
+    let mut lines: Vec<AnyElement> = Vec::new();
+    for (k, &more) in guides.iter().enumerate() {
+        let x = px(W * k as f32 + X);
+        let vertical = || div().absolute().left(x).w(px(1.)).top(px(-4.)).bg(style::faint());
+        if k + 1 < n {
+            // Nivel de arriba: la línea sigue si a ese nivel quedan hermanos abajo.
+            if more {
+                lines.push(vertical().bottom_0().into_any_element());
+            }
+        } else {
+            // Este nivel: ├ si quedan hermanos abajo, └ si es el último.
+            lines.push(if more { vertical().bottom_0() } else { vertical().h(px(MID + 4.)) }.into_any_element());
+            lines.push(div().absolute().top(px(MID)).left(x).w(px(W - X + 6.)).h(px(1.)).bg(style::faint()).into_any_element());
+        }
+    }
+    div().relative().pl(px(W * n as f32)).child(block).children(lines).into_any_element()
 }
