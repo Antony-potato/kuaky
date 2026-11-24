@@ -3,16 +3,16 @@
 //! del proceso del agente (`claude-agent-acp`, `agy acp`, `gemini --acp`…).
 //!
 //! Usa hilos y canales (sin runtime async), así encaja con cualquier
-//! interfaz. kuaky no ofrece al agente lectura/escritura de archivos ni
-//! terminal: el agente trabaja directo sobre el disco y kuaky muestra lo que
-//! hace.
+//! interfaz. kuaky ofrece al agente leer y escribir archivos de texto (así ve
+//! cada cambio), dentro de las carpetas permitidas; no ofrece terminal: el
+//! agente ejecuta sus comandos por su cuenta y kuaky muestra lo que hace.
 
 use anyhow::{Context as _, anyhow, bail};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -26,6 +26,8 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Algo que pasó en la sesión.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
+    /// Mensaje del usuario repetido al retomar una sesión (`session/load`).
+    UserMessageChunk(String),
     MessageChunk(String),
     ThoughtChunk(String),
     ToolCall(ToolCall),
@@ -35,8 +37,91 @@ pub enum Event {
     Permission(PermissionRequest),
     /// Terminó el turno (`end_turn`, `cancelled`, `max_tokens`…).
     TurnEnded(String),
+    /// Comandos `/` que ofrece el agente.
+    Commands(Vec<SlashCommand>),
+    /// Cambió el modo (p. ej. `plan`, `acceptEdits`).
+    ModeChanged(String),
+    /// Nuevas opciones de sesión (modelo, esfuerzo, modo…).
+    ConfigOptions(Vec<ConfigOption>),
+    /// Título de la sesión que puso el agente.
+    Title(String),
+    /// El agente escribió un archivo a través de kuaky (`fs/write_text_file`).
+    FileWritten { path: PathBuf, old_text: Option<String>, new_text: String },
     Error(String),
     Exited,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlashCommand {
+    pub name: String,
+    pub description: String,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigOption {
+    pub id: String,
+    pub name: String,
+    /// `model`, `mode`, `thought_level`, `speed`…
+    pub category: String,
+    pub current: String,
+    pub options: Vec<ConfigValue>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigValue {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Lo que devuelve el agente al crear o retomar una sesión.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SessionInfo {
+    pub id: String,
+    pub config: Vec<ConfigOption>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AgentCapabilities {
+    pub load_session: bool,
+    pub list_sessions: bool,
+    pub image: bool,
+    pub embedded_context: bool,
+}
+
+/// Un bloque del mensaje que se envía al agente.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromptBlock {
+    Text(String),
+    /// Archivo mencionado con `@` (el agente lo lee si lo necesita).
+    ResourceLink { uri: String, name: String },
+    /// Imagen en base64.
+    Image { data: String, mime: String },
+}
+
+impl PromptBlock {
+    fn to_json(&self) -> Value {
+        match self {
+            PromptBlock::Text(t) => json!({ "type": "text", "text": t }),
+            PromptBlock::ResourceLink { uri, name } => json!({ "type": "resource_link", "uri": uri, "name": name }),
+            PromptBlock::Image { data, mime } => json!({ "type": "image", "data": data, "mimeType": mime }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Location {
+    pub path: String,
+    pub line: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -49,6 +134,7 @@ pub struct ToolCall {
     pub status: Option<String>,
     pub diffs: Vec<FileDiff>,
     pub text: Option<String>,
+    pub locations: Vec<Location>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +176,9 @@ pub struct Client {
     events: flume::Receiver<Event>,
     events_tx: flume::Sender<Event>,
     pub agent_name: Option<String>,
+    pub capabilities: AgentCapabilities,
+    /// Carpetas donde el agente puede escribir por `fs/write_text_file`.
+    roots: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Client {
@@ -110,11 +199,13 @@ impl Client {
         let stdout = child.stdout.take().context("sin stdout")?;
         let pending: Pending = Arc::default();
         let (tx, rx) = flume::unbounded();
+        let roots: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(vec![cwd.to_path_buf()]));
 
         {
             let tx = tx.clone();
             let pending = pending.clone();
             let stdin = stdin.clone();
+            let roots = roots.clone();
             std::thread::Builder::new().name("acp-reader".into()).spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
@@ -122,7 +213,7 @@ impl Client {
                         continue;
                     }
                     let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                    handle_incoming(msg, &pending, &stdin, &tx);
+                    handle_incoming(msg, &pending, &stdin, &tx, &roots);
                 }
                 for (_, waiter) in pending.lock().unwrap().drain() {
                     let _ = waiter.send(Err("el agente terminó".into()));
@@ -139,12 +230,14 @@ impl Client {
             events: rx,
             events_tx: tx,
             agent_name: None,
+            capabilities: AgentCapabilities::default(),
+            roots,
         };
         let init = client.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": { "fs": { "readTextFile": false, "writeTextFile": false }, "terminal": false },
+                "clientCapabilities": { "fs": { "readTextFile": true, "writeTextFile": true }, "terminal": false },
                 "clientInfo": { "name": "kuaky", "version": env!("CARGO_PKG_VERSION") },
             }),
             Duration::from_secs(60),
@@ -154,7 +247,22 @@ impl Client {
             .and_then(|i| i.get("title").or_else(|| i.get("name")))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let caps = init.get("agentCapabilities").cloned().unwrap_or(Value::Null);
+        client.capabilities = AgentCapabilities {
+            load_session: caps.get("loadSession").and_then(Value::as_bool).unwrap_or(false),
+            list_sessions: caps.pointer("/sessionCapabilities/list").is_some(),
+            image: caps.pointer("/promptCapabilities/image").and_then(Value::as_bool).unwrap_or(false),
+            embedded_context: caps.pointer("/promptCapabilities/embeddedContext").and_then(Value::as_bool).unwrap_or(false),
+        };
         Ok(client)
+    }
+
+    /// Añade una carpeta donde el agente puede escribir (p. ej. un worktree).
+    pub fn allow_root(&self, dir: &Path) {
+        let mut roots = self.roots.lock().unwrap();
+        if !roots.iter().any(|r| r == dir) {
+            roots.push(dir.to_path_buf());
+        }
     }
 
     pub fn events(&self) -> flume::Receiver<Event> {
@@ -187,25 +295,79 @@ impl Client {
 
     /// Crea una sesión en `cwd` y devuelve su id.
     pub fn new_session(&self, cwd: &Path) -> anyhow::Result<String> {
+        Ok(self.new_session_info(cwd)?.id)
+    }
+
+    /// Crea una sesión en `cwd` con sus opciones (modelo, modo…).
+    pub fn new_session_info(&self, cwd: &Path) -> anyhow::Result<SessionInfo> {
         let result = self.request(
             "session/new",
             json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
             Duration::from_secs(120),
         )?;
-        result
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .context("session/new sin sessionId")
+        let id = result.get("sessionId").and_then(Value::as_str).map(str::to_string).context("session/new sin sessionId")?;
+        Ok(SessionInfo { id, config: parse_session_config(&result) })
+    }
+
+    /// Retoma una sesión anterior: el agente repite la conversación como
+    /// eventos (`UserMessageChunk`, `MessageChunk`, herramientas…).
+    pub fn load_session(&self, cwd: &Path, id: &str) -> anyhow::Result<SessionInfo> {
+        let result = self.request(
+            "session/load",
+            json!({ "sessionId": id, "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+            Duration::from_secs(120),
+        )?;
+        Ok(SessionInfo { id: id.to_string(), config: parse_session_config(&result) })
+    }
+
+    /// Sesiones anteriores del agente en `cwd`, si las ofrece.
+    pub fn list_sessions(&self, cwd: &Path) -> anyhow::Result<Vec<SessionSummary>> {
+        let result = self.request("session/list", json!({ "cwd": cwd.to_string_lossy() }), Duration::from_secs(30))?;
+        Ok(result
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| {
+                        Some(SessionSummary {
+                            id: s.get("sessionId")?.as_str()?.to_string(),
+                            title: s.get("title").and_then(Value::as_str).map(str::to_string),
+                            cwd: s.get("cwd").and_then(Value::as_str).map(str::to_string),
+                            updated_at: s.get("updatedAt").and_then(Value::as_str).map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Cambia una opción de la sesión (modelo, esfuerzo, modo…). Devuelve las
+    /// opciones actualizadas si el agente las manda.
+    pub fn set_config_option(&self, session: &str, config_id: &str, value: &str) -> anyhow::Result<Vec<ConfigOption>> {
+        let result = self.request(
+            "session/set_config_option",
+            json!({ "sessionId": session, "configId": config_id, "value": value }),
+            Duration::from_secs(30),
+        )?;
+        Ok(parse_session_config(&result))
+    }
+
+    /// Cambia el modo con el método clásico (`session/set_mode`).
+    pub fn set_mode(&self, session: &str, mode_id: &str) -> anyhow::Result<()> {
+        self.request("session/set_mode", json!({ "sessionId": session, "modeId": mode_id }), Duration::from_secs(30))?;
+        Ok(())
     }
 
     /// Envía un mensaje. La respuesta llega como [`Event::TurnEnded`] cuando
     /// el agente termina su turno; mientras tanto llegan los demás eventos.
     pub fn prompt(&self, session: &str, text: &str) -> anyhow::Result<()> {
-        let rx = self.start_request(
-            "session/prompt",
-            json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] }),
-        )?;
+        self.prompt_blocks(session, &[PromptBlock::Text(text.to_string())])
+    }
+
+    /// Como [`Client::prompt`], con archivos mencionados o imágenes.
+    pub fn prompt_blocks(&self, session: &str, blocks: &[PromptBlock]) -> anyhow::Result<()> {
+        let prompt: Vec<Value> = blocks.iter().map(PromptBlock::to_json).collect();
+        let rx = self.start_request("session/prompt", json!({ "sessionId": session, "prompt": prompt }))?;
         let events = self.events_tx.clone();
         std::thread::spawn(move || {
             let event = match rx.recv() {
@@ -242,7 +404,94 @@ impl Drop for Client {
     }
 }
 
-fn handle_incoming(msg: Value, pending: &Pending, stdin: &Arc<Mutex<ChildStdin>>, tx: &flume::Sender<Event>) {
+fn reply(stdin: &Arc<Mutex<ChildStdin>>, msg: Value) {
+    if let Ok(mut s) = stdin.lock() {
+        let _ = writeln!(s, "{msg}");
+        let _ = s.flush();
+    }
+}
+
+/// Ruta canónica aunque el archivo (o sus carpetas) aún no existan: se
+/// canoniza el ancestro que sí existe y se le agrega el resto.
+fn canonical(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name().map(|n| n.to_os_string()), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    let mut out = existing.canonicalize().unwrap_or(existing);
+    for name in rest.into_iter().rev() {
+        out.push(name);
+    }
+    out
+}
+
+fn within(roots: &[PathBuf], path: &Path) -> bool {
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return false;
+    }
+    let target = canonical(path);
+    roots.iter().any(|r| target.starts_with(canonical(r)))
+}
+
+/// `fs/read_text_file`: `line` es 1-based; `limit` = número de líneas.
+pub fn read_text(path: &Path, line: Option<u64>, limit: Option<u64>) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    if line.is_none() && limit.is_none() {
+        return Ok(text);
+    }
+    let start = line.unwrap_or(1).saturating_sub(1) as usize;
+    let lines = text.split_inclusive('\n').skip(start);
+    Ok(match limit {
+        Some(n) => lines.take(n as usize).collect(),
+        None => lines.collect(),
+    })
+}
+
+fn handle_fs(method: &str, id: Value, params: &Value, stdin: &Arc<Mutex<ChildStdin>>, tx: &flume::Sender<Event>, roots: &Arc<Mutex<Vec<PathBuf>>>) {
+    let path = PathBuf::from(params.get("path").and_then(Value::as_str).unwrap_or(""));
+    let error = |msg: String| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": msg } });
+    if !path.is_absolute() {
+        return reply(stdin, error(format!("path must be absolute: {}", path.display())));
+    }
+    match method {
+        "fs/read_text_file" => {
+            let line = params.get("line").and_then(Value::as_u64);
+            let limit = params.get("limit").and_then(Value::as_u64);
+            match read_text(&path, line, limit) {
+                Ok(content) => reply(stdin, json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } })),
+                Err(e) => reply(stdin, error(format!("{}: {e}", path.display()))),
+            }
+        }
+        "fs/write_text_file" => {
+            let allowed = within(&roots.lock().unwrap(), &path);
+            if !allowed {
+                return reply(stdin, error(format!("kuaky only allows writing inside the project: {}", path.display())));
+            }
+            let new_text = params.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+            let old_text = std::fs::read_to_string(&path).ok();
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match std::fs::write(&path, &new_text) {
+                Ok(()) => {
+                    reply(stdin, json!({ "jsonrpc": "2.0", "id": id, "result": null }));
+                    let _ = tx.send(Event::FileWritten { path, old_text, new_text });
+                }
+                Err(e) => reply(stdin, error(format!("{}: {e}", path.display()))),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_incoming(msg: Value, pending: &Pending, stdin: &Arc<Mutex<ChildStdin>>, tx: &flume::Sender<Event>, roots: &Arc<Mutex<Vec<PathBuf>>>) {
     let method = msg.get("method").and_then(Value::as_str);
     let id = msg.get("id").cloned();
     match (method, id) {
@@ -262,13 +511,11 @@ fn handle_incoming(msg: Value, pending: &Pending, stdin: &Arc<Mutex<ChildStdin>>
             let params = msg.get("params").cloned().unwrap_or(Value::Null);
             if method == "session/request_permission" {
                 let _ = tx.send(Event::Permission(parse_permission(id, &params)));
+            } else if method.starts_with("fs/") {
+                handle_fs(method, id, &params, stdin, tx, roots);
             } else {
-                // No ofrecemos fs/terminal: responder "método no encontrado".
-                let reply = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("{method} no soportado por kuaky") } });
-                if let Ok(mut s) = stdin.lock() {
-                    let _ = writeln!(s, "{reply}");
-                    let _ = s.flush();
-                }
+                // No ofrecemos terminal ni otros métodos: "método no encontrado".
+                reply(stdin, json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("{method} no soportado por kuaky") } }));
             }
         }
         // Notificación.
@@ -293,7 +540,25 @@ fn text_of(content: &Value) -> Option<String> {
 pub fn parse_update(update: &Value) -> Option<Event> {
     let kind = update.get("sessionUpdate").and_then(Value::as_str)?;
     match kind {
+        "user_message_chunk" => text_of(update.get("content")?).map(Event::UserMessageChunk),
         "agent_message_chunk" => text_of(update.get("content")?).map(Event::MessageChunk),
+        "available_commands_update" => Some(Event::Commands(
+            update
+                .get("availableCommands")?
+                .as_array()?
+                .iter()
+                .filter_map(|c| {
+                    Some(SlashCommand {
+                        name: c.get("name")?.as_str()?.to_string(),
+                        description: c.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
+                        hint: c.pointer("/input/hint").and_then(Value::as_str).map(str::to_string),
+                    })
+                })
+                .collect(),
+        )),
+        "current_mode_update" => update.get("currentModeId").and_then(Value::as_str).map(|m| Event::ModeChanged(m.to_string())),
+        "config_option_update" | "config_options_update" => Some(Event::ConfigOptions(parse_config_options(update.get("configOptions")?))),
+        "session_info_update" => update.get("title").and_then(Value::as_str).map(|t| Event::Title(t.to_string())),
         "agent_thought_chunk" => text_of(update.get("content")?).map(Event::ThoughtChunk),
         "tool_call" => Some(Event::ToolCall(parse_tool_call(update))),
         "tool_call_update" => Some(Event::ToolCallUpdate(parse_tool_call(update))),
@@ -321,6 +586,14 @@ fn parse_tool_call(v: &Value) -> ToolCall {
         status: s("status"),
         ..ToolCall::default()
     };
+    if let Some(locs) = v.get("locations").and_then(Value::as_array) {
+        call.locations = locs
+            .iter()
+            .filter_map(|l| {
+                Some(Location { path: l.get("path")?.as_str()?.to_string(), line: l.get("line").and_then(Value::as_u64).map(|n| n as u32) })
+            })
+            .collect();
+    }
     if let Some(items) = v.get("content").and_then(Value::as_array) {
         let mut texts = Vec::new();
         for item in items {
@@ -366,4 +639,133 @@ fn parse_permission(id: Value, params: &Value) -> PermissionRequest {
         })
         .unwrap_or_default();
     PermissionRequest { request_id: id, title, options }
+}
+
+fn parse_config_options(v: &Value) -> Vec<ConfigOption> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| {
+                    Some(ConfigOption {
+                        id: o.get("id")?.as_str()?.to_string(),
+                        name: o.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                        category: o.get("category").and_then(Value::as_str).unwrap_or("").to_string(),
+                        current: o.get("currentValue").map(value_str).unwrap_or_default(),
+                        options: o
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .map(|opts| {
+                                opts.iter()
+                                    .filter_map(|x| {
+                                        Some(ConfigValue {
+                                            value: value_str(x.get("value")?),
+                                            name: x.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                                            description: x.get("description").and_then(Value::as_str).map(str::to_string),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn value_str(v: &Value) -> String {
+    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+}
+
+/// Opciones de sesión: `configOptions` si el agente las da; si no, se arman
+/// a partir de `modes` y `models` (formato anterior).
+pub fn parse_session_config(result: &Value) -> Vec<ConfigOption> {
+    if let Some(opts) = result.get("configOptions") {
+        let parsed = parse_config_options(opts);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(models) = result.get("models") {
+        let options: Vec<ConfigValue> = models
+            .get("availableModels")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| Some(ConfigValue { value: m.get("modelId")?.as_str()?.to_string(), name: m.get("name").and_then(Value::as_str).unwrap_or("").to_string(), description: None }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !options.is_empty() {
+            out.push(ConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                category: "model".into(),
+                current: models.get("currentModelId").map(value_str).unwrap_or_default(),
+                options,
+            });
+        }
+    }
+    if let Some(modes) = result.get("modes") {
+        let options: Vec<ConfigValue> = modes
+            .get("availableModes")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| {
+                        Some(ConfigValue {
+                            value: m.get("id")?.as_str()?.to_string(),
+                            name: m.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                            description: m.get("description").and_then(Value::as_str).map(str::to_string),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !options.is_empty() {
+            out.push(ConfigOption {
+                id: "mode".into(),
+                name: "Mode".into(),
+                category: "mode".into(),
+                current: modes.get("currentModeId").map(value_str).unwrap_or_default(),
+                options,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn session_config_prefers_config_options_and_falls_back_to_modes() {
+        let with_options = json!({ "configOptions": [{ "id": "model", "name": "Model", "category": "model", "currentValue": "opus",
+            "options": [{ "value": "opus", "name": "Opus" }, { "value": "haiku", "name": "Haiku" }] }] });
+        let c = parse_session_config(&with_options);
+        assert_eq!(c[0].current, "opus");
+        assert_eq!(c[0].options.len(), 2);
+        let legacy = json!({ "modes": { "currentModeId": "plan", "availableModes": [{ "id": "plan", "name": "Plan" }] },
+            "models": { "currentModelId": "m1", "availableModels": [{ "modelId": "m1", "name": "M1" }] } });
+        let c = parse_session_config(&legacy);
+        assert_eq!(c.iter().map(|o| o.category.as_str()).collect::<Vec<_>>(), ["model", "mode"]);
+    }
+
+    #[test]
+    fn reads_line_ranges() {
+        let path = std::env::temp_dir().join(format!("kuaky-acp-read-{}", std::process::id()));
+        std::fs::write(&path, "a\nb\nc\nd\n").unwrap();
+        assert_eq!(read_text(&path, Some(2), Some(2)).unwrap(), "b\nc\n");
+        assert_eq!(read_text(&path, None, None).unwrap(), "a\nb\nc\nd\n");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn writes_only_inside_roots() {
+        let root = std::env::temp_dir();
+        assert!(within(&[root.clone()], &root.join("x/new.txt")));
+        assert!(!within(&[root.join("only-here")], Path::new("/etc/hosts")));
+    }
 }

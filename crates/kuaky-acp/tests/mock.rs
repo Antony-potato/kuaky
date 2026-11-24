@@ -46,3 +46,53 @@ fn full_turn_with_permission_and_diff() {
     assert!(seen.iter().any(|e| matches!(e, Event::ToolCall(c) if c.kind.as_deref() == Some("edit"))));
     assert!(seen.iter().any(|e| matches!(e, Event::Plan(p) if p.len() == 1)));
 }
+
+#[test]
+fn load_session_replays_and_config_changes() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mock_agent.py");
+    let client = Client::spawn(&PathBuf::from("python3"), &[script.to_string_lossy().into_owned()], &std::env::temp_dir(), &[]).unwrap();
+    assert!(client.capabilities.load_session);
+    assert!(client.capabilities.image);
+    let info = client.new_session_info(&std::env::temp_dir()).unwrap();
+    assert_eq!(info.config[0].category, "mode");
+    assert_eq!(info.config[0].current, "default");
+
+    let events = client.events();
+    let loaded = client.load_session(&std::env::temp_dir(), "old").unwrap();
+    assert_eq!(loaded.config[0].current, "a");
+    let mut replay = Vec::new();
+    while let Ok(ev) = events.recv_timeout(Duration::from_millis(300)) {
+        replay.push(ev);
+    }
+    assert!(replay.contains(&Event::UserMessageChunk("pregunta vieja".into())));
+    assert!(replay.contains(&Event::MessageChunk("respuesta vieja".into())));
+
+    let updated = client.set_config_option("old", "model", "b").unwrap();
+    assert_eq!(updated[0].current, "b");
+}
+
+#[test]
+fn file_writes_and_commands_are_reported() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mock_agent.py");
+    let client = Client::spawn(&PathBuf::from("python3"), &[script.to_string_lossy().into_owned()], &std::env::temp_dir(), &[]).unwrap();
+    let session = client.new_session(&std::env::temp_dir()).unwrap();
+    let events = client.events();
+    client.prompt(&session, "hola").unwrap();
+    let (mut wrote, mut commands, mut located) = (false, false, false);
+    loop {
+        match events.recv_timeout(Duration::from_secs(10)).expect("sin respuesta") {
+            Event::FileWritten { path, new_text, .. } => {
+                assert!(path.ends_with("kuaky-mock-acp.txt"));
+                assert_eq!(new_text, "uno\ndos\n");
+                wrote = true;
+            }
+            Event::Commands(c) => commands = c.iter().any(|c| c.name == "review"),
+            Event::ToolCall(c) => located = c.locations.first().is_some_and(|l| l.line == Some(3)),
+            Event::Permission(req) => client.answer_permission(&req.request_id, Some("allow")).unwrap(),
+            Event::TurnEnded(_) => break,
+            Event::Error(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
+    assert!(wrote && commands && located);
+}
