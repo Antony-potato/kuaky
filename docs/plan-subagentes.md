@@ -50,4 +50,10 @@ Hecho con la propuesta **A**:
 - Clic en un subagente: abre la sesión y, en el chat, salta a esa herramienta con su grupo abierto.
 - En el chat, el grupo dice "Ran 2 subagents ›" y cada tarjeta "Subagent · Explore".
 
-Pendiente: recordar qué listas dejaste abiertas al reiniciar; pasos internos de cada subagente (`parentToolUseId`).
+También hecho:
+- **Se recuerda** qué listas de subagentes dejaste abiertas (por sesión, se guarda con el proyecto).
+- **Pasos de cada subagente:**
+  - en el chat, dentro de su tarjeta, plegados en una línea ("3 steps · now: Read src/refunds/mod.rs"); al abrir, uno por fila (últimos 30);
+  - en la barra izquierda, debajo del subagente que corre, su paso actual;
+  - en el chat salen de `_meta.claudeCode.parentToolUseId` y ya no se mezclan con la lista principal;
+  - en terminal, de su propio registro `<sesión>/subagents/agent-*.jsonl` (enlazado por `toolUseId` en `agent-*.meta.json`).

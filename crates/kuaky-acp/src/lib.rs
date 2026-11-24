@@ -141,6 +141,9 @@ pub struct ToolCall {
     pub tool_name: Option<String>,
     /// Subagente lanzado por esta herramienta: (tipo, descripción).
     pub subagent: Option<(String, String)>,
+    /// Paso de un subagente: id del `Agent`/`Task` que lo lanzó
+    /// (`_meta.claudeCode.parentToolUseId`).
+    pub parent: Option<String>,
 }
 
 impl ToolCall {
@@ -602,6 +605,7 @@ fn parse_tool_call(v: &Value) -> ToolCall {
         kind: s("kind"),
         status: s("status"),
         tool_name: v.pointer("/_meta/claudeCode/toolName").and_then(Value::as_str).map(str::to_string),
+        parent: v.pointer("/_meta/claudeCode/parentToolUseId").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_string),
         ..ToolCall::default()
     };
     if matches!(call.tool_name.as_deref(), Some("Agent" | "Task")) {
@@ -788,6 +792,9 @@ mod unit {
         let Some(Event::ToolCall(c)) = e else { panic!() };
         assert!(c.is_subagent());
         assert_eq!(c.subagent, Some(("Explore".into(), "Find auth code".into())));
+        let step = parse_tool_call(&json!({ "toolCallId": "t2", "title": "Read lib.rs", "kind": "read",
+            "_meta": { "claudeCode": { "toolName": "Read", "parentToolUseId": "t1" } } }));
+        assert_eq!(step.parent.as_deref(), Some("t1"));
     }
 
     #[test]

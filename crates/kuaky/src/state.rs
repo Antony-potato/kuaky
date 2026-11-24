@@ -53,6 +53,10 @@ pub struct Settings {
     /// How the single "Merge" button merges PRs: `merge`, `squash` or `rebase`.
     #[serde(default)]
     pub pr_merge_method: String,
+    /// Last choices in the chat box per agent (model, mode, effort, toggles),
+    /// applied to every new chat session: agent label → option id → value.
+    #[serde(default)]
+    pub chat_prefs: HashMap<String, HashMap<String, String>>,
 }
 
 impl Settings {
@@ -107,6 +111,9 @@ pub struct ProjectState {
     pub files: Vec<String>,
     #[serde(default)]
     pub sessions: Vec<SavedSession>,
+    /// Sessions (kuaky uid) whose subagent list was left unfolded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents_open: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]

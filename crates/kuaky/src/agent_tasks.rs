@@ -43,6 +43,8 @@ pub struct Subagent {
     pub started: jiff::Timestamp,
     pub done: Option<jiff::Timestamp>,
     pub failed: bool,
+    /// Paso en curso (p. ej. "Read lib.rs"), si el agente lo informa.
+    pub doing: Option<String>,
 }
 
 impl Subagent {
@@ -79,6 +81,8 @@ pub struct TaskWatcher {
     deleted: Vec<String>,
     subagents: Vec<Subagent>,
     subagents_changed: bool,
+    /// Registro propio de cada subagente (`<sesión>/subagents/agent-*.jsonl`), por tool_use id.
+    subagent_logs: HashMap<String, PathBuf>,
 }
 
 impl TaskWatcher {
@@ -137,6 +141,40 @@ impl TaskWatcher {
         &self.subagents
     }
 
+    /// Paso en curso de cada subagente que corre, leído de su propio registro
+    /// (`<id de sesión>/subagents/agent-*.jsonl`, enlazado por `toolUseId` en su `.meta.json`).
+    pub fn poll_steps(&mut self) {
+        if !self.subagents.iter().any(Subagent::running) {
+            return;
+        }
+        let Some(dir) = self.path.as_ref().map(|p| p.with_extension("").join("subagents")) else { return };
+        if self.subagents.iter().any(|a| a.running() && !self.subagent_logs.contains_key(&a.id)) {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().filter_map(Result::ok) {
+                let meta = entry.path();
+                let Some(name) = meta.file_name().and_then(|n| n.to_str()) else { continue };
+                let Some(stem) = name.strip_suffix(".meta.json") else { continue };
+                if self.subagent_logs.values().any(|p| p.file_stem().and_then(|s| s.to_str()) == Some(stem)) {
+                    continue;
+                }
+                let use_id = std::fs::read_to_string(&meta)
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                    .and_then(|v| v.get("toolUseId").and_then(Value::as_str).map(str::to_string));
+                if let Some(use_id) = use_id {
+                    self.subagent_logs.insert(use_id, dir.join(format!("{stem}.jsonl")));
+                }
+            }
+        }
+        for a in self.subagents.iter_mut().filter(|a| a.running()) {
+            let Some(log) = self.subagent_logs.get(&a.id) else { continue };
+            let doing = last_step(log);
+            if doing.is_some() && doing != a.doing {
+                a.doing = doing;
+                self.subagents_changed = true;
+            }
+        }
+    }
+
     /// ¿Cambiaron los subagentes desde la última vez que se preguntó?
     pub fn take_subagents_changed(&mut self) -> bool {
         std::mem::take(&mut self.subagents_changed)
@@ -163,6 +201,7 @@ impl TaskWatcher {
                                     started: at,
                                     done: None,
                                     failed: false,
+                                    doing: None,
                                 });
                                 self.subagents_changed = true;
                             }
@@ -235,6 +274,43 @@ impl TaskWatcher {
     }
 }
 
+/// Última herramienta que usó un subagente, leyendo solo el final de su registro.
+fn last_step(log: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(log).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).ok()?;
+    text.lines().rev().filter(|l| l.contains("\"tool_use\"")).find_map(|l| {
+        let v: Value = serde_json::from_str(l).ok()?;
+        let blocks = v.pointer("/message/content")?.as_array()?;
+        blocks.iter().rev().find(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")).map(|b| {
+            describe_step(b.get("name").and_then(Value::as_str).unwrap_or("Tool"), b.get("input").unwrap_or(&Value::Null))
+        })
+    })
+}
+
+/// "Read lib.rs", "Bash cargo test", "Grep TaskWatcher"…: una herramienta en pocas palabras.
+pub fn describe_step(name: &str, input: &Value) -> String {
+    let field = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_string);
+    let file = |p: String| p.rsplit('/').next().unwrap_or(&p).to_string();
+    let arg = match name {
+        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => field("file_path").or_else(|| field("notebook_path")).map(file),
+        "Bash" => field("command").map(|c| c.lines().next().unwrap_or("").to_string()),
+        "Grep" | "Glob" => field("pattern"),
+        "WebFetch" => field("url"),
+        "WebSearch" => field("query"),
+        "Agent" | "Task" => field("description"),
+        _ => None,
+    };
+    let text = match arg.filter(|a| !a.trim().is_empty()) {
+        Some(a) => format!("{name} {}", a.trim()),
+        None => name.to_string(),
+    };
+    crate::lines::short(&text, 80)
+}
+
 fn id_str(v: &Value) -> Option<String> {
     v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))
 }
@@ -302,6 +378,24 @@ mod tests {
         assert!(w.take_subagents_changed());
         assert!(!w.subagents()[0].running());
         assert!(w.subagents()[1].running());
+        // Paso en curso del que sigue: su propio registro en `<sesión>/subagents/`.
+        let dir = path.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-x.meta.json"), r#"{"toolUseId":"t2","agentType":"general-purpose"}"#).unwrap();
+        std::fs::write(
+            dir.join("agent-x.jsonl"),
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/src/lib.rs"}}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"s2","name":"Bash","input":{"command":"cargo test\necho"}}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        w.poll_steps();
+        assert_eq!(w.subagents()[1].doing.as_deref(), Some("Bash cargo test"));
+        assert!(w.take_subagents_changed());
+        let _ = std::fs::remove_dir_all(path.with_extension(""));
         let _ = std::fs::remove_file(path);
     }
 

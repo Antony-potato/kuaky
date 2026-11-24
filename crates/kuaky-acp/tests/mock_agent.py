@@ -87,5 +87,9 @@ while True:
         update(s, {"sessionUpdate": "tool_call_update", "toolCallId": "sa1", "status": "completed"})
         update(s, {"sessionUpdate": "tool_call", "toolCallId": "sa2", "title": "Review PR 2278", "kind": "think", "status": "in_progress",
                    "rawInput": {"subagent_type": "general-purpose", "description": "Review PR 2278"}, "_meta": {"claudeCode": {"toolName": "Agent"}}})
+        for i, (title, kind, status) in enumerate([("Read src/payments.rs", "read", "completed"), ("grep -rn \"refund\" src", "execute", "completed"),
+                                                    ("Read src/refunds/mod.rs", "read", "in_progress")]):
+            update(s, {"sessionUpdate": "tool_call", "toolCallId": f"sa2-{i}", "title": title, "kind": kind, "status": status,
+                       "_meta": {"claudeCode": {"toolName": "Read" if kind == "read" else "Bash", "parentToolUseId": "sa2"}}})
         update(s, {"sessionUpdate": "usage_update", "used": 52000, "size": 200000, "cost": {"amount": 0.42, "currency": "USD"}})
         send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})

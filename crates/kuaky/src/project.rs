@@ -417,7 +417,8 @@ pub struct ProjectView {
     /// Sesión (uid) → PR que hizo.
     session_prs: HashMap<String, u64>,
     /// Sessions (tab id) whose subagent list is open in the sidebar.
-    subagents_open: std::collections::HashSet<usize>,
+    /// Sesiones (uid) con su lista de subagentes abierta; se guarda con el proyecto.
+    subagents_open: std::collections::HashSet<String>,
     /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
     pending_merges: HashMap<String, u64>,
     mini_map_collapsed: bool,
@@ -535,7 +536,7 @@ impl ProjectView {
             left_collapsed: state::get(cx).left_collapsed || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_COLLAPSED").is_ok()),
             layout_collapsed: cx.new(|_| ResizableState::default()),
             session_prs: HashMap::new(),
-            subagents_open: std::collections::HashSet::new(),
+            subagents_open: saved.subagents_open.iter().cloned().collect(),
             pending_merges: HashMap::new(),
             mini_map_collapsed: false,
             visible: true,
@@ -655,9 +656,13 @@ impl ProjectView {
                 sessions.push(p);
             }
         }
+        // Solo las de sesiones que siguen guardadas.
+        let mut subagents_open: Vec<String> =
+            self.subagents_open.iter().filter(|u| sessions.iter().any(|s| s.uid.as_deref() == Some(u.as_str()))).cloned().collect();
+        subagents_open.sort();
         let key = self.root.to_string_lossy().into_owned();
         state::update(cx, |s| {
-            s.projects.insert(key, state::ProjectState { files, sessions });
+            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open });
         });
     }
 
@@ -2094,7 +2099,12 @@ impl ProjectView {
             return row;
         }
         let tab_id = tab.id;
-        let open = self.subagents_open.contains(&tab_id) || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_SUBAGENTS").is_ok());
+        let uid = match &tab.kind {
+            TabKind::Terminal { view, .. } => view.read(cx).uid.clone(),
+            TabKind::Chat { view, .. } => view.read(cx).uid.clone(),
+            _ => String::new(),
+        };
+        let open = self.subagents_open.contains(&uid) || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_SUBAGENTS").is_ok());
         let running = subs.iter().filter(|a| a.running()).count();
         let summary = if running > 0 {
             format!("{running} subagent{} working", if running == 1 { "" } else { "s" })
@@ -2131,9 +2141,10 @@ impl ProjectView {
                     .when(running > 0 && !open, |d| d.child(spinner(format!("subs-spin-{tab_id}").into(), style::muted().into())))
                     .child(div().truncate().child(summary))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.subagents_open.remove(&tab_id) {
-                            this.subagents_open.insert(tab_id);
+                        if !this.subagents_open.remove(&uid) {
+                            this.subagents_open.insert(uid.clone());
                         }
+                        this.persist(cx);
                         cx.notify();
                     })),
             )
@@ -2148,7 +2159,12 @@ impl ProjectView {
                         icons::ui("check", px(11.), style::faint()).into_any_element()
                     };
                     let id = a.id.clone();
-                    let tip: SharedString = format!("{} · {}", a.kind, a.what).into();
+                    let tip: SharedString = match &a.doing {
+                        Some(doing) if a.running() => format!("{} · {}\nNow: {doing}", a.kind, a.what),
+                        _ => format!("{} · {}", a.kind, a.what),
+                    }
+                    .into();
+                    let doing = a.doing.clone().filter(|_| a.running());
                     h_flex()
                         .id(SharedString::from(format!("subagent-{tab_id}-{k}")))
                         .pl(px(44.))
@@ -2163,7 +2179,13 @@ impl ProjectView {
                         .hover(|d| d.bg(style::panel_hover()))
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                         .child(icon)
-                        .child(div().flex_1().min_w_0().truncate().child(if a.what.is_empty() { a.kind.clone() } else { a.what.clone() }))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().child(if a.what.is_empty() { a.kind.clone() } else { a.what.clone() }))
+                                .when_some(doing, |d, doing| d.child(div().truncate().text_color(style::faint()).font_family(style::mono_font()).child(doing))),
+                        )
                         .child(div().flex_none().text_color(style::faint()).child(style::duration(elapsed)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.activate(i, window, cx);

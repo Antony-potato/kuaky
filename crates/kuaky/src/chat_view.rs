@@ -232,6 +232,10 @@ pub struct ChatView {
     plan_open: bool,
     config: Vec<ConfigOption>,
     open_config: Option<String>,
+    /// Lista cerrada al pulsar fuera (para que pulsar su propio botón no la reabra).
+    config_closed: Option<(String, Instant)>,
+    /// Subagentes con sus pasos desplegados (id de la herramienta).
+    open_steps: HashSet<String>,
     commands: Vec<SlashCommand>,
     queue: Vec<Queued>,
     /// Imágenes para el próximo mensaje.
@@ -306,6 +310,8 @@ impl ChatView {
             plan_open: true,
             config: Vec::new(),
             open_config: None,
+            config_closed: None,
+            open_steps: HashSet::new(),
             commands: Vec::new(),
             queue: Vec::new(),
             attachments: Vec::new(),
@@ -343,16 +349,39 @@ impl ChatView {
 
     fn connect(&self, cx: &mut Context<Self>) {
         let launch = self.launch.clone();
+        // Preferencias de la última vez (solo para sesiones nuevas): modelo primero,
+        // porque las demás opciones (esfuerzo…) pueden depender de él.
+        let mut prefs: Vec<(String, String)> = if launch.resume.is_none() {
+            crate::state::get(cx).settings.chat_prefs.get(launch.label).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        prefs.sort_by_key(|(id, _)| (id != "model", id.clone()));
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let env = vec![("PATH".to_string(), kuaky_git::login_path().to_string_lossy().into_owned())];
                     let client = Arc::new(Client::spawn(&launch.program, &launch.args, &launch.cwd, &env)?);
-                    let info = match &launch.resume {
+                    let mut info = match &launch.resume {
                         Some(id) if client.capabilities.load_session => client.load_session(&launch.cwd, id)?,
                         _ => client.new_session_info(&launch.cwd)?,
                     };
+                    for (id, value) in &prefs {
+                        let applies = info.config.iter().any(|o| &o.id == id && &o.current != value && o.options.iter().any(|v| &v.value == value));
+                        if !applies {
+                            continue;
+                        }
+                        match client.set_config_option(&info.id, id, value) {
+                            Ok(opts) if !opts.is_empty() => info.config = opts,
+                            Ok(_) => {
+                                for o in info.config.iter_mut().filter(|o| &o.id == id) {
+                                    o.current = value.clone();
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     anyhow::Ok((client, info))
                 })
                 .await;
@@ -392,6 +421,10 @@ impl ChatView {
                     }
                     cx.emit(ChatEvent::Session(info.id));
                     cx.emit(ChatEvent::Status);
+                    #[cfg(feature = "screenshot")]
+                    if let Ok(id) = std::env::var("KUAKY_DEMO_CONFIG") {
+                        this.open_config = Some(id);
+                    }
                     #[cfg(feature = "screenshot")]
                     if let Ok(prompt) = std::env::var("KUAKY_DEMO_CHAT_PROMPT") {
                         this.dispatch(prompt, Vec::new(), cx);
@@ -524,6 +557,10 @@ impl ChatView {
                         }
                         if update.subagent.is_some() {
                             call.subagent = update.subagent;
+                        }
+                        // Algunas actualizaciones pierden el padre: se conserva el primero.
+                        if call.parent.is_none() {
+                            call.parent = update.parent;
                         }
                         if update.kind.is_some() {
                             call.kind = update.kind;
@@ -666,11 +703,12 @@ impl ChatView {
     pub fn subagents(&self) -> Vec<crate::agent_tasks::Subagent> {
         self.turns
             .iter()
-            .flat_map(|t| t.items.iter())
-            .filter_map(|i| match i {
+            .flat_map(|t| t.items.iter().map(move |i| (t, i)))
+            .filter_map(|(turn, i)| match i {
                 Item::Tool(c) if c.is_subagent() => {
                     let (started, done) = *self.subagent_times.get(&c.id)?;
                     let (kind, what) = c.subagent.clone().unwrap_or_else(|| ("Agent".into(), c.title.clone().unwrap_or_default()));
+                    let doing = done.is_none().then(|| steps_of(turn, &c.id).last().and_then(|s| s.title.clone())).flatten().map(|t| crate::lines::short(&t, 80));
                     Some(crate::agent_tasks::Subagent {
                         id: c.id.clone(),
                         kind,
@@ -678,6 +716,7 @@ impl ChatView {
                         started,
                         done,
                         failed: c.status.as_deref() == Some("failed"),
+                        doing,
                     })
                 }
                 _ => None,
@@ -924,6 +963,12 @@ impl ChatView {
 
     fn set_config(&mut self, id: String, value: String, cx: &mut Context<Self>) {
         self.open_config = None;
+        // Se recuerda para la próxima sesión nueva de este agente.
+        let label = self.launch.label.to_string();
+        let (k, v) = (id.clone(), value.clone());
+        crate::state::update(cx, |s| {
+            s.settings.chat_prefs.entry(label).or_default().insert(k, v);
+        });
         for opt in self.config.iter_mut().filter(|o| o.id == id) {
             opt.current = value.clone();
         }
@@ -1122,7 +1167,15 @@ impl ChatView {
             let ids = std::mem::take(group);
             col.child(this.tool_group(ti, turn, &ids, live && last, cx))
         };
+        // Pasos de subagentes: van dentro de la tarjeta de su subagente.
+        let tool_ids: HashSet<&str> = turn.items.iter().filter_map(|i| match i {
+            Item::Tool(c) => Some(c.id.as_str()),
+            _ => None,
+        }).collect();
         for (ii, item) in turn.items.iter().enumerate() {
+            if matches!(item, Item::Tool(c) if c.parent.as_deref().is_some_and(|p| tool_ids.contains(p))) {
+                continue;
+            }
             // En detalle normal el razonamiento no corta el grupo (queda oculto).
             let groupable = matches!(item, Item::Tool(_))
                 || matches!(item, Item::Permission { answer: Some(_), .. })
@@ -1411,7 +1464,7 @@ impl ChatView {
                     .into_any_element()
             }
             Item::Notice(text) => div().text_xs().italic().text_color(style::muted()).child(text.clone()).into_any_element(),
-            Item::Tool(call) => self.tool_card(key, call, cx),
+            Item::Tool(call) => self.tool_card(key, call, &[], cx),
             Item::Permission { req, answer } => {
                 let pending = answer.is_none() && live;
                 match answer {
@@ -1580,21 +1633,21 @@ impl ChatView {
                     v_flex()
                         .gap_1p5()
                         .children(ids.iter().filter_map(|&i| match turn.items.get(i) {
-                            Some(Item::Tool(c)) => Some(self.tool_card(ti * 10_000 + i, c, cx)),
+                            Some(Item::Tool(c)) => Some(self.tool_card(ti * 10_000 + i, c, &steps_of(turn, &c.id), cx)),
                             Some(it @ Item::Permission { .. }) => Some(self.render_item(ti, i, it, false, cx)),
                             _ => None,
                         })),
                 )
             })
             .when(!open, |d| {
-                d.when_some(current, |d, c| d.child(self.tool_card(ti * 10_000 + 9_999, c, cx)))
+                d.when_some(current, |d, c| d.child(self.tool_card(ti * 10_000 + 9_999, c, &steps_of(turn, &c.id), cx)))
                     .when(answered.is_empty(), |d| d)
             })
             .into_any_element()
     }
 
     /// Una herramienta, estilo Zed: etiqueta arriba y el comando o título en monoespaciado.
-    fn tool_card(&self, key: usize, call: &ToolCall, cx: &mut Context<Self>) -> AnyElement {
+    fn tool_card(&self, key: usize, call: &ToolCall, steps: &[&ToolCall], cx: &mut Context<Self>) -> AnyElement {
         let status = call.status.as_deref().unwrap_or("pending");
         let (status_icon, color): (&'static str, Hsla) = match status {
             "completed" => ("check", style::good().into()),
@@ -1689,6 +1742,7 @@ impl ChatView {
                         cx.emit(ChatEvent::OpenDiff { title: format!("± {}", diff.path.rsplit('/').next().unwrap_or("")), patch: unified_patch(&diff) });
                     }))
             }))
+            .when(!steps.is_empty(), |d| d.child(self.subagent_steps(key, call, steps, cx)))
             .when_some(call.text.clone().filter(|t| verbose && !t.trim().is_empty()), |d, t| {
                 let short: String = t.lines().take(20).collect::<Vec<_>>().join("\n");
                 d.child(
@@ -1702,6 +1756,81 @@ impl ChatView {
                         .text_color(style::faint())
                         .child(short),
                 )
+            })
+            .into_any_element()
+    }
+
+    /// Pasos de un subagente dentro de su tarjeta: plegados en una línea
+    /// ("12 steps · now: Read lib.rs"); al abrir, uno por fila.
+    fn subagent_steps(&self, key: usize, call: &ToolCall, steps: &[&ToolCall], cx: &mut Context<Self>) -> AnyElement {
+        let open = self.detail == Detail::Verbose
+            || self.open_steps.contains(&call.id)
+            || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_STEPS").is_ok());
+        let running = matches!(call.status.as_deref(), Some("in_progress") | Some("pending") | None);
+        let count = steps.len();
+        let failed = steps.iter().filter(|s| s.status.as_deref() == Some("failed")).count();
+        let last = steps.last().and_then(|s| s.title.clone()).unwrap_or_default();
+        let mut summary = format!("{count} step{}", if count == 1 { "" } else { "s" });
+        if failed > 0 {
+            summary.push_str(&format!(" · {failed} failed"));
+        }
+        if running && !last.is_empty() {
+            summary.push_str(&format!(" · now: {}", crate::lines::short(last.lines().next().unwrap_or(""), 70)));
+        }
+        let id = call.id.clone();
+        const MAX: usize = 30;
+        let hidden = count.saturating_sub(MAX);
+        v_flex()
+            .border_t_1()
+            .border_color(style::border())
+            .child(
+                h_flex()
+                    .id(("sub-steps", key))
+                    .px_3()
+                    .py_1()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(style::faint())
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(style::muted()))
+                    .child(crate::icons::ui(if open { "chevron-down" } else { "chevron-right" }, px(11.), style::faint()))
+                    .child(div().flex_1().min_w_0().truncate().child(summary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.open_steps.remove(&id) {
+                            this.open_steps.insert(id.clone());
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(open, |d| {
+                d.when(hidden > 0, |d| d.child(div().px_3().pl(px(28.)).text_xs().text_color(style::faint()).child(format!("{hidden} earlier steps"))))
+                    .children(steps.iter().skip(hidden).map(|s| {
+                        let (icon, color): (&'static str, Hsla) = match s.status.as_deref() {
+                            Some("completed") => ("check", style::faint().into()),
+                            Some("failed") => ("x", style::bad().into()),
+                            _ => ("loader-circle", style::accent().into()),
+                        };
+                        let title = s.title.clone().unwrap_or_else(|| s.tool_name.clone().unwrap_or_else(|| "Tool".into()));
+                        h_flex()
+                            .px_3()
+                            .pl(px(28.))
+                            .py_0p5()
+                            .gap_2()
+                            .items_center()
+                            .text_xs()
+                            .child(crate::icons::ui(icon, px(11.), color))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(crate::style::mono_font())
+                                    .text_color(style::muted())
+                                    .child(title.lines().next().unwrap_or("").to_string()),
+                            )
+                    }))
+                    .child(div().h_1())
             })
             .into_any_element()
     }
@@ -1930,8 +2059,10 @@ impl ChatView {
                 }
                 let value = opt.options.iter().find(|v| v.value == opt.current).map(|v| v.name.clone()).unwrap_or_else(|| opt.current.clone());
                 let open = self.open_config.as_deref() == Some(opt.id.as_str());
+                let menu = if open { self.config_menu(cx) } else { None };
                 h_flex()
                     .id(SharedString::from(format!("cfg-{}", opt.id)))
+                    .relative()
                     .gap_0p5()
                     .px_1p5()
                     .py_0p5()
@@ -1946,9 +2077,15 @@ impl ChatView {
                     .child(value)
                     .child(crate::icons::ui("chevron-down", px(11.), style::faint()))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_config = if this.open_config.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
+                        let just_closed = matches!(&this.config_closed, Some((c, at)) if c == &id && at.elapsed() < Duration::from_millis(400));
+                        this.open_config = if just_closed || this.open_config.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
+                        this.config_closed = None;
                         cx.notify();
                     }))
+                    // La lista sale encima de su botón, flotando sobre el chat.
+                    .when_some(menu, |d, menu| {
+                        d.child(deferred(div().absolute().bottom_full().left_0().mb_1().child(menu)).with_priority(1))
+                    })
                     .into_any_element()
             })
             .collect()
@@ -1959,8 +2096,13 @@ impl ChatView {
         let opt = self.open_config.as_ref().and_then(|id| self.config.iter().find(|o| &o.id == id))?.clone();
         Some(
             v_flex()
+                .id("config-menu")
+                .occlude()
                 .w(px(300.))
+                .max_h(px(420.))
+                .overflow_y_scroll()
                 .p_1()
+                .shadow_lg()
                 .rounded_lg()
                 .border_1()
                 .border_color(style::border())
@@ -1987,6 +2129,10 @@ impl ChatView {
                                 .when_some(v.description.clone(), |d, desc| d.child(div().text_xs().text_color(style::faint()).whitespace_normal().child(desc))),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.set_config(id.clone(), value.clone(), cx)))
+                }))
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.config_closed = this.open_config.take().map(|id| (id, Instant::now()));
+                    cx.notify();
                 }))
                 .into_any_element(),
         )
@@ -2054,6 +2200,17 @@ impl ChatView {
                 .into_any_element(),
         )
     }
+}
+
+/// Pasos de un subagente en un turno (herramientas cuyo padre es `id`).
+fn steps_of<'a>(turn: &'a Turn, id: &str) -> Vec<&'a ToolCall> {
+    turn.items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Tool(c) if c.parent.as_deref() == Some(id) => Some(c),
+            _ => None,
+        })
+        .collect()
 }
 
 fn human(n: u64) -> String {
@@ -2279,7 +2436,6 @@ impl Render for ChatView {
                         .child(format!("Editing message #{n} — sending starts a new version (the current one is kept). Esc cancels.")),
                 )
             })
-            .when_some(self.config_menu(cx), |d, menu| d.child(div().w_full().max_w(px(Self::COLUMN)).mx_auto().child(menu)))
             .child(
                 v_flex()
                     .w_full()
