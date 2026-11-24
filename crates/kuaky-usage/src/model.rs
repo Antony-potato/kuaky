@@ -9,15 +9,17 @@ pub enum Agent {
     GeminiCli,
     Antigravity,
     OpenCode,
+    Grok,
 }
 
 impl Agent {
-    pub const ALL: [Agent; 5] = [
+    pub const ALL: [Agent; 6] = [
         Agent::ClaudeCode,
         Agent::Codex,
         Agent::GeminiCli,
         Agent::Antigravity,
         Agent::OpenCode,
+        Agent::Grok,
     ];
 
     pub fn name(self) -> &'static str {
@@ -27,6 +29,7 @@ impl Agent {
             Agent::GeminiCli => "Gemini CLI",
             Agent::Antigravity => "Antigravity",
             Agent::OpenCode => "OpenCode",
+            Agent::Grok => "Grok CLI",
         }
     }
 }
@@ -86,6 +89,8 @@ pub struct UsageEvent {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// Parte de `cache_write` que fue caché de 1 hora (más cara).
+    pub cache_write_1h: u64,
 }
 
 impl UsageEvent {

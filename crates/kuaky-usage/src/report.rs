@@ -1,7 +1,7 @@
 //! Agregaciones para el dashboard: KPIs, series por día, heatmap, modelos,
 //! agentes y proyectos.
 
-use crate::{Agent, Provider, UsageEvent};
+use crate::{Agent, Pricing, Provider, UsageEvent};
 use jiff::{Timestamp, ToSpan, civil::Date, tz::TimeZone};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -42,6 +42,10 @@ pub struct Kpis {
     pub turns: u64,
     pub agent_secs: u64,
     pub max_parallel: u32,
+    /// Costo equivalente en API (dólares) de las respuestas con precio conocido.
+    pub cost: f64,
+    /// Respuestas cuyo modelo no tiene precio conocido.
+    pub unpriced: u64,
 }
 
 impl Kpis {
@@ -57,6 +61,7 @@ impl Kpis {
 #[derive(Debug, Clone, Default)]
 pub struct DayStat {
     pub date: Option<Date>,
+    pub cost: f64,
     pub input_total: u64,
     pub output: u64,
     pub sessions: u64,
@@ -71,6 +76,8 @@ pub struct ModelRow {
     pub input_total: u64,
     pub output: u64,
     pub turns: u64,
+    /// `None` si el modelo no tiene precio conocido.
+    pub cost: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +86,7 @@ pub struct AgentRow {
     pub input_total: u64,
     pub output: u64,
     pub agent_secs: u64,
+    pub cost: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +117,14 @@ pub struct Report {
 
 impl Report {
     /// `events` debe venir ordenado por fecha.
-    pub fn build(events: &[UsageEvent], range: Range, agent: Option<Agent>, tz: &TimeZone, now: Timestamp) -> Report {
+    pub fn build(
+        events: &[UsageEvent],
+        range: Range,
+        agent: Option<Agent>,
+        tz: &TimeZone,
+        now: Timestamp,
+        pricing: &Pricing,
+    ) -> Report {
         let today = now.to_zoned(tz.clone()).date();
         let filtered: Vec<&UsageEvent> = events.iter().filter(|e| agent.is_none_or(|a| e.agent == a)).collect();
         let Some(first) = filtered.first() else {
@@ -133,7 +148,7 @@ impl Report {
                         d >= prev_start && d < start
                     })
                     .collect();
-                Some(kpis_of(&prev))
+                Some(kpis_of(&prev, pricing))
             }
             Range::All => None,
         };
@@ -157,10 +172,12 @@ impl Report {
             let z = e.ts.to_zoned(tz.clone());
             let date = z.date();
             let tokens = e.input_total() + e.output;
+            let cost = pricing.cost(e);
             if let Some(day) = days.get_mut(&date) {
                 day.input_total += e.input_total();
                 day.output += e.output;
                 day.turns += 1;
+                day.cost += cost.unwrap_or(0.0);
             }
             day_sessions.entry(date).or_default().insert((e.agent, &e.session));
             let wd = z.weekday().to_monday_zero_offset() as usize;
@@ -172,10 +189,14 @@ impl Report {
                 input_total: 0,
                 output: 0,
                 turns: 0,
+                cost: pricing.price(&e.model).map(|_| 0.0),
             });
             m.input_total += e.input_total();
             m.output += e.output;
             m.turns += 1;
+            if let (Some(total), Some(c)) = (m.cost.as_mut(), cost) {
+                *total += c;
+            }
             *providers.entry(e.provider()).or_default() += tokens;
 
             let a = agents.entry(e.agent).or_insert_with(|| AgentRow {
@@ -183,9 +204,11 @@ impl Report {
                 input_total: 0,
                 output: 0,
                 agent_secs: 0,
+                cost: 0.0,
             });
             a.input_total += e.input_total();
             a.output += e.output;
+            a.cost += cost.unwrap_or(0.0);
 
             if let Some(p) = &e.project {
                 let entry = projects.entry(p.clone()).or_insert_with(|| (e.ts, 0, HashSet::new(), HashSet::new()));
@@ -214,7 +237,7 @@ impl Report {
             }
         }
 
-        let mut kpis = kpis_of(&current);
+        let mut kpis = kpis_of(&current, pricing);
         kpis.max_parallel = max_parallel(&segments);
 
         let days: Vec<DayStat> = days.into_values().collect();
@@ -251,6 +274,12 @@ impl Report {
         }
     }
 
+    /// Variación porcentual del costo contra el periodo anterior.
+    pub fn cost_delta(&self) -> Option<f64> {
+        let prev = self.previous.as_ref()?.cost;
+        (prev > 0.0).then(|| (self.kpis.cost - prev) / prev * 100.0)
+    }
+
     /// Variación porcentual contra el periodo anterior.
     pub fn delta(&self, pick: impl Fn(&Kpis) -> u64) -> Option<f64> {
         let prev = pick(self.previous.as_ref()?);
@@ -280,10 +309,14 @@ impl Report {
     }
 }
 
-fn kpis_of(events: &[&UsageEvent]) -> Kpis {
+fn kpis_of(events: &[&UsageEvent], pricing: &Pricing) -> Kpis {
     let mut k = Kpis::default();
     let mut sessions = HashSet::new();
     for e in events {
+        match pricing.cost(e) {
+            Some(c) => k.cost += c,
+            None => k.unpriced += 1,
+        }
         k.input_total += e.input_total();
         k.cache_read += e.cache_read;
         k.output += e.output;
@@ -356,6 +389,7 @@ mod tests {
             output,
             cache_read: input * 9,
             cache_write: 0,
+            cache_write_1h: 0,
         }
     }
 
@@ -370,7 +404,7 @@ mod tests {
             ev(Agent::ClaudeCode, "a", "2026-11-20T11:00:00Z", 10, 5),
         ];
         let now: Timestamp = "2026-11-21T12:00:00Z".parse().unwrap();
-        let r = Report::build(&events, Range::Days(7), None, &TimeZone::UTC, now);
+        let r = Report::build(&events, Range::Days(7), None, &TimeZone::UTC, now, &Pricing::embedded());
         assert_eq!(r.kpis.turns, 5);
         assert_eq!(r.kpis.sessions, 2);
         assert_eq!(r.kpis.input_total, 500);
@@ -395,8 +429,10 @@ mod tests {
             ev(Agent::Codex, "b", "2026-11-20T10:00:00Z", 10, 5),
         ];
         let now: Timestamp = "2026-11-21T12:00:00Z".parse().unwrap();
-        let r = Report::build(&events, Range::Days(7), Some(Agent::ClaudeCode), &TimeZone::UTC, now);
+        let r = Report::build(&events, Range::Days(7), Some(Agent::ClaudeCode), &TimeZone::UTC, now, &Pricing::embedded());
         assert_eq!(r.kpis.turns, 1);
         assert_eq!(r.delta(|k| k.output), Some(200.0));
+        assert!(r.kpis.cost > 0.0, "Opus 5.5 tiene precio");
+        assert_eq!(r.kpis.unpriced, 0);
     }
 }

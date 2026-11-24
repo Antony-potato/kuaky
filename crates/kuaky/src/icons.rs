@@ -39,6 +39,7 @@ pub fn agent(a: Agent) -> Arc<Image> {
         Agent::Antigravity => antigravity(),
         Agent::GeminiCli => gemini_cli(),
         Agent::OpenCode => opencode(),
+        Agent::Grok => grok(),
     }
 }
 

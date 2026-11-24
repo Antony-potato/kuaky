@@ -153,6 +153,7 @@ impl State {
                     output: turn.output_tokens,
                     cache_read: turn.cached_input_tokens,
                     cache_write: 0,
+                    cache_write_1h: 0,
                 })
             }
             _ => None,

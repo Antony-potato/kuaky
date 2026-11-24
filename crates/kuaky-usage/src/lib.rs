@@ -4,10 +4,12 @@
 //! [`UsageEvent`]s. [`report`] agrega esos eventos para un rango de fechas.
 
 pub mod model;
+pub mod pricing;
 pub mod report;
 pub mod sources;
 
 pub use model::{Agent, Provider, UsageEvent};
+pub use pricing::Pricing;
 pub use report::{Range, Report};
 
 use std::time::Instant;

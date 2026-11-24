@@ -106,6 +106,7 @@ fn parse_chat(text: &str, path: &Path) -> Vec<UsageEvent> {
                 output: t.output + t.thoughts,
                 cache_read: t.cached,
                 cache_write: 0,
+                cache_write_1h: 0,
             })
         })
         .collect()

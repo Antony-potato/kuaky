@@ -1,8 +1,11 @@
 //! Lectores de logs, uno por agente.
 
+mod antigravity;
 mod claude;
 mod codex;
 mod gemini;
+mod grok;
+mod opencode;
 
 use crate::{Agent, UsageEvent};
 use std::{
@@ -13,7 +16,10 @@ use std::{
 
 pub use claude::ClaudeCode;
 pub use codex::Codex;
+pub use antigravity::Antigravity;
 pub use gemini::GeminiCli;
+pub use grok::Grok;
+pub use opencode::OpenCode;
 
 pub trait Source: Send + Sync {
     fn agent(&self) -> Agent;
@@ -25,6 +31,9 @@ pub fn all() -> Vec<Box<dyn Source>> {
         Box::new(ClaudeCode::from_env()),
         Box::new(Codex::from_env()),
         Box::new(GeminiCli::from_env()),
+        Box::new(Antigravity::from_env()),
+        Box::new(OpenCode::from_env()),
+        Box::new(Grok::from_env()),
     ]
 }
 

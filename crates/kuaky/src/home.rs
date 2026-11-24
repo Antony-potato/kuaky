@@ -7,7 +7,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
-use kuaky_usage::{Agent, Range, Report, UsageEvent};
+use kuaky_usage::{Agent, Pricing, Range, Report, UsageEvent};
 use std::{path::PathBuf, sync::Arc};
 
 pub enum HomeEvent {
@@ -22,6 +22,7 @@ pub struct HomeView {
     report: Report,
     tz: TimeZone,
     now: Timestamp,
+    pricing: Arc<Pricing>,
 }
 
 impl EventEmitter<HomeEvent> for HomeView {}
@@ -35,9 +36,36 @@ impl HomeView {
             report: Report::default(),
             tz: TimeZone::system(),
             now: Timestamp::now(),
+            pricing: Arc::new(Pricing::embedded()),
         };
         this.reload(cx);
+        this.refresh_prices(cx);
         this
+    }
+
+    /// Carga los precios guardados y, si tienen más de un día, descarga los de
+    /// LiteLLM en segundo plano.
+    fn refresh_prices(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let pricing = cx.background_executor().spawn(async { Pricing::load() }).await;
+            this.update(cx, |this, cx| {
+                this.pricing = Arc::new(pricing);
+                this.rebuild();
+                cx.notify();
+            })
+            .ok();
+            let updated = cx.background_executor().spawn(async { kuaky_usage::pricing::refresh_if_stale() }).await;
+            if updated {
+                let pricing = cx.background_executor().spawn(async { Pricing::load() }).await;
+                this.update(cx, |this, cx| {
+                    this.pricing = Arc::new(pricing);
+                    this.rebuild();
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Eventos de consumo ya cargados (para la actividad de cada proyecto).
@@ -65,7 +93,7 @@ impl HomeView {
     fn rebuild(&mut self) {
         self.now = Timestamp::now();
         if let Some(events) = &self.events {
-            self.report = Report::build(events, self.range, self.agent, &self.tz, self.now);
+            self.report = Report::build(events, self.range, self.agent, &self.tz, self.now, &self.pricing);
         }
     }
 
@@ -186,6 +214,18 @@ impl HomeView {
                 series(|d| d.agent_secs),
                 style::accent(),
             ))
+            .child(kpi_card(
+                "Costo en API",
+                style::money(k.cost),
+                if k.unpriced > 0 {
+                    format!("{} respuestas sin precio", thousands(k.unpriced))
+                } else {
+                    "equivalente a precios de API".into()
+                },
+                r.cost_delta(),
+                r.days.iter().map(|d| (d.cost * 100.0) as u64).collect(),
+                style::output(),
+            ))
     }
 
     fn daily_chart(&self) -> impl IntoElement {
@@ -223,10 +263,11 @@ impl HomeView {
                                 .gap(gap)
                                 .children(days.iter().enumerate().map(|(i, d)| {
                                     let tip = format!(
-                                        "{} · entrada {} · salida {}",
+                                        "{} · entrada {} · salida {} · {}",
                                         d.date.map(short_date).unwrap_or_default(),
                                         human(d.input_total),
-                                        human(d.output)
+                                        human(d.output),
+                                        style::money(d.cost)
                                     );
                                     div()
                                         .id(("in", i))
@@ -329,7 +370,9 @@ impl HomeView {
         const SHOWN: usize = 6;
         let rest = r.models.iter().skip(SHOWN);
         let rest_count = r.models.len().saturating_sub(SHOWN);
-        let (rest_in, rest_out, rest_turns) = rest.fold((0, 0, 0), |a, m| (a.0 + m.input_total, a.1 + m.output, a.2 + m.turns));
+        let (rest_in, rest_out, rest_turns, rest_cost) = rest.fold((0, 0, 0, 0.0), |a, m| {
+            (a.0 + m.input_total, a.1 + m.output, a.2 + m.turns, a.3 + m.cost.unwrap_or(0.0))
+        });
 
         section(
             "Modelos",
@@ -361,7 +404,7 @@ impl HomeView {
                             )))
                     })),
                 )
-                .child(table_header(&["entrada", "salida", "respuestas"]))
+                .child(table_header(&["entrada", "salida", "respuestas", "costo"]))
                 .children(r.models.iter().take(SHOWN).map(|m| {
                     let share = (m.input_total + m.output) as f32 / max as f32;
                     table_row(
@@ -369,7 +412,7 @@ impl HomeView {
                         style::model_name(&m.model),
                         share,
                         style::provider_color(m.provider),
-                        [human(m.input_total), human(m.output), thousands(m.turns)],
+                        vec![human(m.input_total), human(m.output), thousands(m.turns), m.cost.map(style::money).unwrap_or_else(|| "—".into())],
                     )
                 }))
                 .when(rest_count > 0, |d| {
@@ -378,7 +421,7 @@ impl HomeView {
                         format!("{rest_count} más"),
                         0.0,
                         style::faint(),
-                        [human(rest_in), human(rest_out), thousands(rest_turns)],
+                        vec![human(rest_in), human(rest_out), thousands(rest_turns), style::money(rest_cost)],
                     ))
                 }),
         )
@@ -396,7 +439,7 @@ impl HomeView {
             Some(right),
             v_flex()
                 .gap_1()
-                .child(table_header(&["entrada", "salida", "tiempo"]))
+                .child(table_header(&["entrada", "salida", "tiempo", "costo"]))
                 .children(r.agents.iter().map(|a| {
                     let agent = a.agent;
                     let selected = self.agent == Some(agent);
@@ -412,7 +455,7 @@ impl HomeView {
                             agent.name().to_string(),
                             (a.input_total + a.output) as f32 / max as f32,
                             style::agent_color(agent),
-                            [human(a.input_total), human(a.output), style::duration(a.agent_secs)],
+                            vec![human(a.input_total), human(a.output), style::duration(a.agent_secs), style::money(a.cost)],
                         ))
                 })),
         )
@@ -442,6 +485,26 @@ impl HomeView {
                 None => {}
             }
         }
+        // Agrupar subcarpetas bajo la raíz de su repositorio (p. ej. `kuaky/crates/x` → `kuaky`).
+        let mut grouped: Vec<kuaky_usage::report::ProjectRow> = Vec::new();
+        for mut row in rows {
+            let root = repo_root(std::path::Path::new(&*row.path));
+            row.path = Arc::from(root.to_string_lossy().as_ref());
+            match grouped.iter_mut().find(|g| g.path == row.path) {
+                Some(g) => {
+                    g.last_active = g.last_active.max(row.last_active);
+                    g.tokens += row.tokens;
+                    g.sessions += row.sessions;
+                    for a in row.agents {
+                        if !g.agents.contains(&a) {
+                            g.agents.push(a);
+                        }
+                    }
+                }
+                None => grouped.push(row),
+            }
+        }
+        let mut rows = grouped;
         rows.sort_by_key(|r| std::cmp::Reverse(r.last_active));
         rows.truncate(8);
         let now = self.now;
@@ -620,22 +683,22 @@ fn axis_label(value: String, label: &'static str, color: Rgba) -> impl IntoEleme
         .child(div().text_xs().text_color(color).child(label))
 }
 
-fn table_header(cols: &[&'static str; 3]) -> impl IntoElement {
+fn table_header(cols: &[&'static str]) -> impl IntoElement {
     h_flex()
         .px_2()
         .text_xs()
         .text_color(style::faint())
         .child(div().flex_1())
-        .children(cols.iter().map(|c| div().w(px(84.)).text_right().child(*c)))
+        .children(cols.iter().map(|c| div().w(px(76.)).text_right().child(*c)))
 }
 
-fn table_row(icon: AnyElement, name: String, share: f32, color: Rgba, values: [String; 3]) -> impl IntoElement {
+fn table_row(icon: AnyElement, name: String, share: f32, color: Rgba, values: Vec<String>) -> impl IntoElement {
     h_flex()
         .px_2()
         .py_1()
         .gap_3()
         .text_sm()
-        .child(h_flex().w(px(220.)).gap_2().child(icon).child(div().truncate().child(name)))
+        .child(h_flex().w(px(180.)).gap_2().child(icon).child(div().truncate().child(name)))
         .child(
             div().flex_1().child(
                 div()
@@ -646,7 +709,7 @@ fn table_row(icon: AnyElement, name: String, share: f32, color: Rgba, values: [S
                     .bg(color),
             ),
         )
-        .children(values.into_iter().map(|v| div().w(px(84.)).text_right().child(v)))
+        .children(values.into_iter().map(|v| div().w(px(76.)).text_right().child(v)))
 }
 
 fn agent_badge(agent: Agent) -> AnyElement {
@@ -688,6 +751,14 @@ fn ago(ts: Timestamp, now: Timestamp) -> String {
         s if s < 86_400 => format!("hace {} h", s / 3600),
         s => format!("hace {} d", s / 86_400),
     }
+}
+
+/// Carpeta más cercana hacia arriba que contiene `.git`; si no hay, la misma.
+fn repo_root(path: &std::path::Path) -> std::path::PathBuf {
+    path.ancestors()
+        .find(|p| p.join(".git").exists())
+        .unwrap_or(path)
+        .to_path_buf()
 }
 
 /// `/Users/x/proyectos` → `~/proyectos`.

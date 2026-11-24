@@ -17,17 +17,131 @@ use std::{
 
 pub struct ClaudeCode {
     roots: Vec<PathBuf>,
+    cache_path: Option<PathBuf>,
 }
 
 impl ClaudeCode {
     pub fn from_env() -> Self {
         Self {
             roots: roots("CLAUDE_CONFIG_DIR", &[".claude", ".config/claude"]),
+            cache_path: dirs::cache_dir().map(|d| d.join("kuaky").join("claude-usage-v1.json")),
         }
     }
 
     pub fn with_roots(roots: Vec<PathBuf>) -> Self {
-        Self { roots }
+        Self { roots, cache_path: None }
+    }
+
+    pub fn with_cache(mut self, path: PathBuf) -> Self {
+        self.cache_path = Some(path);
+        self
+    }
+}
+
+/// Caché en disco de los eventos ya leídos de cada archivo.
+mod cache {
+    use super::Keyed;
+    use crate::{Agent, UsageEvent};
+    use serde::{Deserialize, Serialize};
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    /// Tamaño y fecha de modificación (ns) del archivo.
+    pub type Stamp = (u64, u128);
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct Entry {
+        k: String,
+        t: i64,
+        m: String,
+        s: String,
+        p: Option<String>,
+        i: u64,
+        o: u64,
+        r: u64,
+        w: u64,
+        w1: u64,
+    }
+
+    #[derive(Serialize, Deserialize, Default)]
+    struct File {
+        files: HashMap<PathBuf, (Stamp, Vec<Entry>)>,
+    }
+
+    pub fn stamp(path: &Path) -> Option<Stamp> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        Some((meta.len(), modified))
+    }
+
+    pub fn load(path: &Path) -> HashMap<PathBuf, (Stamp, Vec<Entry>)> {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<File>(&b).ok())
+            .map(|f| f.files)
+            .unwrap_or_default()
+    }
+
+    pub fn decode(entries: &[Entry]) -> Vec<Keyed> {
+        let mut models: HashMap<&str, Arc<str>> = HashMap::new();
+        let mut sessions: HashMap<&str, Arc<str>> = HashMap::new();
+        entries
+            .iter()
+            .filter_map(|e| {
+                let model = models.entry(&e.m).or_insert_with(|| Arc::from(e.m.as_str())).clone();
+                let session = sessions.entry(&e.s).or_insert_with(|| Arc::from(e.s.as_str())).clone();
+                Some((
+                    Box::from(e.k.as_str()),
+                    UsageEvent {
+                        agent: Agent::ClaudeCode,
+                        ts: jiff::Timestamp::from_millisecond(e.t).ok()?,
+                        model,
+                        session,
+                        project: e.p.as_deref().map(Arc::from),
+                        input: e.i,
+                        output: e.o,
+                        cache_read: e.r,
+                        cache_write: e.w,
+                        cache_write_1h: e.w1,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub fn save(path: &Path, results: &[(PathBuf, Stamp, Vec<Keyed>, bool)]) {
+        let files = results
+            .iter()
+            .map(|(p, stamp, entries, _)| {
+                let entries = entries
+                    .iter()
+                    .map(|(k, e)| Entry {
+                        k: k.to_string(),
+                        t: e.ts.as_millisecond(),
+                        m: e.model.to_string(),
+                        s: e.session.to_string(),
+                        p: e.project.as_deref().map(str::to_string),
+                        i: e.input,
+                        o: e.output,
+                        r: e.cache_read,
+                        w: e.cache_write,
+                        w1: e.cache_write_1h,
+                    })
+                    .collect();
+                (p.clone(), (*stamp, entries))
+            })
+            .collect();
+        let Ok(bytes) = serde_json::to_vec(&File { files }) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 }
 
@@ -43,7 +157,26 @@ impl Source for ClaudeCode {
             .flat_map(|r| files_with_ext(&r.join("projects"), "jsonl"))
             .collect();
 
-        let per_file: Vec<Vec<Keyed>> = files.par_iter().map(|f| parse_file(f)).collect();
+        // Caché por archivo: solo se releen los que cambiaron (tamaño o fecha).
+        let cache_path = self.cache_path.clone();
+        let cache = cache_path.as_deref().map(cache::load).unwrap_or_default();
+        let results: Vec<(PathBuf, cache::Stamp, Vec<Keyed>, bool)> = files
+            .par_iter()
+            .filter_map(|f| {
+                let stamp = cache::stamp(f)?;
+                match cache.get(f) {
+                    Some((s, entries)) if *s == stamp => Some((f.clone(), stamp, cache::decode(entries), false)),
+                    _ => Some((f.clone(), stamp, parse_file(f), true)),
+                }
+            })
+            .collect();
+        let changed = results.iter().any(|r| r.3) || results.len() != cache.len();
+        if changed {
+            if let Some(path) = &cache_path {
+                cache::save(path, &results);
+            }
+        }
+        let per_file: Vec<Vec<Keyed>> = results.into_iter().map(|r| r.2).collect();
 
         // Deduplicación global: una sesión reanudada repite mensajes de otra.
         let mut best: HashMap<Box<str>, UsageEvent> = HashMap::new();
@@ -89,6 +222,13 @@ struct Usage {
     output_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+    cache_creation: CacheCreation,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CacheCreation {
+    ephemeral_1h_input_tokens: u64,
 }
 
 fn parse_file(path: &Path) -> Vec<Keyed> {
@@ -148,6 +288,7 @@ fn parse_line(line: &str, fallback_session: &str, interner: &mut Interner) -> Op
             output: usage.output_tokens,
             cache_read: usage.cache_read_input_tokens,
             cache_write: usage.cache_creation_input_tokens,
+            cache_write_1h: usage.cache_creation.ephemeral_1h_input_tokens.min(usage.cache_creation_input_tokens),
         },
     ))
 }
@@ -157,7 +298,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-22T01:40:35.245Z","sessionId":"s1","cwd":"/tmp/app","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":400,"output_tokens":50}}}"#;
+    const LINE: &str = r#"{"type":"assistant","timestamp":"2026-11-22T01:40:35.245Z","sessionId":"s1","cwd":"/tmp/app","requestId":"req_1","message":{"id":"msg_1","model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":400,"output_tokens":50,"cache_creation":{"ephemeral_1h_input_tokens":100,"ephemeral_5m_input_tokens":0}}}}"#;
 
     #[test]
     fn parses_assistant_usage() {
@@ -167,6 +308,7 @@ mod tests {
         assert_eq!(e.input, 2);
         assert_eq!(e.cache_read, 400);
         assert_eq!(e.cache_write, 100);
+        assert_eq!(e.cache_write_1h, 100);
         assert_eq!(e.output, 50);
         assert_eq!(e.input_total(), 502);
         assert_eq!(&*e.model, "claude-opus-5-5");
@@ -192,9 +334,17 @@ mod tests {
         let mut b = std::fs::File::create(projects.join("b.jsonl")).unwrap();
         writeln!(b, "{LINE}").unwrap();
 
-        let events = ClaudeCode::with_roots(vec![dir.clone()]).load().unwrap();
-        std::fs::remove_dir_all(&dir).ok();
+        let cache = dir.join("cache.json");
+        let source = ClaudeCode::with_roots(vec![dir.clone()]).with_cache(cache.clone());
+        let events = source.load().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].output, 50);
+        // Segunda lectura desde la caché: mismo resultado.
+        assert!(cache.is_file());
+        let again = source.load().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].output, 50);
+        assert_eq!(again[0].cache_write_1h, 100);
     }
 }

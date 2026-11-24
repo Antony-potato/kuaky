@@ -14,7 +14,7 @@ kuaky es un editor de escritorio ligero (macOS + Windows) centrado en agentes. A
 | Fase | Estado | Notas |
 |---|---|---|
 | 0. Fundación | ✅ | Workspace, CI macOS + Windows, repo privado en GitHub |
-| 6. Dashboard de consumo (inicio) | ✅ | Claude Code, Codex y Gemini CLI; KPIs, días, heatmap, modelos, agentes, proyectos recientes |
+| 6. Dashboard de consumo (inicio) | ✅ | Claude Code, Codex, Gemini CLI, OpenCode, Grok CLI y Antigravity CLI (los tres últimos probados solo con datos de ejemplo); costo equivalente en API con precios de LiteLLM (caché de 1 h incluida); caché de lectura (3 s → 0.4 s); proyectos agrupados por repo |
 | 1. Proyecto y layout | ✅ | Sesiones (izq.), pestañas (centro), archivos / cambios / ramas / PRs (der.) |
 | 2. Terminal | ✅ | `kuaky-term`: alacritty_terminal + shell de login; selección, copiar/pegar, scroll |
 | 3. Sesiones | ✅ | Lanzadores por agente, actividad por proyecto. Claude Code: estado exacto con hooks (`--settings`, sin tocar tus ajustes) y avisos cuando termina o pide permiso. Codex/Gemini: estado aproximado |

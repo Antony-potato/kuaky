@@ -81,6 +81,7 @@ pub fn agent_color(a: Agent) -> Rgba {
         Agent::GeminiCli => rgb(0x60a5fa),
         Agent::Antigravity => rgb(0xfbbf24),
         Agent::OpenCode => rgb(0xd1d5db),
+        Agent::Grok => rgb(0xc4b5fd),
     }
 }
 
@@ -92,6 +93,7 @@ pub fn agent_glyph(a: Agent) -> &'static str {
         Agent::GeminiCli => "G",
         Agent::Antigravity => "A",
         Agent::OpenCode => "O",
+        Agent::Grok => "K",
     }
 }
 
@@ -121,6 +123,19 @@ pub fn model_name(model: &str) -> String {
         name.push_str(&version.join("."));
     }
     name
+}
+
+/// Dólares: "$2,647", "$12.34", "<$0.01".
+pub fn money(usd: f64) -> String {
+    if usd <= 0.0 {
+        "$0".into()
+    } else if usd < 0.01 {
+        "<$0.01".into()
+    } else if usd < 100.0 {
+        format!("${usd:.2}")
+    } else {
+        format!("${}", thousands(usd.round() as u64))
+    }
 }
 
 /// 11 600 000 000 → "11.6B".
@@ -185,6 +200,9 @@ mod tests {
         assert_eq!(duration(347 * 3600), "347 h");
         assert_eq!(duration(23 * 60), "23 min");
         assert_eq!(model_name("claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(money(2647.28), "$2,647");
+        assert_eq!(money(12.345), "$12.35");
+        assert_eq!(money(0.001), "<$0.01");
         assert_eq!(model_name("claude-haiku-5-5-20261001"), "Haiku 5.5");
         assert_eq!(model_name("gpt-6.2-astra"), "gpt-6.2-astra");
     }
