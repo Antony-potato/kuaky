@@ -7,7 +7,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
-use kuaky_usage::{Agent, Pricing, Range, Report, UsageEvent};
+use kuaky_usage::{Agent, AgentLimits, Pricing, Range, Report, UsageEvent};
 use std::{path::PathBuf, sync::Arc};
 
 pub enum HomeEvent {
@@ -17,6 +17,7 @@ pub enum HomeEvent {
 
 pub struct HomeView {
     events: Option<Arc<Vec<UsageEvent>>>,
+    limits: Vec<AgentLimits>,
     range: Range,
     agent: Option<Agent>,
     report: Report,
@@ -31,6 +32,7 @@ impl HomeView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let this = Self {
             events: None,
+            limits: Vec::new(),
             range: Range::Days(30),
             agent: None,
             report: Report::default(),
@@ -76,12 +78,21 @@ impl HomeView {
     /// Vuelve a leer los logs en segundo plano.
     pub fn reload(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let events = cx
+            let (events, limits) = cx
                 .background_executor()
-                .spawn(async { kuaky_usage::load_all() })
+                .spawn(async {
+                    let events = kuaky_usage::load_all();
+                    let limits = kuaky_usage::load_all_limits();
+                    (events, limits)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.events = Some(Arc::new(events));
+                this.limits = limits;
+                #[cfg(feature = "screenshot")]
+                if this.limits.is_empty() && std::env::var("KUAKY_DEMO_LIMITS").is_ok() {
+                    this.limits = demo_limits();
+                }
                 this.rebuild();
                 cx.notify();
             })
@@ -169,6 +180,77 @@ impl HomeView {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::PickFolder))),
                     ),
             )
+    }
+
+    fn limits_section(&self) -> impl IntoElement {
+        let now = self.now;
+        let tz = &self.tz;
+        section(
+            "Remaining limits",
+            Some("live session & weekly quotas".into()),
+            h_flex().gap_4().flex_wrap().children(self.limits.iter().map(|al| {
+                let updated = al.updated_at.map(|ts| ago(ts, now)).unwrap_or_else(|| "active".into());
+                v_flex()
+                    .flex_1()
+                    .min_w(px(280.))
+                    .p_4()
+                    .gap_3()
+                    .rounded_xl()
+                    .bg(style::panel())
+                    .border_1()
+                    .border_color(style::border())
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(agent_badge(al.agent))
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(al.agent.name()))
+                            .child(div().flex_1())
+                            .child(div().text_xs().text_color(style::faint()).child(updated)),
+                    )
+                    .children(al.windows().map(|w| {
+                        let rem = w.remaining_pct;
+                        let bar_color = if rem <= 10.0 {
+                            style::bad()
+                        } else if rem <= 25.0 {
+                            rgb(0xfbbf24)
+                        } else {
+                            style::accent()
+                        };
+                        let reset_text = w
+                            .resets_at
+                            .and_then(|ts| kuaky_usage::limits::format_reset(ts, now, tz))
+                            .map(|t| format!("resets {t}"));
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_xs()
+                                    .child(div().text_color(style::text()).font_weight(FontWeight::MEDIUM).child(w.label.clone()))
+                                    .child(div().text_color(bar_color).child(format!("{:.0}% left", rem)))
+                                    .child(div().text_color(style::faint()).child(format!("({:.0}% used)", w.used_pct)))
+                                    .child(div().flex_1())
+                                    .when_some(reset_text, |d, r| d.child(div().text_color(style::muted()).child(r))),
+                            )
+                            .child(
+                                div()
+                                    .h(px(6.))
+                                    .w_full()
+                                    .rounded_full()
+                                    .bg(style::panel_hover())
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative((rem as f32 / 100.0).clamp(0.0, 1.0)))
+                                            .rounded_full()
+                                            .bg(bar_color),
+                                    ),
+                            )
+                    }))
+            })),
+        )
     }
 
     fn kpi_cards(&self) -> impl IntoElement {
@@ -580,6 +662,7 @@ impl Render for HomeView {
                     .when(empty, |d| d.child(placeholder("No agent activity in this period.")))
                     .when(!loading && !empty, |d| {
                         d.child(self.kpi_cards())
+                            .when(!self.limits.is_empty(), |d| d.child(self.limits_section()))
                             .child(
                                 h_flex()
                                     .gap_8()
@@ -769,4 +852,25 @@ pub fn tilde(path: &std::path::Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+#[cfg(feature = "screenshot")]
+pub fn demo_limits() -> Vec<AgentLimits> {
+    let now = Timestamp::now();
+    let five_h = Timestamp::from_second(now.as_second() + 2 * 3600 + 40 * 60).ok();
+    let week = Timestamp::from_second(now.as_second() + 4 * 86_400).ok();
+    vec![
+        AgentLimits {
+            agent: Agent::ClaudeCode,
+            primary: Some(kuaky_usage::RateWindow::from_used("5h", 42.0, five_h)),
+            secondary: Some(kuaky_usage::RateWindow::from_used("week", 18.0, week)),
+            updated_at: Some(now),
+        },
+        AgentLimits {
+            agent: Agent::Codex,
+            primary: Some(kuaky_usage::RateWindow::from_used("5h", 28.0, five_h)),
+            secondary: Some(kuaky_usage::RateWindow::from_used("week", 11.0, week)),
+            updated_at: Some(now),
+        },
+    ]
 }

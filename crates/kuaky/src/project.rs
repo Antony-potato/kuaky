@@ -21,7 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kuaky_git::{Branch, Change, PullRequest, Repo, Worktree};
 use kuaky_term::Launch;
-use kuaky_usage::{Agent, UsageEvent};
+use kuaky_usage::{Agent, AgentLimits, UsageEvent};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -230,6 +230,7 @@ pub struct ProjectView {
     previous_expanded: bool,
     activity_open: bool,
     activity: Vec<ActivityRow>,
+    limits: Vec<AgentLimits>,
     focus: FocusHandle,
     /// Previous sessions from the last time this project was open.
     previous: Vec<SavedSession>,
@@ -293,6 +294,7 @@ impl ProjectView {
             new_session_menu: false,
             previous_expanded: false,
             activity_open: false,
+            limits: Vec::new(),
             focus: cx.focus_handle(),
             previous: saved.sessions.clone(),
             quick_open: None,
@@ -302,6 +304,7 @@ impl ProjectView {
         };
         this.detect_agents(cx);
         this.start_git_refresh(cx);
+        this.start_limits_refresh(cx);
         for file in &saved.files {
             let path = this.root.join(file);
             if path.is_file() {
@@ -468,6 +471,9 @@ impl ProjectView {
         }
         if std::env::var("KUAKY_DEMO_RIGHT_TERM").is_ok() {
             self.open_right_terminal(window, cx);
+        }
+        if std::env::var("KUAKY_DEMO_LIMITS").is_ok() {
+            self.limits = crate::home::demo_limits();
         }
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
@@ -899,6 +905,33 @@ impl ProjectView {
     }
 
     // ── git ─────────────────────────────────────────────────────────────
+
+    fn start_limits_refresh(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let limits = cx.background_executor().spawn(async { kuaky_usage::load_all_limits() }).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        #[cfg(feature = "screenshot")]
+                        let limits = if limits.is_empty() && std::env::var("KUAKY_DEMO_LIMITS").is_ok() {
+                            crate::home::demo_limits()
+                        } else {
+                            limits
+                        };
+                        if this.limits != limits {
+                            this.limits = limits;
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(10)).await;
+            }
+        })
+        .detach();
+    }
 
     fn start_git_refresh(&self, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
@@ -1639,6 +1672,57 @@ impl ProjectView {
                 )
             })
             .child(div().flex_1())
+            .children(self.limits.iter().enumerate().map(|(i, al)| {
+                let now = jiff::Timestamp::now();
+                let tz = jiff::tz::TimeZone::system();
+                let short_name = match al.agent {
+                    Agent::ClaudeCode => "Claude",
+                    other => other.name(),
+                };
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(p) = &al.primary {
+                    parts.push(format!("{} {:.0}%", p.label, p.used_pct));
+                }
+                if let Some(s) = &al.secondary {
+                    parts.push(format!("{} {:.0}%", s.label, s.used_pct));
+                }
+                let reset = al
+                    .primary
+                    .as_ref()
+                    .and_then(|p| p.resets_at)
+                    .and_then(|ts| kuaky_usage::limits::format_reset(ts, now, &tz));
+                if let Some(r) = &reset {
+                    parts.push(format!("resets {r}"));
+                }
+                let max_used = al.windows().map(|w| w.used_pct).fold(0.0_f64, f64::max);
+                let color = if max_used >= 90.0 {
+                    style::bad()
+                } else if max_used >= 75.0 {
+                    rgb(0xfbbf24)
+                } else {
+                    style::muted()
+                };
+                let tip_lines: Vec<String> = al
+                    .windows()
+                    .map(|w| {
+                        let r = w
+                            .resets_at
+                            .and_then(|ts| kuaky_usage::limits::format_reset(ts, now, &tz))
+                            .map(|t| format!(" · resets {t}"))
+                            .unwrap_or_default();
+                        format!("{}: {:.0}% left ({:.0}% used){r}", w.label, w.remaining_pct, w.used_pct)
+                    })
+                    .collect();
+                let tip: SharedString = format!("{} — {}", al.agent.name(), tip_lines.join(" | ")).into();
+                h_flex()
+                    .id(("status-limit", i))
+                    .gap_1()
+                    .items_center()
+                    .text_color(color)
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .child(icons::logo(icons::agent(al.agent), px(12.)))
+                    .child(format!("{short_name} {}", parts.join(" · ")))
+            }))
             .child(div().text_color(style::faint()).child(if self.tabs.is_empty() {
                 String::new()
             } else if self.tabs.len() == 1 {

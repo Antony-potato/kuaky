@@ -3,11 +3,13 @@
 //! Cada agente tiene un módulo en [`sources`] que convierte sus archivos en
 //! [`UsageEvent`]s. [`report`] agrega esos eventos para un rango de fechas.
 
+pub mod limits;
 pub mod model;
 pub mod pricing;
 pub mod report;
 pub mod sources;
 
+pub use limits::{AgentLimits, RateWindow, load_all_limits};
 pub use model::{Agent, Provider, UsageEvent};
 pub use pricing::Pricing;
 pub use report::{Range, Report};
