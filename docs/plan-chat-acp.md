@@ -306,3 +306,19 @@ Cada fase con commit propio, tests con el agente falso y captura de la vista.
 - Checkpoints y `/rewind` en Claude Code: https://www.anthropic.com/news/enabling-claude-code-to-work-more-autonomously
 - ACP, RFD `session/fork`: https://agentclientprotocol.com/rfds/session-fork
 - ACP, propuesta `session/rewind`: https://github.com/agentclientprotocol/agent-client-protocol/pull/1214
+
+## Estado (2026-11-24)
+
+| Fase | Estado |
+|---|---|
+| 1. Protocolo completo | Hecho salvo `terminal/*` y `authenticate` (a propósito: el login se hace en la CLI de cada agente) |
+| 2. Estado y persistencia | Hecho: los chats se guardan como sesión y se retoman con `session/load` |
+| 3. Conversación | Hecho: mensajes tuyos destacados, prompt fijo, riel, lista `⌘⇧J`, `⌥↑/⌥↓`, plan, herramientas, permisos |
+| 4. Composer | Hecho: `@` archivos, `/` comandos, cola con "Send now"/"Edit", `↑` recupera, `Esc` detiene. Falta pegar imágenes |
+| 5. Revisión | Parcial: "Review changes" por turno, "Revert" por archivo, checkpoints con "Restore", editar con versiones ‹ 1/2 ›, nivel de detalle. Faltan aceptar/rechazar por bloque, comentarios por línea y seguir al agente |
+| 6. Encabezado y varios hilos | Hecho: modo, modelo, esfuerzo y demás opciones del agente; título; notificaciones. Falta % de contexto |
+| 7. Integración | Hecho: el chat alimenta el mapa (prompts, plan, fin de turno). Las conexiones siguen siendo por terminal |
+| 8. Codex | Pendiente (no instalado) |
+
+Probado con el agente falso (`crates/kuaky-acp/tests/mock_agent.py`) y con el handshake real de
+`claude-agent-acp` y `agy acp` (sin enviar mensajes, para no gastar tokens).

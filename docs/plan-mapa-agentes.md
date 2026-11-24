@@ -238,3 +238,17 @@ Se guardan por proyecto en `<config>/kuaky/lines/<repo>.json`:
 
 Depende de la parte D (sesiones con nombre) y la parte E (Graph) de
 [plan-interfaz.md](plan-interfaz.md): el dibujo de carriles se comparte.
+
+## Estado (2026-11-24)
+
+| Fase | Estado |
+|---|---|
+| 1. Modelo y lista compacta | Hecho: `lines.rs`; la barra izquierda agrupa las sesiones abiertas por línea |
+| 2. Estaciones automáticas | Hecho: prompts (hooks), título de la terminal, tareas de Claude Code (`TaskCreate`/`TaskUpdate`/`TodoWrite`), plan por ACP, commits/PR/merge |
+| 3. Mapa del proyecto | Hecho: mini mapa en el panel derecho y board a pantalla completa (`Esc` cierra) con sub-líneas, trenes y ficha "¿En qué me quedé?" |
+| 4. Mapa en Inicio | Pendiente |
+| 5. Conexiones por terminal | Hecho: Review / Test / Second opinion / Hand off; hallazgos en archivo y "Send to author" (escribe sin enviar) |
+| 6. Resumen con modelo barato | Pendiente (opcional) |
+| 7. Conexiones por ACP con rondas automáticas | Pendiente |
+
+No hay arrastrar y soltar: mover una sesión a otra línea se hace desde la ficha (ícono ⇄).

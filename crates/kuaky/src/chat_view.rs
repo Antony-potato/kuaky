@@ -893,7 +893,43 @@ impl ChatView {
                     }),
             );
         }
+        if live && !turn.files.is_empty() && turn.duration.is_some() {
+            col = col.children(turn.files.iter().enumerate().map(|(fi, (path, (old, _)))| {
+                let name = path.strip_prefix(&self.launch.cwd).unwrap_or(path).to_string_lossy().into_owned();
+                let (path, old) = (path.clone(), old.clone());
+                h_flex()
+                    .pl_3()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(style::faint())
+                    .child(crate::icons::ui("file", px(11.), style::faint()))
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(
+                        div()
+                            .id(("revert-file", ti * 1000 + fi))
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(style::bad()))
+                            .tooltip(|window, cx| Tooltip::new("Undo this turn's change to the file").build(window, cx))
+                            .child("Revert")
+                            .on_click(cx.listener(move |this, _, _, cx| this.revert_file(path.clone(), old.clone(), name.clone(), cx))),
+                    )
+            }));
+        }
         col.into_any_element()
+    }
+
+    /// Deshace el cambio de un turno a un archivo (o lo borra si era nuevo).
+    fn revert_file(&mut self, path: PathBuf, old: Option<String>, name: String, cx: &mut Context<Self>) {
+        let result = match &old {
+            Some(text) => std::fs::write(&path, text),
+            None => std::fs::remove_file(&path),
+        };
+        let msg = match result {
+            Ok(()) => format!("Reverted {name}."),
+            Err(err) => format!("Could not revert {name}: {err}"),
+        };
+        self.current_turn().items.push(Item::Notice(msg));
+        cx.notify();
     }
 
     fn user_card(&self, user: &UserMsg, live: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -1178,7 +1214,8 @@ impl ChatView {
                     .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(title))
                     .child(h_flex().gap_1().items_center().text_xs().text_color(status_color).child(div().size(px(6.)).rounded_full().bg(status_color)).child(status_label))
                     .children(config.into_iter().take(4).map(|opt| {
-                        let current = opt.options.iter().find(|v| v.value == opt.current).map(|v| v.name.clone()).unwrap_or_else(|| opt.current.clone());
+                        let value = opt.options.iter().find(|v| v.value == opt.current).map(|v| v.name.clone()).unwrap_or_else(|| opt.current.clone());
+                        let current = if opt.category == "model" || opt.category == "mode" { value } else { format!("{}: {value}", opt.name) };
                         let id = opt.id.clone();
                         let open = self.open_config.as_deref() == Some(opt.id.as_str());
                         let name: SharedString = opt.name.clone().into();
@@ -1363,6 +1400,17 @@ impl Render for ChatView {
             .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
             .px_4()
             .pt_3()
+            .when(turns.is_empty() && matches!(self.status, ChatStatus::Ready | ChatStatus::Connecting), |d| {
+                d.child(
+                    v_flex()
+                        .pt_8()
+                        .gap_1()
+                        .items_center()
+                        .text_color(style::faint())
+                        .child(div().text_sm().child(format!("Start a conversation with {}", self.launch.label)))
+                        .child(div().text_xs().child("Mention files with @, run agent commands with /, and pick mode or model above.")),
+                )
+            })
             .children(turns.iter().enumerate().map(|(i, t)| self.render_turn(i, t, i < live_upto, cx)));
 
         let body = match &self.status {
