@@ -4,6 +4,7 @@ use crate::home::{HomeEvent, HomeView, tilde};
 use crate::icons;
 use crate::project::{ProjectView, SearchProject};
 use crate::settings::{SettingsEvent, SettingsView};
+use crate::state;
 use crate::style;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{TitleBar, h_flex};
@@ -107,11 +108,13 @@ impl KuakyApp {
             }
         });
         let mut this = Self { home, project: None, settings: None, _subscriptions: vec![sub, obs] };
-        if let Some(arg) = std::env::args().nth(1) {
-            let path = PathBuf::from(arg);
-            if path.is_dir() {
-                this.open_project(path, window, cx);
-            }
+        let capture = std::env::var_os("KUAKY_SCREENSHOT").is_some();
+        let start = std::env::args().nth(1).map(PathBuf::from).or_else(|| {
+            // Reopen the project that was open when kuaky was closed.
+            (!capture).then(|| state::get(cx).last_open.clone().map(PathBuf::from)).flatten()
+        });
+        if let Some(path) = start.filter(|p| p.is_dir()) {
+            this.open_project(path, window, cx);
         }
         #[cfg(feature = "screenshot")]
         {
@@ -157,6 +160,8 @@ impl KuakyApp {
     fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
         let usage = self.home.read(cx).events();
+        let key = path.to_string_lossy().into_owned();
+        state::update(cx, |s| s.last_open = Some(key));
         let project = cx.new(|cx| ProjectView::new(path, usage, window, cx));
         #[cfg(feature = "screenshot")]
         if let Ok(which) = std::env::var("KUAKY_DEMO_TERMINAL") {
@@ -171,6 +176,7 @@ impl KuakyApp {
 
     fn go_home(&mut self, cx: &mut Context<Self>) {
         self.project = None;
+        state::update(cx, |s| s.last_open = None);
         self.home.update(cx, |home, cx| home.reload(cx));
         cx.notify();
     }

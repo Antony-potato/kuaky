@@ -28,6 +28,9 @@ pub struct State {
     pub right_bottom_height: Option<f32>,
     #[serde(default)]
     pub settings: Settings,
+    /// Project open when kuaky was closed; reopened on launch (`None` = Home).
+    #[serde(default)]
+    pub last_open: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

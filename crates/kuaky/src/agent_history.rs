@@ -115,8 +115,8 @@ mod tests {
     use super::{agy_conversations_in, agy_current_in, valid_id};
     use std::path::Path;
 
-    fn fixture() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("kuaky-agy-{}", std::process::id()));
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kuaky-agy-{name}-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("cache")).unwrap();
         std::fs::create_dir_all(dir.join("conversations")).unwrap();
         std::fs::write(
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn lists_conversations_of_the_folder() {
-        let dir = fixture();
+        let dir = fixture("list");
         let list = agy_conversations_in(&dir, Path::new("/w/kuaky/"));
         let ids: Vec<&str> = list.iter().map(|c| c.id.as_str()).collect();
         // La más reciente (sin metadatos, fecha del .db de hoy) va primero.
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn current_needs_activity_after_start() {
-        let dir = fixture();
+        let dir = fixture("current");
         let cwd = Path::new("/w/kuaky");
         let long_ago: jiff::Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
         assert_eq!(agy_current_in(&dir, cwd, long_ago).as_deref(), Some("cccc-new"));
