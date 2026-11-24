@@ -21,6 +21,10 @@ struct AgentRowState {
     visible: bool,
     path_input: Entity<InputState>,
     args_input: Entity<InputState>,
+    /// `chat` / `terminal` (vacío = chat).
+    open_as: String,
+    /// `folder` / `worktree` (vacío = esta carpeta).
+    workspace: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -99,7 +103,7 @@ impl SettingsView {
                     this.save(cx);
                 }
             }));
-            agents.push(AgentRowState { harness, visible: cfg.visible, path_input, args_input });
+            agents.push(AgentRowState { harness, visible: cfg.visible, path_input, args_input, open_as: cfg.open_as.clone(), workspace: cfg.workspace.clone() });
         }
 
         let worktrees_input = cx.new(|cx| {
@@ -148,6 +152,34 @@ impl SettingsView {
         .detach();
     }
 
+    fn set_agent_pref(&mut self, index: usize, open_as: Option<&str>, workspace: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(row) = self.agents.get_mut(index) {
+            if let Some(v) = open_as {
+                row.open_as = v.to_string();
+            }
+            if let Some(v) = workspace {
+                row.workspace = v.to_string();
+            }
+            self.save(cx);
+            cx.notify();
+        }
+    }
+
+    /// Dos opciones lado a lado (la elegida resaltada).
+    fn choice(id: impl Into<ElementId>, label: &'static str, on: bool) -> Stateful<Div> {
+        div()
+            .id(id)
+            .px_2()
+            .py_0p5()
+            .rounded_md()
+            .text_xs()
+            .cursor_pointer()
+            .when(on, |d| d.bg(style::panel_hover()).text_color(style::text()))
+            .when(!on, |d| d.text_color(style::muted()))
+            .hover(|d| d.bg(style::panel_hover()))
+            .child(label)
+    }
+
     fn toggle_visible(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Some(row) = self.agents.get_mut(index) {
             row.visible = !row.visible;
@@ -165,6 +197,8 @@ impl SettingsView {
                     visible: row.visible,
                     binary_path: row.path_input.read(cx).value().trim().to_string(),
                     extra_args: row.args_input.read(cx).value().trim().to_string(),
+                    open_as: row.open_as.clone(),
+                    workspace: row.workspace.clone(),
                 },
             );
         }
@@ -433,6 +467,31 @@ impl Render for SettingsView {
                                                             .child(Input::new(&row.args_input)),
                                                     ),
                                             )
+                                            // Cómo lo abre "New session".
+                                            .child({
+                                                let chat = row.open_as != "terminal";
+                                                let worktree = row.workspace == "worktree";
+                                                h_flex()
+                                                    .gap_4()
+                                                    .flex_wrap()
+                                                    .items_center()
+                                                    .child(
+                                                        h_flex()
+                                                            .gap_1()
+                                                            .items_center()
+                                                            .child(div().mr_1().text_xs().text_color(style::faint()).child("Open as"))
+                                                            .child(Self::choice(("agent-chat", i), "Chat", chat).on_click(cx.listener(move |this, _, _, cx| this.set_agent_pref(i, Some("chat"), None, cx))))
+                                                            .child(Self::choice(("agent-term", i), "Terminal", !chat).on_click(cx.listener(move |this, _, _, cx| this.set_agent_pref(i, Some("terminal"), None, cx)))),
+                                                    )
+                                                    .child(
+                                                        h_flex()
+                                                            .gap_1()
+                                                            .items_center()
+                                                            .child(div().mr_1().text_xs().text_color(style::faint()).child("Works in"))
+                                                            .child(Self::choice(("agent-folder", i), "This folder", !worktree).on_click(cx.listener(move |this, _, _, cx| this.set_agent_pref(i, None, Some("folder"), cx))))
+                                                            .child(Self::choice(("agent-wt", i), "New branch", worktree).on_click(cx.listener(move |this, _, _, cx| this.set_agent_pref(i, None, Some("worktree"), cx)))),
+                                                    )
+                                            })
                                     })),
                             ))
                             .when(self.section == Section::Panel, |d| d.child(self.panels_section(cx)))

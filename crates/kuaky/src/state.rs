@@ -90,11 +90,27 @@ pub struct AgentConfig {
     pub binary_path: String,
     #[serde(default)]
     pub extra_args: String,
+    /// How "New session" opens this agent: `chat` (default) or `terminal`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub open_as: String,
+    /// Where it works: this folder (default) or `worktree` (a new branch in its own copy).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace: String,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { visible: true, binary_path: String::new(), extra_args: String::new() }
+        Self { visible: true, binary_path: String::new(), extra_args: String::new(), open_as: String::new(), workspace: String::new() }
+    }
+}
+
+impl AgentConfig {
+    pub fn as_chat(&self) -> bool {
+        self.open_as != "terminal"
+    }
+
+    pub fn in_worktree(&self) -> bool {
+        self.workspace == "worktree"
     }
 }
 

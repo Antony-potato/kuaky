@@ -79,6 +79,7 @@ impl ConnKind {
 #[derive(Clone, PartialEq)]
 pub(super) enum BoardMenu {
     NewSession,
+    Branch,
     Connection(ConnKind),
     MergeInto,
     Parent,
@@ -442,17 +443,43 @@ impl ProjectView {
             .unwrap_or_else(|| self.root.clone())
     }
 
-    fn new_session_on_line(&mut self, line_id: String, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn new_session_on_line(&mut self, line_id: String, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
         let Some(line) = self.lines.get(&line_id) else { return };
         let cwd = self.line_cwd(line);
-        let paste = (!line.stations.is_empty()).then(|| line.relay_note());
+        // Una terminal simple no recibe la nota de la línea.
+        let paste = (!line.stations.is_empty() && harness != Harness::Shell).then(|| line.relay_note());
         self.board = None;
-        if self.chat_mode && harness.chat_command().is_some() {
+        self.new_session_menu = false;
+        self.new_session_line = None;
+        if self.opens_as_chat(harness, cx) {
             let opts = ChatOpts { line: Some(line_id), draft: paste, cwd: Some(cwd), ..Default::default() };
             self.open_chat_with(harness, opts, window, cx);
             return;
         }
         let opts = SpawnOpts { line: Some(line_id), paste, ..Default::default() };
+        self.spawn_terminal(harness, cwd, None, opts, window, cx);
+    }
+
+    /// Sesión que se bifurca de una línea: crea una sub-línea debajo de ella (mismo
+    /// tema, otra rama de trabajo), en la carpeta de la línea y con su contexto.
+    pub(super) fn branch_off_line(&mut self, parent_id: String, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent) = self.lines.get(&parent_id).cloned() else { return };
+        let cwd = self.line_cwd(&parent);
+        let kind = parent.kind;
+        // Nombre provisional: el primer título del agente lo reemplaza.
+        let sub = self.lines.create(&format!("Sub-task · {}", crate::lines::short(&parent.name, 40)), kind, Some(parent_id.clone()), false);
+        let paste = (harness != Harness::Shell).then(|| {
+            format!("{}\nThis session is a sub-task that branches off that goal. The sub-task is: ", parent.relay_note())
+        });
+        self.board = None;
+        self.new_session_menu = false;
+        self.new_session_line = None;
+        if self.opens_as_chat(harness, cx) {
+            let opts = ChatOpts { line: Some(sub), draft: paste, cwd: Some(cwd), ..Default::default() };
+            self.open_chat_with(harness, opts, window, cx);
+            return;
+        }
+        let opts = SpawnOpts { line: Some(sub), paste, ..Default::default() };
         self.spawn_terminal(harness, cwd, None, opts, window, cx);
     }
 
@@ -701,9 +728,40 @@ impl ProjectView {
                     .text_xs()
                     .text_color(style::faint())
                     .hover(|d| d.text_color(style::muted()))
+                    .group(SharedString::from(format!("line-g-{}", line.id)))
+                    .relative()
+                    // Sub-línea: se ve como rama del tema de arriba.
+                    .when(depth > 0, |d| d.child(icons::ui("corner-down-right", px(11.), style::faint())))
                     .child(div().min_w_0().truncate().child(line.name.clone()))
                     .when(total > 0, |d| d.child(div().flex_none().child(format!("· {done}/{total}"))))
-                    .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map · drop a session here to move it")).build(window, cx))
+                    .child(div().flex_1())
+                    // + al pasar el mouse: otra sesión en esta línea (solo eliges el agente).
+                    .child({
+                        let open = self.new_session_line.as_deref() == Some(line.id.as_str());
+                        let target = line.id.clone();
+                        div()
+                            .id(SharedString::from(format!("line-add-{}", line.id)))
+                            .flex_none()
+                            .p_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .when(!open, |d| d.invisible().group_hover(SharedString::from(format!("line-g-{}", line.id)), |s| s.visible()))
+                            .when(open, |d| d.bg(style::panel_hover()))
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .tooltip(|window, cx| Tooltip::new("New session in this line").build(window, cx))
+                            .child(icons::ui("plus", px(12.), style::muted()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.new_session_menu = false;
+                                this.new_session_branch = false;
+                                this.new_session_line = if open || this.menu_just_closed() { None } else { Some(target.clone()) };
+                                cx.notify();
+                            }))
+                    })
+                    .when(self.new_session_line.as_deref() == Some(line.id.as_str()), |d| {
+                        d.child(deferred(div().absolute().top_full().right_0().mt_1().child(self.agent_menu(Some(line.id.clone()), cx))).with_priority(1))
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map · + adds a session · drop a session here to move it")).build(window, cx))
                     .drag_over::<super::DraggedSession>(|s, _, _, _| s.bg(style::accent_alpha(0.18)))
                     .on_drop(cx.listener({
                         let target = line.id.clone();
@@ -1133,11 +1191,11 @@ impl ProjectView {
             .into_any_element()
     }
 
-    fn harness_menu(&self, line_id: &str, kind: Option<ConnKind>, harnesses: &[Harness], cx: &mut Context<Self>) -> Div {
+    fn harness_menu(&self, line_id: &str, kind: Option<ConnKind>, branch: bool, harnesses: &[Harness], cx: &mut Context<Self>) -> Div {
         v_flex().ml_4().children(harnesses.iter().copied().map(|h| {
             let line_id = line_id.to_string();
             h_flex()
-                .id(SharedString::from(format!("hm-{}-{:?}", h.label(), kind.map(|k| k.role()))))
+                .id(SharedString::from(format!("hm-{}-{:?}-{branch}", h.label(), kind.map(|k| k.role()))))
                 .px_2()
                 .py_1()
                 .gap_2()
@@ -1150,6 +1208,7 @@ impl ProjectView {
                 .child(h.label())
                 .on_click(cx.listener(move |this, _, window, cx| match kind {
                     Some(k) => this.start_connection(line_id.clone(), k, h, window, cx),
+                    None if branch => this.branch_off_line(line_id.clone(), h, window, cx),
                     None => this.new_session_on_line(line_id.clone(), h, window, cx),
                 }))
         }))
@@ -1452,7 +1511,9 @@ impl ProjectView {
             })
             .child(section("ACTIONS"))
             .child(action("act-new".into(), "plus", "New session on this line", menu == Some(BoardMenu::NewSession)).on_click(cx.listener(|this, _, _, cx| this.toggle_menu(BoardMenu::NewSession, cx))))
-            .when(menu == Some(BoardMenu::NewSession), |d| d.child(self.harness_menu(&line_id, None, &harnesses, cx)))
+            .when(menu == Some(BoardMenu::NewSession), |d| d.child(self.harness_menu(&line_id, None, false, &harnesses, cx)))
+            .child(action("act-branch".into(), "git-branch-plus", "Branch off (sub-line)…", menu == Some(BoardMenu::Branch)).on_click(cx.listener(|this, _, _, cx| this.toggle_menu(BoardMenu::Branch, cx))))
+            .when(menu == Some(BoardMenu::Branch), |d| d.child(self.harness_menu(&line_id, None, true, &harnesses, cx)))
             .children(ConnKind::ALL.into_iter().map(|k| {
                 let open = menu == Some(BoardMenu::Connection(k));
                 let icon = match k {
@@ -1463,7 +1524,7 @@ impl ProjectView {
                 };
                 v_flex()
                     .child(action(SharedString::from(format!("act-{}", k.role())), icon, k.label(), open).on_click(cx.listener(move |this, _, _, cx| this.toggle_menu(BoardMenu::Connection(k), cx))))
-                    .when(open, |d| d.child(self.harness_menu(&line_id, Some(k), &harnesses, cx)))
+                    .when(open, |d| d.child(self.harness_menu(&line_id, Some(k), false, &harnesses, cx)))
             }))
             .child(action("act-parent".into(), "git-fork", "Part of…", menu == Some(BoardMenu::Parent)).on_click(cx.listener(|this, _, _, cx| this.toggle_menu(BoardMenu::Parent, cx))))
             .when_some(parent_name, |d, p| d.child(div().ml_8().text_xs().text_color(style::faint()).child(format!("now: {p}"))))

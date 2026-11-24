@@ -235,8 +235,7 @@ impl ProjectView {
             return;
         };
         let line = self.lines.lines.iter().find(|l| l.branch.as_deref() == Some(pr.head_ref_name.as_str())).map(|l| l.id.clone());
-        let can_chat = self.chat_agents.contains_key(&harness) || harness.chat_command().is_some();
-        if self.chat_mode && can_chat {
+        if self.opens_as_chat(harness, cx) {
             let opts = ChatOpts { line, cwd: Some(cwd), role: Some("resolve".into()), ..Default::default() };
             self.open_chat_with(harness, opts, window, cx);
             if let Some(TabKind::Chat { view, .. }) = self.tabs.last().map(|t| &t.kind) {

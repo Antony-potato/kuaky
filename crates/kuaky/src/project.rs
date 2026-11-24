@@ -381,10 +381,14 @@ pub struct ProjectView {
     #[allow(dead_code)]
     chat_agents: HashMap<Harness, (PathBuf, Vec<String>)>,
     /// Launch target chosen in the New Session menu (`false` = This folder, `true` = New branch).
-    isolate: bool,
+    /// Línea a la que se agrega la sesión nueva (menú abierto en su encabezado).
+    new_session_line: Option<String>,
+    /// Cuándo se cerró el menú al pulsar fuera (para que su botón no lo reabra).
+    new_session_closed: Option<Instant>,
+    /// En el menú de una línea: la sesión se bifurca en una sub-línea.
+    new_session_branch: bool,
     new_session_menu: bool,
     /// New sessions open as kuaky's own chat (ACP) instead of a terminal.
-    chat_mode: bool,
     previous_expanded: bool,
     activity_open: bool,
     activity: Vec<ActivityRow>,
@@ -521,9 +525,10 @@ impl ProjectView {
             git: GitState::default(),
             installed: HashMap::new(),
             chat_agents: HashMap::new(),
-            isolate: false,
+            new_session_line: None,
+            new_session_closed: None,
+            new_session_branch: false,
             new_session_menu: false,
-            chat_mode: false,
             previous_expanded: false,
             activity_open: false,
             limits: Vec::new(),
@@ -941,29 +946,171 @@ impl ProjectView {
         if !installed {
             return;
         }
-        let mut cwd = self.root.clone();
-        let mut worktree = None;
-        if self.isolate && harness != Harness::Shell {
-            if let Some(repo) = &self.repo {
-                let name = format!(
-                    "{}-{}",
-                    harness.command().unwrap_or("agent"),
-                    jiff::Zoned::now().strftime("%m%d-%H%M%S")
-                );
-                let created = match settings.resolved_worktrees_dir() {
-                    Some(dir) => repo.create_worktree_in(&dir, &name),
-                    None => repo.create_worktree(&name),
-                };
-                match created {
-                    Ok(path) => {
-                        cwd = path;
-                        worktree = Some(format!("kuaky/{name}"));
-                    }
-                    Err(err) => tracing::warn!(%err, "failed to create worktree"),
-                }
+        let (cwd, worktree) = match self.new_worktree(harness, cx) {
+            Some((path, branch)) => (path, Some(branch)),
+            None => (self.root.clone(), None),
+        };
+        self.spawn_terminal(harness, cwd, worktree, SpawnOpts::default(), window, cx);
+    }
+
+    /// Carpeta aparte (worktree + rama `kuaky/…`) si Settings lo pide para este agente.
+    fn new_worktree(&self, harness: Harness, cx: &App) -> Option<(PathBuf, String)> {
+        let settings = &state::get(cx).settings;
+        if harness == Harness::Shell || !settings.agent(harness.key()).in_worktree() {
+            return None;
+        }
+        let repo = self.repo.as_ref()?;
+        let name = format!("{}-{}", harness.command().unwrap_or("agent"), jiff::Zoned::now().strftime("%m%d-%H%M%S"));
+        let created = match settings.resolved_worktrees_dir() {
+            Some(dir) => repo.create_worktree_in(&dir, &name),
+            None => repo.create_worktree(&name),
+        };
+        match created {
+            Ok(path) => Some((path, format!("kuaky/{name}"))),
+            Err(err) => {
+                tracing::warn!(%err, "failed to create worktree");
+                None
             }
         }
-        self.spawn_terminal(harness, cwd, worktree, SpawnOpts::default(), window, cx);
+    }
+
+    /// "New session" abre este agente como chat (Settings → Agents; por defecto sí), si tiene chat.
+    pub(crate) fn opens_as_chat(&self, harness: Harness, cx: &App) -> bool {
+        harness != Harness::Shell
+            && state::get(cx).settings.agent(harness.key()).as_chat()
+            && (self.chat_agents.contains_key(&harness) || harness.chat_command().is_some())
+    }
+
+    /// Sesión nueva desde el menú: chat o terminal y carpeta según Settings → Agents.
+    pub fn launch(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_menu = false;
+        self.new_session_line = None;
+        if self.opens_as_chat(harness, cx) {
+            let cwd = self.new_worktree(harness, cx).map(|(path, _)| path);
+            self.open_chat_with(harness, ChatOpts { cwd, ..Default::default() }, window, cx);
+        } else {
+            self.open_terminal(harness, window, cx);
+        }
+    }
+
+    /// Lista de agentes para empezar una sesión (como el + de Zed). Con `line`,
+    /// la sesión se suma a esa línea, en su carpeta.
+    pub(crate) fn agent_menu(&self, line: Option<String>, cx: &mut Context<Self>) -> AnyElement {
+        let harnesses = self.available_harnesses(cx);
+        let item = |h: Harness, this: &Self, cx: &mut Context<Self>| {
+            let hint = (h != Harness::Shell && !this.opens_as_chat(h, cx)).then_some("terminal");
+            let line = line.clone();
+            h_flex()
+                .id(SharedString::from(format!("launch-{}-{}", h.label(), line.as_deref().unwrap_or(""))))
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .hover(|d| d.bg(style::panel_hover()))
+                .child(harness_badge(h))
+                .child(div().flex_1().min_w_0().truncate().child(h.label()))
+                .when_some(hint, |d, t| d.child(div().text_xs().text_color(style::faint()).child(t)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    match line.clone() {
+                        Some(line) if this.new_session_branch => this.branch_off_line(line, h, window, cx),
+                        Some(line) => this.new_session_on_line(line, h, window, cx),
+                        None => this.launch(h, window, cx),
+                    }
+                }))
+                .into_any_element()
+        };
+        let agents: Vec<AnyElement> = harnesses.iter().filter(|h| **h != Harness::Shell).map(|h| item(*h, self, cx)).collect();
+        let shell = item(Harness::Shell, self, cx);
+        let sep = || div().my_1().h(px(1.)).bg(style::border());
+        v_flex()
+            .id("agent-menu")
+            .occlude()
+            .w(px(220.))
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .shadow_lg()
+            .text_color(style::text())
+            // En una línea: seguir en ella o bifurcar una sub-línea (trabajo aparte del mismo tema).
+            .when(line.is_some(), |d| {
+                let branch = self.new_session_branch;
+                let chip = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
+                    div()
+                        .id(id)
+                        .flex_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .text_xs()
+                        .text_center()
+                        .cursor_pointer()
+                        .when(on, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                        .when(!on, |d| d.text_color(style::muted()))
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                        .child(label)
+                };
+                d.child(
+                    h_flex()
+                        .gap_1()
+                        .p_0p5()
+                        .child(chip("menu-this-line", "This line", !branch, "Another session on the same line").on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.new_session_branch = false;
+                            cx.notify();
+                        })))
+                        .child(chip("menu-sub-line", "Branch off", branch, "A sub-line under this one: separate work on the same topic").on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.new_session_branch = true;
+                            cx.notify();
+                        }))),
+                )
+                .child(div().my_1().h(px(1.)).bg(style::border()))
+            })
+            .when(agents.is_empty(), |d| d.child(div().px_2().py_1().text_xs().text_color(style::faint()).child("No agents found")))
+            .children(agents)
+            .child(sep())
+            .child(shell)
+            .child(sep())
+            .child(
+                h_flex()
+                    .id("agent-menu-settings")
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(style::muted())
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                    .child(icons::ui("settings", px(13.), style::muted()))
+                    .child("Configure agents…")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.new_session_menu = false;
+                        this.new_session_line = None;
+                        window.dispatch_action(Box::new(crate::app::OpenSettings), cx);
+                        cx.notify();
+                    })),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.new_session_menu || this.new_session_line.is_some() {
+                    this.new_session_menu = false;
+                    this.new_session_line = None;
+                    this.new_session_closed = Some(Instant::now());
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// ¿Se acaba de cerrar el menú al pulsar fuera? (el clic en su botón no lo reabre)
+    pub(crate) fn menu_just_closed(&self) -> bool {
+        self.new_session_closed.is_some_and(|t| t.elapsed() < Duration::from_millis(300))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2319,7 +2466,6 @@ impl ProjectView {
 
     fn left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
-        let harnesses = self.available_harnesses(cx);
 
         v_flex()
             .size_full()
@@ -2345,144 +2491,19 @@ impl ProjectView {
                                     .when(self.new_session_menu, |d| d.bg(style::panel_hover()))
                                     .hover(|d| d.bg(style::panel_hover()))
                                     .tooltip(|window, cx| Tooltip::new("New session").build(window, cx))
-                                    .child(icons::ui(if self.new_session_menu { "x" } else { "plus" }, px(14.), style::muted()))
+                                    .relative()
+                                    .child(icons::ui("plus", px(14.), style::muted()))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.new_session_menu = !this.new_session_menu;
+                                        this.new_session_line = None;
+                                        this.new_session_menu = !this.new_session_menu && !this.menu_just_closed();
                                         cx.notify();
-                                    })),
+                                    }))
+                                    // Lista de agentes flotando debajo del +.
+                                    .when(self.new_session_menu, |d| {
+                                        d.child(deferred(div().absolute().top_full().right_0().mt_1().child(self.agent_menu(None, cx))).with_priority(1))
+                                    }),
                             ),
                     )
-                    .when(self.new_session_menu, |d| {
-                        let isolated = self.isolate;
-                        d.child(
-                            v_flex()
-                                .p_2()
-                                .gap_2()
-                                .rounded_lg()
-                                .bg(style::bg())
-                                .border_1()
-                                .border_color(style::border())
-                                .when(self.repo.is_some(), |d| {
-                                    d.child(
-                                        v_flex()
-                                            .gap_1()
-                                            .child(div().px_1().text_xs().text_color(style::faint()).child("WORKSPACE"))
-                                            .child(
-                                                h_flex()
-                                                    .id("target-folder")
-                                                    .px_2()
-                                                    .py_1()
-                                                    .gap_2()
-                                                    .rounded_md()
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .when(!isolated, |d| d.bg(style::panel_hover()).text_color(style::text()))
-                                                    .when(isolated, |d| d.text_color(style::muted()))
-                                                    .hover(|d| d.bg(style::panel_hover()))
-                                                    .tooltip(|window, cx| {
-                                                        Tooltip::new("Work directly in this project folder").build(window, cx)
-                                                    })
-                                                    .child(icons::ui("folder", px(13.), if !isolated { style::accent() } else { style::muted() }))
-                                                    .child(div().flex_1().min_w_0().truncate().child("This folder"))
-                                                    .when(!isolated, |d| d.child(icons::ui("check", px(12.), style::accent())))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.isolate = false;
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .child(
-                                                h_flex()
-                                                    .id("target-branch")
-                                                    .px_2()
-                                                    .py_1()
-                                                    .gap_2()
-                                                    .rounded_md()
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .when(isolated, |d| d.bg(style::panel_hover()).text_color(style::text()))
-                                                    .when(!isolated, |d| d.text_color(style::muted()))
-                                                    .hover(|d| d.bg(style::panel_hover()))
-                                                    .tooltip(|window, cx| {
-                                                        Tooltip::new(
-                                                            "Create a separate git worktree and branch (kuaky/…) without touching your current folder",
-                                                        )
-                                                        .build(window, cx)
-                                                    })
-                                                    .child(icons::ui("git-branch", px(13.), if isolated { style::accent() } else { style::muted() }))
-                                                    .child(div().flex_1().min_w_0().truncate().child("New branch (separate copy)"))
-                                                    .when(isolated, |d| d.child(icons::ui("check", px(12.), style::accent())))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.isolate = true;
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    )
-                                    .child(div().h(px(1.)).bg(style::border()))
-                                })
-                                .child({
-                                    let chat = self.chat_mode;
-                                    let chip = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
-                                        div()
-                                            .id(id)
-                                            .flex_1()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_md()
-                                            .text_xs()
-                                            .text_center()
-                                            .cursor_pointer()
-                                            .when(on, |d| d.bg(style::panel_hover()).text_color(style::text()))
-                                            .when(!on, |d| d.text_color(style::muted()))
-                                            .hover(|d| d.bg(style::panel_hover()))
-                                            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-                                            .child(label)
-                                    };
-                                    v_flex()
-                                        .gap_1()
-                                        .child(div().px_1().text_xs().text_color(style::faint()).child("OPEN AS"))
-                                        .child(
-                                            h_flex()
-                                                .gap_1()
-                                                .child(chip("open-as-terminal", "Terminal", !chat, "The agent's own CLI in a terminal").on_click(cx.listener(|this, _, _, cx| {
-                                                    this.chat_mode = false;
-                                                    cx.notify();
-                                                })))
-                                                .child(chip("open-as-chat", "Chat", chat, "kuaky's chat (ACP): plan, permissions and changes with buttons").on_click(cx.listener(|this, _, _, cx| {
-                                                    this.chat_mode = true;
-                                                    cx.notify();
-                                                }))),
-                                        )
-                                        .child(div().h(px(1.)).bg(style::border()))
-                                })
-                                .child(
-                                    v_flex()
-                                        .gap_0p5()
-                                        .children(harnesses.into_iter().map(|h| {
-                                            let as_chat = self.chat_mode && h != Harness::Shell && (self.chat_agents.contains_key(&h) || h.chat_command().is_some());
-                                            let no_chat = self.chat_mode && h != Harness::Shell && !as_chat;
-                                            h_flex()
-                                                .id(SharedString::from(format!("launch-{}", h.label())))
-                                                .gap_2()
-                                                .px_2()
-                                                .py_1p5()
-                                                .rounded_md()
-                                                .text_sm()
-                                                .cursor_pointer()
-                                                .hover(|d| d.bg(style::panel_hover()))
-                                                .child(harness_badge(h))
-                                                .child(div().flex_1().min_w_0().truncate().child(h.label()))
-                                                .when(no_chat, |d| d.child(div().text_xs().text_color(style::faint()).child("terminal")))
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    if as_chat {
-                                                        this.open_chat(h, window, cx)
-                                                    } else {
-                                                        this.open_terminal(h, window, cx)
-                                                    }
-                                                }))
-                                        })),
-                                ),
-                        )
-                    }),
             )
             .child(
                 v_flex()
