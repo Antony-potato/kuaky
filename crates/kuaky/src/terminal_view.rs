@@ -1,5 +1,6 @@
 //! Vista GPUI de una terminal de `kuaky-term`.
 
+use crate::agent_status::{self, AgentState};
 use crate::style;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
@@ -11,6 +12,8 @@ const PADDING: f32 = 10.;
 pub enum TerminalViewEvent {
     TitleChanged,
     Exited,
+    /// El agente cambió de estado (según sus hooks).
+    AgentState,
 }
 
 pub struct TerminalView {
@@ -20,6 +23,9 @@ pub struct TerminalView {
     pub title: Option<SharedString>,
     pub exited: bool,
     pub last_output: Option<Instant>,
+    /// Estado reportado por los hooks del agente, si los tiene.
+    pub agent_state: Option<AgentState>,
+    pub previous_state: Option<AgentState>,
     focus: FocusHandle,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     cell: Option<(Pixels, Pixels)>,
@@ -39,7 +45,16 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(label: impl Into<SharedString>, launch: Launch, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        label: impl Into<SharedString>,
+        launch: Launch,
+        status_file: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        if let Some(path) = status_file {
+            Self::watch_status(path, cx);
+        }
         // Tamaño provisional; se ajusta en el primer pintado.
         let size = Size { cols: 100, rows: 30, cell_width: 8, cell_height: 18 };
         let (term, error) = match Terminal::spawn(&launch, size) {
@@ -76,6 +91,8 @@ impl TerminalView {
             title: None,
             exited: false,
             last_output: None,
+            agent_state: None,
+            previous_state: None,
             focus,
             bounds: Rc::new(Cell::new(None)),
             cell: None,
@@ -84,6 +101,43 @@ impl TerminalView {
             scroll_acc: 0.,
             font_size: px(13.),
         }
+    }
+
+    /// Lee las líneas nuevas del archivo de estado cada 300 ms.
+    fn watch_status(path: std::path::PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut offset = 0usize;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+                let text = std::fs::read(&path).unwrap_or_default();
+                if text.len() > offset {
+                    let new = String::from_utf8_lossy(&text[offset..]).into_owned();
+                    // Solo líneas completas.
+                    let consumed = new.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    offset += consumed;
+                    let latest = new[..consumed].lines().filter_map(agent_status::parse_line).last();
+                    if let Some(state) = latest {
+                        let alive = this
+                            .update(cx, |this, cx| {
+                                if this.agent_state.as_ref() != Some(&state) {
+                                    this.previous_state = this.agent_state.replace(state);
+                                    cx.emit(TerminalViewEvent::AgentState);
+                                    cx.notify();
+                                }
+                            })
+                            .is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                }
+                if this.upgrade().is_none() {
+                    break;
+                }
+            }
+            std::fs::remove_file(&path).ok();
+        })
+        .detach();
     }
 
     fn on_term_event(&mut self, ev: kuaky_term::RawEvent, cx: &mut Context<Self>) {

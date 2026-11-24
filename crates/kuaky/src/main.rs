@@ -1,3 +1,4 @@
+mod agent_status;
 mod app;
 mod diff_view;
 mod file_tree;

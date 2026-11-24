@@ -5,7 +5,7 @@ mod env;
 mod parse;
 
 pub use env::{command, find_agent, find_program, login_path, shell_command};
-pub use parse::{Branch, Change, ChangeKind, Commit, PullRequest};
+pub use parse::{Branch, Change, ChangeKind, Commit, PullRequest, Worktree};
 
 use anyhow::{Context as _, bail};
 use std::path::{Path, PathBuf};
@@ -144,6 +144,25 @@ impl Repo {
         Ok(path)
     }
 
+    /// Worktrees del repositorio (el principal incluido).
+    pub fn worktrees(&self) -> anyhow::Result<Vec<Worktree>> {
+        let out = self.git(&["worktree", "list", "--porcelain"])?;
+        Ok(parse::worktrees(&out))
+    }
+
+    /// Lo que un worktree tiene respecto a `base`: commits de su rama más
+    /// cambios sin commit.
+    pub fn diff_worktree_branch(&self, base: &str, wt: &Worktree) -> anyhow::Result<String> {
+        let mut patch = match &wt.branch {
+            Some(branch) => self.diff_refs(base, branch)?,
+            None => String::new(),
+        };
+        if let Some(repo) = Repo::discover(&wt.path) {
+            patch.push_str(&repo.diff_worktree().unwrap_or_default());
+        }
+        Ok(patch)
+    }
+
     /// PRs abiertos del repositorio (requiere `gh` con sesión iniciada).
     pub fn pull_requests(&self) -> anyhow::Result<Vec<PullRequest>> {
         let out = gh_in(
@@ -274,6 +293,11 @@ mod tests {
         assert!(wt.join("a.txt").is_file());
         let wt_repo = Repo::discover(&wt).unwrap();
         assert_eq!(wt_repo.current_branch().unwrap(), format!("kuaky/{name}"));
+        let list = repo.worktrees().unwrap();
+        assert_eq!(list.len(), 2);
+        let entry = list.iter().find(|w| w.branch.as_deref() == Some(&format!("kuaky/{name}"))).unwrap();
+        std::fs::write(wt.join("b.txt"), "nuevo\n").unwrap();
+        assert!(repo.diff_worktree_branch("main", entry).unwrap().contains("+nuevo"));
         git_in(&dir, &["worktree", "remove", "--force", &wt.to_string_lossy()]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }

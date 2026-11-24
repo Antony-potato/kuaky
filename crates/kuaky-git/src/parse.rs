@@ -45,6 +45,14 @@ pub struct Change {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Worktree {
+    pub path: std::path::PathBuf,
+    /// Rama sin `refs/heads/`; `None` si el HEAD está separado.
+    pub branch: Option<String>,
+    pub main: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Commit {
     pub short_hash: String,
     pub author: String,
@@ -141,6 +149,25 @@ pub fn status(out: &str) -> Vec<Change> {
         });
     }
     changes
+}
+
+pub fn worktrees(out: &str) -> Vec<Worktree> {
+    let mut list = Vec::new();
+    for (i, block) in out.split("\n\n").filter(|b| !b.trim().is_empty()).enumerate() {
+        let mut path = None;
+        let mut branch = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(std::path::PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(b.trim_start_matches("refs/heads/").to_string());
+            }
+        }
+        if let Some(path) = path {
+            list.push(Worktree { path, branch, main: i == 0 });
+        }
+    }
+    list
 }
 
 pub fn commits(out: &str) -> Vec<Commit> {

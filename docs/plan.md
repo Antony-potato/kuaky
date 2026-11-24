@@ -17,12 +17,12 @@ kuaky es un editor de escritorio ligero (macOS + Windows) centrado en agentes. A
 | 6. Dashboard de consumo (inicio) | ✅ | Claude Code, Codex y Gemini CLI; KPIs, días, heatmap, modelos, agentes, proyectos recientes |
 | 1. Proyecto y layout | ✅ | Sesiones (izq.), pestañas (centro), archivos / cambios / ramas / PRs (der.) |
 | 2. Terminal | ✅ | `kuaky-term`: alacritty_terminal + shell de login; selección, copiar/pegar, scroll |
-| 3. Sesiones | 🟡 | Lanzadores por agente (detecta las CLIs instaladas), estado trabajando/en espera/terminó, actividad por proyecto. Falta: hooks de estado |
+| 3. Sesiones | ✅ | Lanzadores por agente, actividad por proyecto. Claude Code: estado exacto con hooks (`--settings`, sin tocar tus ajustes) y avisos cuando termina o pide permiso. Codex/Gemini: estado aproximado |
 | 4. Git | ✅ | Cambios locales con diff, diff entre ramas, cambiar de rama |
 | 5. PRs | ✅ | Lista con `gh` y diff de cada PR |
 | 8. Editor | 🟡 | Editor de GPUI Kit con resaltado (syntect) y guardado ⌘S. Falta: LSP, búsqueda |
 | 7. Chat ACP | ⏳ | |
-| 9. Worktrees y distribución | 🟡 | Worktree por sesión; `kuaky.app` con ícono (`script/bundle-macos.sh`). Falta: instalador de Windows, auto-actualización |
+| 9. Worktrees y distribución | 🟡 | Worktree por sesión con cambios / terminal / crear PR / fusionar / eliminar; `kuaky.app` con ícono (`script/bundle-macos.sh`). Falta: instalador de Windows, auto-actualización |
 | Uso diario | ✅ | Menús nativos, paneles redimensionables, ⌘P, estado persistente y sesiones para reanudar |
 
 Capturas de desarrollo: `cargo run -p kuaky --features screenshot` con `KUAKY_SCREENSHOT=archivo.png` (más `KUAKY_DEMO_TERMINAL`, `KUAKY_DEMO_PANEL`, `KUAKY_DEMO_FILE`, `KUAKY_DEMO_DIFF`).

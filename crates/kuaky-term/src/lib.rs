@@ -55,6 +55,8 @@ pub struct Launch {
     /// Texto que se deja escrito en el shell sin ejecutarlo (p. ej. el comando
     /// para instalar un agente que falta).
     pub prefill: Option<String>,
+    /// Variables de entorno extra para el shell y el agente.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -117,6 +119,9 @@ impl Terminal {
         env.insert("TERM".into(), "xterm-256color".into());
         env.insert("COLORTERM".into(), "truecolor".into());
         env.insert("TERM_PROGRAM".into(), "kuaky".into());
+        for (k, v) in &launch.env {
+            env.insert(k.clone(), v.clone());
+        }
         let options = Options {
             shell: Some(shell_for(launch.command.as_deref())),
             working_directory: Some(launch.cwd.clone()),
@@ -466,6 +471,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             command: Some("echo kuaky-$((40+2))".into()),
             prefill: None,
+            env: Vec::new(),
         };
         let term = Terminal::spawn(&launch, size).unwrap();
         let events = term.events();

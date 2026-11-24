@@ -1,6 +1,7 @@
 //! Vista de proyecto: sesiones de agentes a la izquierda, pestañas en el
 //! centro (terminales, archivos, diffs) y archivos / git / PRs a la derecha.
 
+use crate::agent_status::AgentState;
 use crate::diff_view::DiffView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
@@ -13,7 +14,7 @@ use gpui_kit::component::resizable::{ResizablePanelEvent, ResizableState, h_resi
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use kuaky_git::{Branch, Change, PullRequest, Repo};
+use kuaky_git::{Branch, Change, PullRequest, Repo, Worktree};
 use kuaky_term::Launch;
 use kuaky_usage::{Agent, UsageEvent};
 use std::{
@@ -171,6 +172,7 @@ struct GitState {
     default_branch: Option<String>,
     changes: Vec<Change>,
     branches: Vec<Branch>,
+    worktrees: Vec<Worktree>,
     prs: Option<Result<Vec<PullRequest>, String>>,
     prs_loading: bool,
 }
@@ -381,8 +383,8 @@ impl ProjectView {
         let mut worktree = None;
         if !installed {
             // La CLI no está: abrir un shell con el comando de instalación escrito, sin ejecutarlo.
-            let launch = Launch { cwd, command: None, prefill: harness.install_hint().map(str::to_string) };
-            self.add_terminal(harness, launch, None, window, cx);
+            let launch = Launch { cwd, command: None, prefill: harness.install_hint().map(str::to_string), env: Vec::new() };
+            self.add_terminal(harness, launch, None, None, window, cx);
             return;
         }
         if self.isolate && harness != Harness::Shell {
@@ -426,22 +428,161 @@ impl ProjectView {
             };
             if resume { format!("{base}{}", harness.resume_args()) } else { base }
         });
-        let launch = Launch { cwd, command, prefill: None };
-        self.add_terminal(harness, launch, worktree, window, cx);
+        // Claude Code: hooks de kuaky para conocer su estado exacto (sin tocar tus ajustes).
+        let mut env = Vec::new();
+        let mut status_file = None;
+        let mut command = command;
+        if harness == Harness::Claude && cfg!(unix) {
+            if let (Some(settings), Some(file)) = (crate::agent_status::claude_settings(), crate::agent_status::new_status_file()) {
+                command = command.map(|c| format!("{c} --settings {}", kuaky_git::shell_command(settings)));
+                env.push(("KUAKY_STATUS_FILE".to_string(), file.to_string_lossy().into_owned()));
+                status_file = Some(file);
+            }
+        }
+        let launch = Launch { cwd, command, prefill: None, env };
+        self.add_terminal(harness, launch, worktree, status_file, window, cx);
     }
 
-    fn add_terminal(&mut self, harness: Harness, launch: Launch, worktree: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_terminal(
+        &mut self,
+        harness: Harness,
+        launch: Launch,
+        worktree: Option<String>,
+        status_file: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cwd = launch.cwd.clone();
-        let view = cx.new(|cx| TerminalView::new(harness.label(), launch, window, cx));
-        let sub = cx.subscribe(&view, |this, _, ev: &TerminalViewEvent, cx| {
-            if matches!(ev, TerminalViewEvent::Exited) {
-                this.persist(cx);
+        let view = cx.new(|cx| TerminalView::new(harness.label(), launch, status_file, window, cx));
+        let sub = cx.subscribe_in(&view, window, move |this, view, ev: &TerminalViewEvent, window, cx| {
+            match ev {
+                TerminalViewEvent::Exited => this.persist(cx),
+                TerminalViewEvent::AgentState => this.on_agent_state(view, harness, window, cx),
+                TerminalViewEvent::TitleChanged => {}
             }
             cx.notify();
         });
         let obs = cx.observe(&view, |_, _, cx| cx.notify());
         self._subs.extend([sub, obs]);
         self.push_tab(TabKind::Terminal { view, harness, worktree, cwd }, window, cx);
+    }
+
+    /// Avisa cuando un agente termina o necesita tu permiso: dentro de kuaky si
+    /// estás en otra pestaña, y con una notificación de macOS si kuaky no está
+    /// en primer plano.
+    fn on_agent_state(&mut self, view: &Entity<TerminalView>, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+        let t = view.read(cx);
+        let Some(state) = t.agent_state.clone() else { return };
+        let was_working = t.previous_state == Some(AgentState::Working);
+        let (title, message) = match &state {
+            AgentState::NeedsYou(msg) => (format!("{} necesita tu permiso", harness.label()), msg.clone()),
+            AgentState::Done if was_working => (format!("{} terminó", harness.label()), "Es tu turno.".to_string()),
+            _ => return,
+        };
+        let project = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let is_active_tab = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .is_some_and(|tab| matches!(&tab.kind, TabKind::Terminal { view: v, .. } if v == view));
+        let window_active = window.is_window_active();
+        if !is_active_tab || !window_active {
+            use gpui_kit::component::WindowExt as _;
+            window.push_notification(
+                gpui_kit::component::notification::Notification::new()
+                    .title(format!("{title} · {project}"))
+                    .message(message.clone()),
+                cx,
+            );
+        }
+        if !window_active {
+            system_notification(&format!("{title} · {project}"), &message);
+        }
+    }
+
+    /// Abre una terminal con `text` escrito, sin ejecutarlo: tú confirmas con Enter.
+    fn prefilled_shell(&mut self, cwd: PathBuf, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let launch = Launch { cwd, command: None, prefill: Some(text), env: Vec::new() };
+        self.add_terminal(Harness::Shell, launch, None, None, window, cx);
+    }
+
+    fn worktree_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let base = self.git.default_branch.clone().unwrap_or_else(|| "main".into());
+        let worktrees: Vec<Worktree> = self.git.worktrees.iter().filter(|w| !w.main).cloned().collect();
+        if worktrees.is_empty() {
+            return None;
+        }
+        let action = |id: (&'static str, usize), label: &'static str| {
+            div()
+                .id(id)
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(style::muted())
+                .hover(|d| d.bg(style::bg()).text_color(style::text()))
+                .child(label)
+        };
+        Some(
+            v_flex()
+                .gap_1()
+                .pb_2()
+                .mb_1()
+                .border_b_1()
+                .border_color(style::border())
+                .child(div().px_2().text_xs().text_color(style::faint()).child(format!("WORKTREES · base {base}")))
+                .children(worktrees.into_iter().enumerate().map(|(i, wt)| {
+                    let branch = wt.branch.clone().unwrap_or_else(|| "(sin rama)".into());
+                    let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let path_q = kuaky_git::shell_command(&wt.path);
+                    let (wt1, wt2, wt3) = (wt.clone(), wt.clone(), wt.clone());
+                    let (b1, b2, b3, b4) = (base.clone(), branch.clone(), branch.clone(), branch.clone());
+                    let root = self.root.clone();
+                    v_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_0p5()
+                        .rounded_md()
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .text_sm()
+                                .child(div().text_color(style::accent()).child("⑂"))
+                                .child(div().truncate().child(name)),
+                        )
+                        .child(div().text_xs().truncate().text_color(style::faint()).child(branch.clone()))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .flex_wrap()
+                                .child(action(("wt-diff", i), "cambios").on_click(cx.listener(move |this, _, window, cx| {
+                                    let Some(repo) = this.repo.clone() else { return };
+                                    let (base, wt) = (b1.clone(), wt1.clone());
+                                    let title = format!("⑂ {}", wt.branch.clone().unwrap_or_default());
+                                    this.open_diff(title, format!("cambios del worktree contra {base}"), move || repo.diff_worktree_branch(&base, &wt), window, cx);
+                                })))
+                                .child(action(("wt-term", i), "terminal").on_click(cx.listener(move |this, _, window, cx| {
+                                    this.add_terminal(Harness::Shell, Launch { cwd: wt2.path.clone(), command: None, prefill: None, env: Vec::new() }, wt2.branch.clone(), None, window, cx);
+                                })))
+                                .child(action(("wt-pr", i), "crear PR").on_click(cx.listener(move |this, _, window, cx| {
+                                    let text = format!("git push -u origin {b2} && gh pr create --fill --head {b2}");
+                                    this.prefilled_shell(wt3.path.clone(), text, window, cx);
+                                })))
+                                .child(action(("wt-merge", i), "fusionar").on_click(cx.listener({
+                                    let root = root.clone();
+                                    move |this, _, window, cx| {
+                                        this.prefilled_shell(root.clone(), format!("git merge --no-ff {b3}"), window, cx);
+                                    }
+                                })))
+                                .child(action(("wt-remove", i), "eliminar").on_click(cx.listener(move |this, _, window, cx| {
+                                    let text = format!("git worktree remove {path_q} && git branch -D {b4}");
+                                    this.prefilled_shell(root.clone(), text, window, cx);
+                                }))),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     fn push_tab(&mut self, kind: TabKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -519,7 +660,7 @@ impl ProjectView {
             loop {
                 let r = repo.clone();
                 let with_branches = first;
-                let (branch, changes, branches, default_branch) = cx
+                let (branch, changes, branches, default_branch, worktrees) = cx
                     .background_executor()
                     .spawn(async move {
                         (
@@ -527,6 +668,7 @@ impl ProjectView {
                             r.status().unwrap_or_default(),
                             r.branches().unwrap_or_default(),
                             if with_branches { r.default_branch() } else { None },
+                            r.worktrees().unwrap_or_default(),
                         )
                     })
                     .await;
@@ -534,6 +676,7 @@ impl ProjectView {
                     .update(cx, |this, cx| {
                         this.git.branch = branch;
                         this.git.branches = branches;
+                        this.git.worktrees = worktrees;
                         if first {
                             this.git.default_branch = default_branch;
                         }
@@ -1066,6 +1209,7 @@ impl ProjectView {
             return panel_message("Esta carpeta no es un repositorio git.").into_any_element();
         }
         let base = self.git.default_branch.clone();
+        let worktrees = self.worktree_section(cx);
         div()
             .id("branches")
             .size_full()
@@ -1074,6 +1218,7 @@ impl ProjectView {
                 v_flex()
                     .p_2()
                     .gap_0p5()
+                    .children(worktrees)
                     .when_some(base.clone(), |d, b| {
                         d.child(div().px_2().pb_1().text_xs().text_color(style::faint()).child(format!("clic: diff contra {b}")))
                     })
@@ -1280,6 +1425,17 @@ impl Render for ProjectView {
 // ── piezas ───────────────────────────────────────────────────────────────
 
 fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
+    if !t.exited {
+        if let Some(state) = &t.agent_state {
+            let color: Hsla = match state {
+                AgentState::Working => style::accent().into(),
+                AgentState::NeedsYou(_) => style::bad().into(),
+                AgentState::Done => style::good().into(),
+                AgentState::Ended => style::faint().into(),
+            };
+            return (state.label(), color);
+        }
+    }
     if t.exited {
         ("terminó", style::faint().into())
     } else if t.last_output.is_some_and(|o| now.duration_since(o) < Duration::from_secs(2)) {
@@ -1287,6 +1443,20 @@ fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
     } else {
         ("en espera", style::good().into())
     }
+}
+
+/// Notificación del sistema (macOS) en segundo plano.
+fn system_notification(title: &str, message: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!("display notification \"{}\" with title \"kuaky\" subtitle \"{}\"", esc(message), esc(title));
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("osascript").args(["-e", &script]).output();
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (title, message);
 }
 
 fn side_title(text: &'static str) -> impl IntoElement {
