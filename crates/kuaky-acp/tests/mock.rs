@@ -26,7 +26,7 @@ fn full_turn_with_permission_and_diff() {
                 assert_eq!(req.options.len(), 2);
                 client.answer_permission(&req.request_id, Some("allow")).unwrap();
             }
-            Event::ToolCallUpdate(call) => {
+            Event::ToolCallUpdate(call) if call.id == "t1" => {
                 assert_eq!(call.status.as_deref(), Some("completed"));
                 assert_eq!(call.diffs[0].new_text, "b\n");
             }

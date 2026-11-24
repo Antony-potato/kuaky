@@ -40,3 +40,14 @@ Colores: neutros; el color solo marca estado (trabajando, te necesita). El tema 
 2. Fila plegable en la barra izquierda con la propuesta elegida.
 3. Clic → saltar a la herramienta en el chat.
 4. Temas (después del mood).
+
+## Estado (24-nov)
+
+Hecho con la propuesta **A**:
+- Detección en terminal (registro de Claude Code: `Agent`/`Task` → resultado) y en chat (`_meta.claudeCode.toolName` + `rawInput`).
+- Debajo de cada sesión, una línea plegada ("2 subagents working ›", con spinner); al abrirla, hasta 4 filas con qué hace, estado y tiempo; "+N more".
+- Los terminados desaparecen a los 2 minutos; los que corren se ocultan tras 2 h (sesión muerta).
+- Clic en un subagente: abre la sesión y, en el chat, salta a esa herramienta con su grupo abierto.
+- En el chat, el grupo dice "Ran 2 subagents ›" y cada tarjeta "Subagent · Explore".
+
+Pendiente: recordar qué listas dejaste abiertas al reiniciar; pasos internos de cada subagente (`parentToolUseId`).

@@ -416,6 +416,8 @@ pub struct ProjectView {
     layout_collapsed: Entity<ResizableState>,
     /// Sesión (uid) → PR que hizo.
     session_prs: HashMap<String, u64>,
+    /// Sessions (tab id) whose subagent list is open in the sidebar.
+    subagents_open: std::collections::HashSet<usize>,
     /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
     pending_merges: HashMap<String, u64>,
     mini_map_collapsed: bool,
@@ -533,6 +535,7 @@ impl ProjectView {
             left_collapsed: state::get(cx).left_collapsed || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_COLLAPSED").is_ok()),
             layout_collapsed: cx.new(|_| ResizableState::default()),
             session_prs: HashMap::new(),
+            subagents_open: std::collections::HashSet::new(),
             pending_merges: HashMap::new(),
             mini_map_collapsed: false,
             visible: true,
@@ -1965,8 +1968,7 @@ impl ProjectView {
             None => format!("{title}\n{status_line}").into(),
         };
         let _ = accent_color;
-        Some(
-            h_flex()
+        let row = h_flex()
                 .id(("session", tab_id))
                 .relative()
                 .group(group.clone())
@@ -2067,8 +2069,113 @@ impl ProjectView {
                         }
                     }),
                 )
-                .into_any_element(),
-        )
+                .into_any_element();
+        Some(self.with_subagents(row, i, tab, cx))
+    }
+
+    /// Subagentes visibles de una sesión (corriendo, o terminados hace menos de 2 min).
+    fn session_subagents(&self, tab: &Tab, cx: &App) -> Vec<crate::agent_tasks::Subagent> {
+        let now = jiff::Timestamp::now();
+        let all = match &tab.kind {
+            TabKind::Terminal { view, .. } => {
+                let uid = view.read(cx).uid.clone();
+                self.task_watchers.get(&uid).map(|w| w.subagents().to_vec()).unwrap_or_default()
+            }
+            TabKind::Chat { view, .. } => view.read(cx).subagents(),
+            _ => Vec::new(),
+        };
+        all.into_iter().filter(|a| a.visible(now)).collect()
+    }
+
+    /// Debajo de la sesión: una línea plegable con sus subagentes.
+    fn with_subagents(&self, row: AnyElement, i: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
+        let subs = self.session_subagents(tab, cx);
+        if subs.is_empty() {
+            return row;
+        }
+        let tab_id = tab.id;
+        let open = self.subagents_open.contains(&tab_id) || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_SUBAGENTS").is_ok());
+        let running = subs.iter().filter(|a| a.running()).count();
+        let summary = if running > 0 {
+            format!("{running} subagent{} working", if running == 1 { "" } else { "s" })
+        } else {
+            format!("{} subagent{} done", subs.len(), if subs.len() == 1 { "" } else { "s" })
+        };
+        let now = jiff::Timestamp::now();
+        let spinner = |id: SharedString, color: Hsla| {
+            icons::ui("loader-circle", px(11.), color)
+                .with_animation(id, Animation::new(Duration::from_millis(1100)).repeat(), |svg, delta| {
+                    svg.with_transformation(Transformation::rotate(percentage(delta)))
+                })
+                .into_any_element()
+        };
+        const MAX_ROWS: usize = 4;
+        let shown: Vec<&crate::agent_tasks::Subagent> = subs.iter().rev().take(MAX_ROWS).collect();
+        let more = subs.len().saturating_sub(MAX_ROWS);
+        v_flex()
+            .child(row)
+            .child(
+                h_flex()
+                    .id(("subagents", tab_id))
+                    .pl(px(32.))
+                    .pr_2()
+                    .py_0p5()
+                    .gap_1()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(if running > 0 { style::muted() } else { style::faint() })
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .child(icons::ui(if open { "chevron-down" } else { "chevron-right" }, px(11.), style::faint()))
+                    .when(running > 0 && !open, |d| d.child(spinner(format!("subs-spin-{tab_id}").into(), style::muted().into())))
+                    .child(div().truncate().child(summary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.subagents_open.remove(&tab_id) {
+                            this.subagents_open.insert(tab_id);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(open, |d| {
+                d.children(shown.into_iter().enumerate().map(|(k, a)| {
+                    let elapsed = a.done.unwrap_or(now).duration_since(a.started).as_secs().max(0) as u64;
+                    let icon = if a.running() {
+                        spinner(format!("sub-spin-{tab_id}-{k}").into(), style::muted().into())
+                    } else if a.failed {
+                        icons::ui("x", px(11.), style::bad()).into_any_element()
+                    } else {
+                        icons::ui("check", px(11.), style::faint()).into_any_element()
+                    };
+                    let id = a.id.clone();
+                    let tip: SharedString = format!("{} · {}", a.kind, a.what).into();
+                    h_flex()
+                        .id(SharedString::from(format!("subagent-{tab_id}-{k}")))
+                        .pl(px(44.))
+                        .pr_2()
+                        .py_0p5()
+                        .gap_1p5()
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(if a.running() { style::muted() } else { style::faint() })
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .child(icon)
+                        .child(div().flex_1().min_w_0().truncate().child(if a.what.is_empty() { a.kind.clone() } else { a.what.clone() }))
+                        .child(div().flex_none().text_color(style::faint()).child(style::duration(elapsed)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.activate(i, window, cx);
+                            if let Some(TabKind::Chat { view, .. }) = this.tabs.get(i).map(|t| &t.kind) {
+                                view.update(cx, |v, cx| v.reveal_tool(&id, cx));
+                            }
+                        }))
+                        .into_any_element()
+                }))
+                .when(more > 0, |d| d.child(div().pl(px(44.)).text_xs().text_color(style::faint()).child(format!("+{more} more"))))
+            })
+            .into_any_element()
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {

@@ -32,6 +32,34 @@ impl TaskStatus {
     }
 }
 
+/// Subagente que lanzó la sesión (herramienta `Agent`/`Task` de Claude Code).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Subagent {
+    /// `tool_use` id (o `toolCallId` en ACP).
+    pub id: String,
+    /// `Explore`, `general-purpose`, `Plan`…
+    pub kind: String,
+    pub what: String,
+    pub started: jiff::Timestamp,
+    pub done: Option<jiff::Timestamp>,
+    pub failed: bool,
+}
+
+impl Subagent {
+    pub fn running(&self) -> bool {
+        self.done.is_none()
+    }
+
+    /// Se muestra mientras corre (hasta 2 h, por si la sesión murió sin cerrarlo)
+    /// y 2 minutos después de terminar.
+    pub fn visible(&self, now: jiff::Timestamp) -> bool {
+        match self.done {
+            None => now.duration_since(self.started).as_secs() < 2 * 3600,
+            Some(done) => now.duration_since(done).as_secs() < 120,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTask {
     pub subject: String,
@@ -49,6 +77,8 @@ pub struct TaskWatcher {
     /// `TaskCreate` sin resultado todavía (tool_use id → tarea).
     pending: HashMap<String, AgentTask>,
     deleted: Vec<String>,
+    subagents: Vec<Subagent>,
+    subagents_changed: bool,
 }
 
 impl TaskWatcher {
@@ -89,8 +119,10 @@ impl TaskWatcher {
             }
             self.offset += n as u64;
             let relevant = line.contains("\"Task")
+                || line.contains("\"Agent\"")
                 || line.contains("\"TodoWrite\"")
-                || (line.contains("\"toolUseResult\"") && line.contains("\"task\""));
+                || (line.contains("\"toolUseResult\"") && line.contains("\"task\""))
+                || (line.contains("tool_result") && self.subagents.iter().any(|a| a.running() && line.contains(a.id.as_str())));
             if relevant {
                 if let Ok(v) = serde_json::from_str::<Value>(&line) {
                     self.apply(&v);
@@ -101,17 +133,49 @@ impl TaskWatcher {
         (after != before).then_some(after)
     }
 
+    pub fn subagents(&self) -> &[Subagent] {
+        &self.subagents
+    }
+
+    /// ¿Cambiaron los subagentes desde la última vez que se preguntó?
+    pub fn take_subagents_changed(&mut self) -> bool {
+        std::mem::take(&mut self.subagents_changed)
+    }
+
     pub fn list(&self) -> Vec<AgentTask> {
         self.order.iter().filter(|id| !self.deleted.contains(id)).filter_map(|id| self.tasks.get(id).cloned()).collect()
     }
 
     fn apply(&mut self, v: &Value) {
+        let at = v.get("timestamp").and_then(Value::as_str).and_then(|t| t.parse::<jiff::Timestamp>().ok()).unwrap_or_else(jiff::Timestamp::now);
         if let Some(content) = v.pointer("/message/content").and_then(Value::as_array) {
             for block in content {
                 match block.get("type").and_then(Value::as_str) {
-                    Some("tool_use") => self.tool_use(block),
+                    Some("tool_use") => {
+                        if matches!(block.get("name").and_then(Value::as_str), Some("Agent" | "Task")) {
+                            let input = block.get("input").cloned().unwrap_or(Value::Null);
+                            let id = block.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                            if !id.is_empty() && !self.subagents.iter().any(|a| a.id == id) {
+                                self.subagents.push(Subagent {
+                                    id,
+                                    kind: input.get("subagent_type").and_then(Value::as_str).unwrap_or("Agent").to_string(),
+                                    what: input.get("description").and_then(Value::as_str).unwrap_or("").to_string(),
+                                    started: at,
+                                    done: None,
+                                    failed: false,
+                                });
+                                self.subagents_changed = true;
+                            }
+                        }
+                        self.tool_use(block)
+                    }
                     Some("tool_result") => {
                         let use_id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                        if let Some(a) = self.subagents.iter_mut().find(|a| a.id == use_id && a.running()) {
+                            a.done = Some(at);
+                            a.failed = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                            self.subagents_changed = true;
+                        }
                         if let Some(task) = self.pending.remove(use_id) {
                             if let Some(id) = v.pointer("/toolUseResult/task/id").and_then(id_str) {
                                 self.insert(id, task);
@@ -209,6 +273,35 @@ mod tests {
         writeln!(f, r#"{{"message":{{"content":[{{"type":"tool_use","id":"u4","name":"TaskUpdate","input":{{"taskId":"2","status":"in_progress"}}}}]}}}}"#).unwrap();
         drop(f);
         assert_eq!(w.poll().unwrap()[1].status, TaskStatus::InProgress);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follows_subagents() {
+        let path = std::env::temp_dir().join(format!("kuaky-subagents-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-11-24T10:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Agent","input":{"subagent_type":"Explore","description":"Find auth code"}}]}}"#,
+                "\n",
+                r#"{"timestamp":"2026-11-24T10:00:05Z","message":{"content":[{"type":"tool_use","id":"t2","name":"Agent","input":{"description":"Review PR"}}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut w = TaskWatcher::for_file(path.clone());
+        w.poll();
+        assert!(w.take_subagents_changed());
+        assert_eq!(w.subagents().len(), 2);
+        assert_eq!(w.subagents()[0].kind, "Explore");
+        assert!(w.subagents().iter().all(|a| a.running()));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, r#"{{"timestamp":"2026-11-24T10:01:00Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1","is_error":false}}]}}}}"#).unwrap();
+        drop(f);
+        w.poll();
+        assert!(w.take_subagents_changed());
+        assert!(!w.subagents()[0].running());
+        assert!(w.subagents()[1].running());
         let _ = std::fs::remove_file(path);
     }
 

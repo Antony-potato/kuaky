@@ -250,6 +250,10 @@ impl ProjectView {
                             this.lines.set_tasks(uid, &list);
                             changed = true;
                         }
+                        // Subagentes: nuevos/terminados, y los que corren (su tiempo avanza).
+                        if watcher.take_subagents_changed() || watcher.subagents().iter().any(|a| a.running()) {
+                            changed = true;
+                        }
                     }
                     if changed {
                         cx.notify();

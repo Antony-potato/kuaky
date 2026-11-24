@@ -137,6 +137,16 @@ pub struct ToolCall {
     pub diffs: Vec<FileDiff>,
     pub text: Option<String>,
     pub locations: Vec<Location>,
+    /// Herramienta del agente (`_meta.claudeCode.toolName`), p. ej. `Bash`, `Agent`.
+    pub tool_name: Option<String>,
+    /// Subagente lanzado por esta herramienta: (tipo, descripción).
+    pub subagent: Option<(String, String)>,
+}
+
+impl ToolCall {
+    pub fn is_subagent(&self) -> bool {
+        self.subagent.is_some() || matches!(self.tool_name.as_deref(), Some("Agent" | "Task"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -591,8 +601,19 @@ fn parse_tool_call(v: &Value) -> ToolCall {
         title: s("title"),
         kind: s("kind"),
         status: s("status"),
+        tool_name: v.pointer("/_meta/claudeCode/toolName").and_then(Value::as_str).map(str::to_string),
         ..ToolCall::default()
     };
+    if matches!(call.tool_name.as_deref(), Some("Agent" | "Task")) {
+        let kind = v.pointer("/rawInput/subagent_type").and_then(Value::as_str).unwrap_or("Agent").to_string();
+        let what = v
+            .pointer("/rawInput/description")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| call.title.clone())
+            .unwrap_or_default();
+        call.subagent = Some((kind, what));
+    }
     if let Some(locs) = v.get("locations").and_then(Value::as_array) {
         call.locations = locs
             .iter()
@@ -758,6 +779,15 @@ mod unit {
             "models": { "currentModelId": "m1", "availableModels": [{ "modelId": "m1", "name": "M1" }] } });
         let c = parse_session_config(&legacy);
         assert_eq!(c.iter().map(|o| o.category.as_str()).collect::<Vec<_>>(), ["model", "mode"]);
+    }
+
+    #[test]
+    fn marks_subagent_tool_calls() {
+        let e = parse_update(&json!({ "sessionUpdate": "tool_call", "toolCallId": "a1", "title": "Find auth code", "status": "in_progress",
+            "rawInput": { "subagent_type": "Explore", "description": "Find auth code" }, "_meta": { "claudeCode": { "toolName": "Agent" } } }));
+        let Some(Event::ToolCall(c)) = e else { panic!() };
+        assert!(c.is_subagent());
+        assert_eq!(c.subagent, Some(("Explore".into(), "Find auth code".into())));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kuaky_acp::{Client, ConfigOption, Event, FileDiff, PermissionRequest, PlanEntry, PromptBlock, SlashCommand, ToolCall};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -220,6 +220,8 @@ pub struct ChatView {
     pub mentioned_prs: Vec<u64>,
     /// PR de esta sesión: (número, tiene conflictos). Lo pone el proyecto.
     pub pr: Option<(u64, bool)>,
+    /// Cuándo empezó y terminó cada subagente (por `toolCallId`).
+    subagent_times: HashMap<String, (jiff::Timestamp, Option<jiff::Timestamp>)>,
     last_followed: Option<(String, Option<u32>)>,
     client: Option<Arc<Client>>,
     turns: Vec<Turn>,
@@ -294,6 +296,7 @@ impl ChatView {
             follow: false,
             mentioned_prs: Vec::new(),
             pr: None,
+            subagent_times: HashMap::new(),
             last_followed: None,
             client: None,
             turns: Vec::new(),
@@ -499,6 +502,7 @@ impl ChatView {
                 }
                 let id = call.id.clone();
                 turn.items.push(Item::Tool(call));
+                self.track_subagent(&id);
                 self.follow_tool(&id, cx);
             }
             Event::ToolCallUpdate(update) => {
@@ -514,6 +518,12 @@ impl ChatView {
                     Some(call) => {
                         if update.title.is_some() {
                             call.title = update.title;
+                        }
+                        if update.tool_name.is_some() {
+                            call.tool_name = update.tool_name;
+                        }
+                        if update.subagent.is_some() {
+                            call.subagent = update.subagent;
                         }
                         if update.kind.is_some() {
                             call.kind = update.kind;
@@ -533,6 +543,7 @@ impl ChatView {
                     }
                     None => turn.items.push(Item::Tool(update.clone())),
                 }
+                self.track_subagent(&update.id);
                 self.follow_tool(&update.id, cx);
             }
             Event::FileWritten { path, old_text, new_text } => self.current_turn().record_file(path, old_text, new_text),
@@ -631,6 +642,60 @@ impl ChatView {
             }
             _ => {}
         }
+    }
+
+    fn find_tool(&self, id: &str) -> Option<&ToolCall> {
+        self.turns.iter().rev().flat_map(|t| t.items.iter().rev()).find_map(|i| match i {
+            Item::Tool(c) if c.id == id => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Anota cuándo empezó/terminó un subagente.
+    fn track_subagent(&mut self, id: &str) {
+        let Some(call) = self.find_tool(id).filter(|c| c.is_subagent()) else { return };
+        let finished = matches!(call.status.as_deref(), Some("completed" | "failed"));
+        let now = jiff::Timestamp::now();
+        let entry = self.subagent_times.entry(id.to_string()).or_insert((now, None));
+        if finished && entry.1.is_none() {
+            entry.1 = Some(now);
+        }
+    }
+
+    /// Subagentes de esta conversación (los de la sesión retomada no tienen hora: se omiten).
+    pub fn subagents(&self) -> Vec<crate::agent_tasks::Subagent> {
+        self.turns
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .filter_map(|i| match i {
+                Item::Tool(c) if c.is_subagent() => {
+                    let (started, done) = *self.subagent_times.get(&c.id)?;
+                    let (kind, what) = c.subagent.clone().unwrap_or_else(|| ("Agent".into(), c.title.clone().unwrap_or_default()));
+                    Some(crate::agent_tasks::Subagent {
+                        id: c.id.clone(),
+                        kind,
+                        what,
+                        started,
+                        done,
+                        failed: c.status.as_deref() == Some("failed"),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Salta a una herramienta del chat (p. ej. un subagente) y abre su grupo.
+    pub fn reveal_tool(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.viewing = None;
+        let Some(ti) = self.turns.iter().position(|t| t.items.iter().any(|i| matches!(i, Item::Tool(c) if c.id == id))) else { return };
+        for ii in 0..self.turns[ti].items.len() {
+            if matches!(self.turns[ti].items[ii], Item::Tool(_)) {
+                self.expanded.insert((ti, ii));
+            }
+        }
+        self.scroll.scroll_to_top_of_item(ti);
+        cx.notify();
     }
 
     /// Enlaces a PRs en las respuestas del agente.
@@ -1431,7 +1496,14 @@ impl ChatView {
         if fetched > 0 {
             words.push(format!("fetched {}", plural(fetched, "a page", "pages")));
         }
-        let other = calls.iter().filter(|c| !matches!(c.kind.as_deref(), Some("execute" | "read" | "search" | "fetch" | "edit" | "delete" | "move"))).count();
+        let subagents = calls.iter().filter(|c| c.is_subagent()).count();
+        if subagents > 0 {
+            words.push(format!("ran {}", plural(subagents, "a subagent", "subagents")));
+        }
+        let other = calls
+            .iter()
+            .filter(|c| !c.is_subagent() && !matches!(c.kind.as_deref(), Some("execute" | "read" | "search" | "fetch" | "edit" | "delete" | "move")))
+            .count();
         if other > 0 {
             words.push(format!("used {}", plural(other, "a tool", "tools")));
         }
@@ -1530,6 +1602,7 @@ impl ChatView {
             "in_progress" => ("loader-circle", style::accent().into()),
             _ => ("circle-dashed", style::faint().into()),
         };
+        let subagent_label = call.subagent.as_ref().map(|(kind, _)| format!("Subagent · {kind}"));
         let label = match call.kind.as_deref() {
             Some("edit") => "Edit",
             Some("read") => "Read",
@@ -1558,7 +1631,7 @@ impl ChatView {
                     .items_center()
                     .text_xs()
                     .text_color(style::faint())
-                    .child(label)
+                    .child(subagent_label.unwrap_or_else(|| label.to_string()))
                     .when_some(location, |d, loc| {
                         let path = PathBuf::from(&loc.path);
                         let line = loc.line.unwrap_or(1);

@@ -82,5 +82,10 @@ while True:
         for i, cmd in enumerate(["git status --short", "cargo test -p kuaky"]):
             update(s, {"sessionUpdate": "tool_call", "toolCallId": f"c{i}", "title": cmd, "kind": "execute", "status": "completed"})
         update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "\n\nListo: el archivo quedó editado y los tests pasan."}})
+        update(s, {"sessionUpdate": "tool_call", "toolCallId": "sa1", "title": "Find auth code", "kind": "think", "status": "in_progress",
+                   "rawInput": {"subagent_type": "Explore", "description": "Find auth code"}, "_meta": {"claudeCode": {"toolName": "Agent"}}})
+        update(s, {"sessionUpdate": "tool_call_update", "toolCallId": "sa1", "status": "completed"})
+        update(s, {"sessionUpdate": "tool_call", "toolCallId": "sa2", "title": "Review PR 2278", "kind": "think", "status": "in_progress",
+                   "rawInput": {"subagent_type": "general-purpose", "description": "Review PR 2278"}, "_meta": {"claudeCode": {"toolName": "Agent"}}})
         update(s, {"sessionUpdate": "usage_update", "used": 52000, "size": 200000, "cost": {"amount": 0.42, "currency": "USD"}})
         send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
