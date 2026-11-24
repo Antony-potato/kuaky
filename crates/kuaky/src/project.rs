@@ -559,6 +559,10 @@ impl ProjectView {
         this
     }
 
+    pub fn sidebar_collapsed(&self) -> bool {
+        self.left_collapsed
+    }
+
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
     }
@@ -1943,7 +1947,6 @@ impl ProjectView {
                                     }
                                     _ => return None,
                                 };
-                                let selected = self.active == Some(i);
                                 let tab_id = tab.id;
                                 let uid = match &tab.kind {
                                     TabKind::Terminal { view, .. } => view.read(cx).uid.clone(),
@@ -1955,119 +1958,120 @@ impl ProjectView {
                                     (n, conflicts)
                                 });
                                 let dragged = DraggedSession { uid, title: title.clone() };
-                                Some(
-                                    h_flex()
-                                        .id(("session", tab_id))
-                                        .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1p5()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .when_some(accent_color, |d, c| d.border_l_2().border_color(rgb(c)))
-                                        .when(selected, |d| d.bg(style::panel_hover()))
-                                        .hover(|d| d.bg(style::panel_hover()))
-                                        .child(harness_badge(harness))
-                                        .child(
-                                            v_flex()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .child(div().text_sm().truncate().child(title))
-                                                .child(
-                                                    h_flex()
-                                                        .gap_1()
-                                                        .min_w_0()
-                                                        .text_xs()
-                                                        .text_color(style::muted())
-                                                        .child(div().size(px(6.)).flex_none().rounded_full().bg(dot_color))
-                                                        .child(div().flex_1().min_w_0().truncate().child(status_line)),
-                                                )
-                                                .when_some(pr, |d, (n, conflicts)| {
-                                                    d.child(
-                                                        h_flex()
-                                                            .id(("session-pr", tab_id))
-                                                            .gap_1()
-                                                            .text_xs()
-                                                            .text_color(if conflicts { style::bad() } else { style::accent() })
-                                                            .cursor_pointer()
-                                                            .hover(|d| d.text_color(style::text()))
-                                                            .tooltip(move |window, cx| {
-                                                                Tooltip::new(if conflicts { "PR with conflicts · open" } else { "Open this session's PR" }).build(window, cx)
-                                                            })
-                                                            .child(icons::ui("git-pull-request", px(11.), if conflicts { style::bad() } else { style::accent() }))
-                                                            .child(format!("PR #{n}{}", if conflicts { " · conflicts" } else { "" }))
-                                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                                cx.stop_propagation();
-                                                                this.open_pr(n, window, cx);
-                                                            })),
-                                                    )
-                                                })
-                                                .when_some(worktree, |d, w| {
-                                                    d.child(
-                                                        h_flex()
-                                                            .gap_1()
-                                                            .min_w_0()
-                                                            .text_xs()
-                                                            .text_color(style::faint())
-                                                            .child(icons::ui("git-branch", px(11.), style::faint()))
-                                                            .child(div().flex_1().min_w_0().truncate().child(w)),
-                                                    )
-                                                }),
-                                        )
-                                        .when(can_rename, |d| {
-                                            d.child(
-                                                div()
-                                                    .id(("session-rename", tab_id))
-                                                    .flex_none()
-                                                    .p_0p5()
-                                                    .rounded_sm()
-                                                    .hover(|d| d.bg(style::bg()))
-                                                    .tooltip(|window, cx| {
-                                                        Tooltip::new("Rename & color (double-click or right-click)").build(window, cx)
-                                                    })
-                                                    .child(icons::ui("pencil", px(11.), style::faint()))
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.open_rename_modal(tab_id, window, cx);
-                                                    })),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .id(("session-close", tab_id))
-                                                .flex_none()
-                                                .p_0p5()
-                                                .rounded_sm()
-                                                .hover(|d| d.bg(style::bg()))
-                                                .child(icons::ui("x", px(12.), style::faint()))
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.close_tab(i, window, cx);
-                                                })),
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                                if can_rename && ev.click_count >= 2 {
-                                                    this.open_rename_modal(tab_id, window, cx);
-                                                } else {
-                                                    this.activate(i, window, cx);
-                                                }
-                                            }),
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener(move |this, _, window, cx| {
-                                                if can_rename {
-                                                    this.open_rename_modal(tab_id, window, cx);
-                                                }
-                                            }),
-                                        ),
-                                )
-                                .map(|e| e.into_any_element())
+        let selected = self.shown_session == Some(tab_id);
+        let group: SharedString = format!("session-row-{tab_id}").into();
+        let tip: SharedString = match &worktree {
+            Some(w) => format!("{title}\n{status_line} · worktree {w}").into(),
+            None => format!("{title}\n{status_line}").into(),
+        };
+        let _ = accent_color;
+        Some(
+            h_flex()
+                .id(("session", tab_id))
+                .relative()
+                .group(group.clone())
+                .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(selected, |d| d.bg(style::panel_hover()))
+                .hover(|d| d.bg(style::panel_hover()))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .child(div().flex_none().child(harness_badge(harness)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(if selected { style::text() } else { style::muted() })
+                        .child(title),
+                )
+                .when_some(pr, |d, (n, conflicts)| {
+                    let color = if conflicts { style::bad() } else { style::muted() };
+                    d.child(
+                        h_flex()
+                            .id(("session-pr", tab_id))
+                            .flex_none()
+                            .gap_0p5()
+                            .text_xs()
+                            .text_color(color)
+                            .cursor_pointer()
+                            .hover(|d| d.text_color(style::text()))
+                            .child(icons::ui("git-pull-request", px(11.), color))
+                            .child(format!("{n}"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_pr(n, window, cx);
+                            })),
+                    )
+                })
+                // State dot; on hover it gives way to rename / close.
+                .child(div().size(px(7.)).flex_none().rounded_full().bg(dot_color).group_hover(group.clone(), |s| s.invisible()))
+                .child(
+                    h_flex()
+                        .absolute()
+                        .right(px(4.))
+                        .top_0()
+                        .bottom_0()
+                        .px_1()
+                        .gap_0p5()
+                        .items_center()
+                        .bg(style::panel_hover())
+                        .invisible()
+                        .group_hover(group, |s| s.visible())
+                        .when(can_rename, |d| {
+                            d.child(
+                                div()
+                                    .id(("session-rename", tab_id))
+                                    .p_0p5()
+                                    .rounded_sm()
+                                    .hover(|d| d.bg(style::bg()))
+                                    .child(icons::ui("pencil", px(11.), style::faint()))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_rename_modal(tab_id, window, cx);
+                                    })),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(("session-close", tab_id))
+                                .p_0p5()
+                                .rounded_sm()
+                                .hover(|d| d.bg(style::bg()))
+                                .child(icons::ui("x", px(12.), style::faint()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_tab(i, window, cx);
+                                })),
+                        ),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        if can_rename && ev.click_count >= 2 {
+                            this.open_rename_modal(tab_id, window, cx);
+                        } else {
+                            this.activate(i, window, cx);
+                        }
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, window, cx| {
+                        if can_rename {
+                            this.open_rename_modal(tab_id, window, cx);
+                        }
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.left_collapsed = !self.left_collapsed;
         let collapsed = self.left_collapsed;
         state::update(cx, |s| s.left_collapsed = collapsed);
@@ -2090,7 +2094,6 @@ impl ProjectView {
             .border_r_1()
             .border_color(style::border())
             .bg(style::panel())
-            .child(sidebar_toggle(true).on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))))
             .child(
                 div()
                     .id("rail-new-session")
@@ -2150,38 +2153,29 @@ impl ProjectView {
             .bg(style::panel())
             .child(
                 v_flex()
-                    .p_3()
+                    .px_3()
+                    .pt_3()
                     .gap_2()
-                    .border_b_1()
-                    .border_color(style::border())
                     .child(
                         h_flex()
-                            .gap_1()
+                            .pl_2()
                             .items_center()
+                            .child(div().flex_1().text_xs().text_color(style::faint()).child("SESSIONS"))
                             .child(
-                                h_flex()
+                                div()
                                     .id("new-session-btn")
-                                    .flex_1()
-                                    .px_2()
-                                    .py_1()
-                                    .gap_1p5()
-                                    .items_center()
+                                    .p_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .border_1()
-                                    .border_color(style::accent_alpha(0.5))
-                                    .text_color(style::accent())
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .hover(|d| d.bg(style::accent_alpha(0.1)))
-                                    .child(icons::ui("plus", px(13.), style::accent()))
-                                    .child("New session")
+                                    .when(self.new_session_menu, |d| d.bg(style::panel_hover()))
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .tooltip(|window, cx| Tooltip::new("New session").build(window, cx))
+                                    .child(icons::ui(if self.new_session_menu { "x" } else { "plus" }, px(14.), style::muted()))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.new_session_menu = !this.new_session_menu;
                                         cx.notify();
                                     })),
-                            )
-                            .child(sidebar_toggle(false).on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))),
+                            ),
                     )
                     .when(self.new_session_menu, |d| {
                         let isolated = self.isolate;
@@ -2319,9 +2313,10 @@ impl ProjectView {
                 v_flex()
                     .flex_1()
                     .min_h_0()
-                    .p_3()
+                    .px_3()
+                    .pt_1()
+                    .pb_3()
                     .gap_1()
-                    .child(side_title("Open sessions"))
                     .when(!self.tabs.iter().any(|t| matches!(t.kind, TabKind::Terminal { .. } | TabKind::Chat { .. })), |d| {
                         d.child(div().px_2().text_xs().text_color(style::faint()).child("No open sessions"))
                     })
@@ -3978,9 +3973,6 @@ fn system_notification(title: &str, message: &str) {
     let _ = (title, message);
 }
 
-fn side_title(text: &'static str) -> impl IntoElement {
-    div().px_2().pb_1().text_xs().text_color(style::muted()).child(text.to_uppercase())
-}
 
 /// Agent logo, or Lucide terminal icon for plain shell.
 fn harness_badge(h: Harness) -> AnyElement {
@@ -4095,7 +4087,7 @@ fn activity_for(root: &Path, events: &[UsageEvent]) -> Vec<ActivityRow> {
 }
 
 /// Fold/unfold button for the left sidebar.
-fn sidebar_toggle(collapsed: bool) -> Stateful<Div> {
+pub(crate) fn sidebar_toggle(collapsed: bool) -> Stateful<Div> {
     let tip = if cfg!(target_os = "macos") {
         if collapsed { "Show sidebar (⌘B)" } else { "Hide sidebar (⌘B)" }
     } else if collapsed {

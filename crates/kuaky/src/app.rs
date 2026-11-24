@@ -408,6 +408,13 @@ impl KuakyApp {
                 .gap_1()
                 .items_center()
                 .text_sm()
+                .when_some(self.current().map(|p| p.read(cx).sidebar_collapsed()), |d, collapsed| {
+                    d.child(crate::project::sidebar_toggle(collapsed).mr_1().on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(p) = this.current() {
+                            p.update(cx, |p, cx| p.toggle_sidebar(cx));
+                        }
+                    })))
+                })
                 .child(
                     div()
                         .id("brand")

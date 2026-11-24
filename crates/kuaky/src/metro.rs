@@ -682,21 +682,22 @@ impl ProjectView {
             let total = line.stations.len();
             let done = line.done_count();
             let id = line.id.clone();
+            let _ = state_color;
             out.push(
                 h_flex()
                     .id(SharedString::from(format!("line-head-{}", line.id)))
-                    .mt_1()
+                    .mt_2()
                     .ml(px(depth as f32 * 10.))
-                    .px_1()
-                    .gap_1p5()
+                    .px_2()
+                    .gap_1()
                     .items_center()
                     .cursor_pointer()
                     .rounded_sm()
-                    .hover(|d| d.bg(style::panel_hover()))
-                    .child(div().size(px(8.)).flex_none().rounded_full().bg(line_color(line.color)))
-                    .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).child(line.name.clone()))
-                    .when(total > 0, |d| d.child(div().flex_none().text_xs().text_color(style::faint()).child(format!("{done}/{total}"))))
-                    .child(div().size(px(6.)).flex_none().rounded_full().bg(state_color))
+                    .text_xs()
+                    .text_color(style::faint())
+                    .hover(|d| d.text_color(style::muted()))
+                    .child(div().min_w_0().truncate().child(line.name.clone()))
+                    .when(total > 0, |d| d.child(div().flex_none().child(format!("· {done}/{total}"))))
                     .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map · drop a session here to move it")).build(window, cx))
                     .drag_over::<super::DraggedSession>(|s, _, _, _| s.bg(style::accent_alpha(0.18)))
                     .on_drop(cx.listener({
@@ -708,7 +709,7 @@ impl ProjectView {
             );
             for i in tabs {
                 if let Some(row) = self.tabs.get(i).and_then(|tab| self.session_row(i, tab, now, cx)) {
-                    out.push(div().ml(px(depth as f32 * 10. + 8.)).border_l_1().border_color(line_color(line.color)).pl_1().child(row).into_any_element());
+                    out.push(div().ml(px(depth as f32 * 10.)).child(row).into_any_element());
                     used.push(i);
                 }
             }
@@ -716,7 +717,7 @@ impl ProjectView {
         let rest: Vec<usize> =
             (0..self.tabs.len()).filter(|i| !used.contains(i) && self.tabs.get(*i).is_some_and(|t| super::is_session(&t.kind))).collect();
         if !rest.is_empty() && !used.is_empty() {
-            out.push(div().mt_2().px_1().text_xs().text_color(style::faint()).child("Other").into_any_element());
+            out.push(div().mt_2().px_2().text_xs().text_color(style::faint()).child("Other").into_any_element());
         }
         for i in rest {
             if let Some(row) = self.tabs.get(i).and_then(|tab| self.session_row(i, tab, now, cx)) {
