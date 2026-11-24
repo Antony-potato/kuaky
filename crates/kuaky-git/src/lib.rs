@@ -66,6 +66,25 @@ impl Repo {
         git_in(&self.root, args)
     }
 
+    /// Foto del árbol de trabajo (archivos con seguimiento) sin tocarlo:
+    /// `git stash create`, o `HEAD` si no hay cambios. Se guarda en
+    /// `refs/kuaky/checkpoints/<name>` para que git no la borre.
+    pub fn checkpoint(&self, name: &str) -> anyhow::Result<String> {
+        let stash = self.git(&["stash", "create"])?.trim().to_string();
+        let sha = if stash.is_empty() { self.git(&["rev-parse", "HEAD"])?.trim().to_string() } else { stash };
+        let reference = format!("refs/kuaky/checkpoints/{name}");
+        self.git(&["update-ref", &reference, &sha])?;
+        Ok(sha)
+    }
+
+    /// Devuelve los archivos con seguimiento al estado de un checkpoint.
+    /// Los archivos nuevos creados después no se borran.
+    pub fn restore_checkpoint(&self, sha: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(sha.bytes().all(|b| b.is_ascii_hexdigit()) && sha.len() >= 7, "checkpoint inválido");
+        self.git(&["restore", "--source", sha, "--worktree", "--", "."])?;
+        Ok(())
+    }
+
     /// Progreso de `branch` respecto a `base`: commits por delante y si ya
     /// está integrada en `base`.
     pub fn branch_progress(&self, base: &str, branch: &str) -> Option<BranchProgress> {

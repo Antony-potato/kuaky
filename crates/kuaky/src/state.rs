@@ -114,6 +114,9 @@ pub struct SavedSession {
     /// The agent's own conversation ID, to resume exactly this conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Opened as kuaky's own chat (ACP) instead of a terminal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chat: bool,
     /// Listed from the agent's own history (not saved by kuaky).
     #[serde(skip)]
     pub from_history: bool,

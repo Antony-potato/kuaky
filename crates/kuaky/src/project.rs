@@ -39,6 +39,17 @@ actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, Searc
 #[path = "metro.rs"]
 mod metro;
 
+/// How to open an agent chat (ACP).
+#[derive(Default)]
+struct ChatOpts {
+    resume: Option<String>,
+    uid: Option<String>,
+    line: Option<String>,
+    draft: Option<String>,
+    role: Option<String>,
+    cwd: Option<PathBuf>,
+}
+
 /// How to start an agent terminal.
 #[derive(Default)]
 struct SpawnOpts {
@@ -298,6 +309,8 @@ pub struct ProjectView {
     /// Launch target chosen in the New Session menu (`false` = This folder, `true` = New branch).
     isolate: bool,
     new_session_menu: bool,
+    /// New sessions open as kuaky's own chat (ACP) instead of a terminal.
+    chat_mode: bool,
     previous_expanded: bool,
     activity_open: bool,
     activity: Vec<ActivityRow>,
@@ -393,6 +406,7 @@ impl ProjectView {
             chat_agents: HashMap::new(),
             isolate: false,
             new_session_menu: false,
+            chat_mode: false,
             previous_expanded: false,
             activity_open: false,
             limits: Vec::new(),
@@ -468,6 +482,23 @@ impl ProjectView {
                         custom_name: custom_name.clone(),
                         custom_color: *custom_color,
                         conversation,
+                        chat: false,
+                        from_history: false,
+                        updated: None,
+                    })
+                }
+                TabKind::Chat { view, harness } => {
+                    let v = view.read(cx);
+                    v.session.as_ref()?;
+                    Some(SavedSession {
+                        uid: Some(v.uid.clone()),
+                        harness: harness.key().to_string(),
+                        cwd: v.launch.cwd.to_string_lossy().into_owned(),
+                        worktree: None,
+                        custom_name: v.title.clone(),
+                        custom_color: None,
+                        conversation: v.session.clone(),
+                        chat: true,
                         from_history: false,
                         updated: None,
                     })
@@ -494,6 +525,11 @@ impl ProjectView {
         let Some(harness) = Harness::from_key(&saved.harness) else { return };
         let cwd = PathBuf::from(&saved.cwd);
         let cwd = if cwd.is_dir() { cwd } else { self.root.clone() };
+        if saved.chat {
+            let opts = ChatOpts { resume: saved.conversation.clone(), uid: saved.uid.clone(), cwd: Some(cwd), ..Default::default() };
+            self.open_chat_with(harness, opts, window, cx);
+            return;
+        }
         let opts = SpawnOpts {
             resume: saved.conversation.clone().or(Some(String::new())),
             custom_name: saved.custom_name,
@@ -831,6 +867,7 @@ impl ProjectView {
                     label: harness.label().to_string(),
                     last_active: jiff::Timestamp::now(),
                     role,
+                    chat: false,
                 },
             );
             if branch.is_some() {
@@ -1065,11 +1102,40 @@ impl ProjectView {
 
     #[allow(dead_code)]
     pub fn open_chat(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_chat_with(harness, ChatOpts::default(), window, cx);
+    }
+
+    /// Opens kuaky's own chat (ACP) with an agent, attached to a metro line.
+    fn open_chat_with(&mut self, harness: Harness, opts: ChatOpts, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_menu = false;
         let Some((program, args)) = self.chat_agents.get(&harness).cloned().or_else(|| harness.chat_command()) else {
             return;
         };
-        let launch = ChatLaunch { label: harness.label(), program, args, cwd: self.root.clone() };
+        let cwd = opts.cwd.clone().filter(|c| c.is_dir()).unwrap_or_else(|| self.root.clone());
+        let launch = ChatLaunch { label: harness.label(), program, args, cwd: cwd.clone(), resume: opts.resume.clone(), draft: opts.draft.clone() };
         let view = cx.new(|cx| ChatView::new(launch, window, cx));
+        if let Some(uid) = opts.uid.clone() {
+            view.update(cx, |v, _| v.uid = uid);
+        }
+        let uid = view.read(cx).uid.clone();
+        let line_id = opts
+            .line
+            .filter(|l| self.lines.get(l).is_some())
+            .or_else(|| self.lines.line_of(&uid).map(|l| l.id.clone()))
+            .unwrap_or_else(|| self.lines.create(&format!("New {} chat", harness.label()), LineKind::Task, None, false));
+        self.lines.attach(
+            &line_id,
+            LineSession {
+                uid: uid.clone(),
+                harness: harness.key().to_string(),
+                conversation: opts.resume.clone(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                label: format!("{} · chat", harness.label()),
+                last_active: jiff::Timestamp::now(),
+                role: opts.role.clone(),
+                chat: true,
+            },
+        );
         let sub = cx.subscribe_in(&view, window, move |this, view, ev: &ChatEvent, window, cx| {
             let is_active_tab = this
                 .active
@@ -1083,8 +1149,42 @@ impl ProjectView {
                 ChatEvent::NeedsYou(msg) => {
                     this.notify(format!("{} needs your permission", harness.label()), msg.clone(), is_active_tab, window, cx)
                 }
-                ChatEvent::TurnDone => this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx),
+                ChatEvent::TurnDone => {
+                    let uid = view.read(cx).uid.clone();
+                    this.lines.on_turn_done(&uid);
+                    this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx)
+                }
                 ChatEvent::Status => {}
+                ChatEvent::OpenFile { path, line } => this.open_file_at(path.clone(), line.saturating_sub(1), 0, window, cx),
+                ChatEvent::Prompt(text) => {
+                    let uid = view.read(cx).uid.clone();
+                    this.lines.on_prompt(&uid, text);
+                }
+                ChatEvent::Plan(entries) => {
+                    let uid = view.read(cx).uid.clone();
+                    let tasks: Vec<crate::agent_tasks::AgentTask> = entries
+                        .iter()
+                        .map(|e| crate::agent_tasks::AgentTask {
+                            subject: e.content.clone(),
+                            status: match e.status.as_str() {
+                                "completed" => crate::agent_tasks::TaskStatus::Completed,
+                                "in_progress" => crate::agent_tasks::TaskStatus::InProgress,
+                                _ => crate::agent_tasks::TaskStatus::Pending,
+                            },
+                        })
+                        .collect();
+                    this.lines.set_tasks(&uid, &tasks);
+                }
+                ChatEvent::Session(id) => {
+                    let uid = view.read(cx).uid.clone();
+                    this.lines.set_conversation(&uid, id);
+                    this.persist(cx);
+                }
+                ChatEvent::Title(t) => {
+                    let uid = view.read(cx).uid.clone();
+                    this.lines.on_title(&uid, t);
+                    this.persist(cx);
+                }
             }
             cx.notify();
         });
@@ -1615,8 +1715,10 @@ impl ProjectView {
                                         (*harness, title, format!("{status} · {when}"), dot, worktree.clone(), *custom_color, true)
                                     }
                                     TabKind::Chat { view, harness } => {
-                                        let (status, dot) = chat_status(view.read(cx));
-                                        (*harness, format!("{} · chat", harness.label()).into(), status.to_string(), dot, None, None, false)
+                                        let v = view.read(cx);
+                                        let (status, dot) = chat_status(v);
+                                        let title = v.title.clone().unwrap_or_else(|| format!("{} · chat", harness.label()));
+                                        (*harness, title.into(), format!("chat · {status}"), dot, None, None, false)
                                     }
                                     _ => return None,
                                 };
@@ -1816,10 +1918,47 @@ impl ProjectView {
                                     )
                                     .child(div().h(px(1.)).bg(style::border()))
                                 })
+                                .child({
+                                    let chat = self.chat_mode;
+                                    let chip = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
+                                        div()
+                                            .id(id)
+                                            .flex_1()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_center()
+                                            .cursor_pointer()
+                                            .when(on, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                                            .when(!on, |d| d.text_color(style::muted()))
+                                            .hover(|d| d.bg(style::panel_hover()))
+                                            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                                            .child(label)
+                                    };
+                                    v_flex()
+                                        .gap_1()
+                                        .child(div().px_1().text_xs().text_color(style::faint()).child("OPEN AS"))
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(chip("open-as-terminal", "Terminal", !chat, "The agent's own CLI in a terminal").on_click(cx.listener(|this, _, _, cx| {
+                                                    this.chat_mode = false;
+                                                    cx.notify();
+                                                })))
+                                                .child(chip("open-as-chat", "Chat", chat, "kuaky's chat (ACP): plan, permissions and changes with buttons").on_click(cx.listener(|this, _, _, cx| {
+                                                    this.chat_mode = true;
+                                                    cx.notify();
+                                                }))),
+                                        )
+                                        .child(div().h(px(1.)).bg(style::border()))
+                                })
                                 .child(
                                     v_flex()
                                         .gap_0p5()
                                         .children(harnesses.into_iter().map(|h| {
+                                            let as_chat = self.chat_mode && h != Harness::Shell && (self.chat_agents.contains_key(&h) || h.chat_command().is_some());
+                                            let no_chat = self.chat_mode && h != Harness::Shell && !as_chat;
                                             h_flex()
                                                 .id(SharedString::from(format!("launch-{}", h.label())))
                                                 .gap_2()
@@ -1831,7 +1970,14 @@ impl ProjectView {
                                                 .hover(|d| d.bg(style::panel_hover()))
                                                 .child(harness_badge(h))
                                                 .child(div().flex_1().min_w_0().truncate().child(h.label()))
-                                                .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
+                                                .when(no_chat, |d| d.child(div().text_xs().text_color(style::faint()).child("terminal")))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    if as_chat {
+                                                        this.open_chat(h, window, cx)
+                                                    } else {
+                                                        this.open_terminal(h, window, cx)
+                                                    }
+                                                }))
                                         })),
                                 ),
                         )
@@ -2003,8 +2149,10 @@ impl ProjectView {
                         (icons::ui("search", px(14.), style::accent()).into_any_element(), None, "Search".into(), false, None, false)
                     }
                     TabKind::Chat { view, harness } => {
-                        let (_, dot) = chat_status(view.read(cx));
-                        (harness_badge(*harness), Some(dot), format!("{} · chat", harness.label()).into(), false, None, false)
+                        let v = view.read(cx);
+                        let (_, dot) = chat_status(v);
+                        let title = v.title.clone().map(|t| crate::lines::short(&t, 28)).unwrap_or_else(|| format!("{} · chat", harness.label()));
+                        (harness_badge(*harness), Some(dot), title.into(), false, None, false)
                     }
                 };
                 h_flex()
@@ -3443,6 +3591,7 @@ fn with_agent_history(mut sessions: Vec<SavedSession>, root: &Path) -> Vec<Saved
             custom_name: Some(c.title),
             custom_color: None,
             conversation: Some(c.id),
+            chat: false,
             from_history: true,
             updated: c.updated,
         });

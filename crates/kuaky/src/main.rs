@@ -49,6 +49,7 @@ fn main() {
             state::init(cx);
             app::init(cx);
             project::init(cx);
+            chat_view::init(cx);
             file_view::init(cx);
 
             let mut options = TitleBar::window_options();

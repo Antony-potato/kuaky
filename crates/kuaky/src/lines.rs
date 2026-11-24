@@ -83,6 +83,9 @@ pub struct LineSession {
     #[serde(default)]
     pub label: String,
     pub last_active: Timestamp,
+    /// Sesión de chat propio (ACP) en vez de terminal.
+    #[serde(default)]
+    pub chat: bool,
     /// Tipo de conexión si llegó a revisar/probar lo de otra sesión.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -653,6 +656,7 @@ mod tests {
             label: String::new(),
             last_active: Timestamp::now(),
             role: None,
+            chat: false,
         }
     }
 

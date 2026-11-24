@@ -131,6 +131,21 @@ impl ProjectView {
     fn trains(&self, cx: &App) -> HashMap<String, Train> {
         let mut out = HashMap::new();
         for (i, tab) in self.tabs.iter().enumerate() {
+            if let TabKind::Chat { view, harness } = &tab.kind {
+                let v = view.read(cx);
+                if !matches!(v.status, crate::chat_view::ChatStatus::Exited) {
+                    out.insert(
+                        v.uid.clone(),
+                        Train {
+                            harness: *harness,
+                            tab: i,
+                            working: matches!(v.status, crate::chat_view::ChatStatus::Running),
+                            needs_you: v.is_waiting_permission(),
+                        },
+                    );
+                }
+                continue;
+            }
             if let TabKind::Terminal { view, harness, .. } = &tab.kind {
                 if *harness == Harness::Shell {
                     continue;
@@ -304,10 +319,11 @@ impl ProjectView {
 
     /// Lleva a la terminal de la sesión; si está cerrada, la retoma.
     fn focus_session(&mut self, uid: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let live = self
-            .tabs
-            .iter()
-            .position(|t| matches!(&t.kind, TabKind::Terminal { view, .. } if view.read(cx).uid == uid && !view.read(cx).exited));
+        let live = self.tabs.iter().position(|t| match &t.kind {
+            TabKind::Terminal { view, .. } => view.read(cx).uid == uid && !view.read(cx).exited,
+            TabKind::Chat { view, .. } => view.read(cx).uid == uid,
+            _ => false,
+        });
         if let Some(i) = live {
             self.board = None;
             self.activate(i, window, cx);
@@ -320,6 +336,11 @@ impl ProjectView {
         let cwd = if cwd.is_dir() { cwd } else { self.root.clone() };
         self.previous.retain(|p| p.uid.as_deref() != Some(uid));
         self.board = None;
+        if s.chat {
+            let opts = ChatOpts { resume: s.conversation.clone(), uid: Some(uid.to_string()), line: Some(line.id.clone()), cwd: Some(cwd), ..Default::default() };
+            self.open_chat_with(harness, opts, window, cx);
+            return;
+        }
         let opts = SpawnOpts {
             resume: s.conversation.clone().or(Some(String::new())),
             uid: Some(uid.to_string()),
@@ -345,6 +366,11 @@ impl ProjectView {
         let cwd = self.line_cwd(line);
         let paste = (!line.stations.is_empty()).then(|| line.relay_note());
         self.board = None;
+        if self.chat_mode && harness.chat_command().is_some() {
+            let opts = ChatOpts { line: Some(line_id), draft: paste, cwd: Some(cwd), ..Default::default() };
+            self.open_chat_with(harness, opts, window, cx);
+            return;
+        }
         let opts = SpawnOpts { line: Some(line_id), paste, ..Default::default() };
         self.spawn_terminal(harness, cwd, None, opts, window, cx);
     }
@@ -463,12 +489,11 @@ impl ProjectView {
                     .cursor_pointer()
                     .rounded_sm()
                     .hover(|d| d.bg(style::panel_hover()))
-                    .tooltip(|window, cx| Tooltip::new("Open on the map").build(window, cx))
                     .child(div().size(px(8.)).flex_none().rounded_full().bg(line_color(line.color)))
                     .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).child(line.name.clone()))
                     .when(total > 0, |d| d.child(div().flex_none().text_xs().text_color(style::faint()).child(format!("{done}/{total}"))))
                     .child(div().size(px(6.)).flex_none().rounded_full().bg(state_color))
-                    .tooltip(move |window, cx| Tooltip::new(state).build(window, cx))
+                    .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map")).build(window, cx))
                     .on_click(cx.listener(move |this, _, window, cx| this.open_board(Some(id.clone()), window, cx)))
                     .into_any_element(),
             );
@@ -907,6 +932,7 @@ impl ProjectView {
             label: label.into(),
             last_active: jiff::Timestamp::now(),
             role: None,
+            chat: false,
         };
         self.lines.lines.clear();
         let plan = self.lines.create("Plan · search + LSP", LineKind::Plan, None, true);
