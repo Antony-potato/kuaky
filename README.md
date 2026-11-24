@@ -7,6 +7,13 @@ Editor de escritorio ligero, escrito en Rust con [GPUI](https://github.com/zed-i
 
 Plataformas: macOS y Windows.
 
+## Instalar en macOS
+
+```bash
+script/bundle-macos.sh             # crea target/release/bundle/kuaky.app
+script/bundle-macos.sh --install   # y la copia a ~/Applications
+```
+
 ## Desarrollo
 
 ```bash

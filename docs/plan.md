@@ -22,7 +22,8 @@ kuaky es un editor de escritorio ligero (macOS + Windows) centrado en agentes. A
 | 5. PRs | ✅ | Lista con `gh` y diff de cada PR |
 | 8. Editor | 🟡 | Editor de GPUI Kit con resaltado (syntect) y guardado ⌘S. Falta: LSP, búsqueda |
 | 7. Chat ACP | ⏳ | |
-| 9. Worktrees y distribución | ⏳ | |
+| 9. Worktrees y distribución | 🟡 | Worktree por sesión; `kuaky.app` con ícono (`script/bundle-macos.sh`). Falta: instalador de Windows, auto-actualización |
+| Uso diario | ✅ | Menús nativos, paneles redimensionables, ⌘P, estado persistente y sesiones para reanudar |
 
 Capturas de desarrollo: `cargo run -p kuaky --features screenshot` con `KUAKY_SCREENSHOT=archivo.png` (más `KUAKY_DEMO_TERMINAL`, `KUAKY_DEMO_PANEL`, `KUAKY_DEMO_FILE`, `KUAKY_DEMO_DIFF`).
 
