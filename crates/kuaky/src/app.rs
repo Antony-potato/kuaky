@@ -18,15 +18,19 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
     cx.on_action(|_: &OpenRepo, cx| cx.open_url(REPO_URL));
+    #[cfg(target_os = "macos")]
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("cmd-alt-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
-        KeyBinding::new("ctrl-o", OpenFolder, None),
         KeyBinding::new("cmd-shift-h", GoHome, None),
-        KeyBinding::new("ctrl-shift-h", GoHome, None),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-o", OpenFolder, Some("!Terminal")),
+        KeyBinding::new("ctrl-shift-h", GoHome, Some("!Terminal")),
     ]);
     set_menus(cx);
 }

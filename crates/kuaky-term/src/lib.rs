@@ -251,6 +251,10 @@ impl Terminal {
         self.term.lock().scroll_display(Scroll::Bottom);
     }
 
+    pub fn scrolled_back(&self) -> bool {
+        self.term.lock().grid().display_offset() > 0
+    }
+
     // ── selección ───────────────────────────────────────────────────────
 
     fn point(&self, term: &Term<Listener>, row: usize, col: usize) -> Point {

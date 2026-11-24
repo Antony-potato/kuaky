@@ -13,9 +13,11 @@ const MAX_BYTES: u64 = 4 * 1024 * 1024;
 actions!(file_view, [Save]);
 
 pub fn init(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([KeyBinding::new("cmd-s", Save, Some("FileView"))]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new("ctrl-s", Save, Some("FileView"))]);
     cx.bind_keys([
-        KeyBinding::new("cmd-s", Save, Some("FileView")),
-        KeyBinding::new("ctrl-s", Save, Some("FileView")),
         KeyBinding::new("ctrl-space", ShowCompletions, Some("Input && mode == editor")),
         KeyBinding::new("f12", GoToDefinition, Some("Input && mode == editor")),
     ]);

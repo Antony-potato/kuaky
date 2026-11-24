@@ -29,19 +29,23 @@ use std::{
 actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject]);
 
 pub fn init(cx: &mut App) {
+    #[cfg(target_os = "macos")]
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewTerminal, Some("Project")),
         KeyBinding::new("cmd-p", QuickOpenFile, Some("Project")),
         KeyBinding::new("cmd-shift-f", SearchProject, Some("Project")),
-        KeyBinding::new("ctrl-shift-f", SearchProject, Some("Project")),
-        KeyBinding::new("ctrl-p", QuickOpenFile, Some("Project")),
-        KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Project")),
         KeyBinding::new("cmd-w", CloseTab, Some("Project")),
-        KeyBinding::new("ctrl-shift-w", CloseTab, Some("Project")),
-        KeyBinding::new("ctrl-tab", NextTab, Some("Project")),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Project")),
         KeyBinding::new("cmd-shift-]", NextTab, Some("Project")),
         KeyBinding::new("cmd-shift-[", PrevTab, Some("Project")),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-p", QuickOpenFile, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-shift-f", SearchProject, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-shift-w", CloseTab, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-tab", NextTab, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Project && !Terminal")),
     ]);
 }
 
@@ -898,11 +902,12 @@ impl ProjectView {
                             .hover(|d| d.bg(style::panel_hover()))
                             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
                             .child(harness_badge(h))
-                            .child(div().flex_1().child(h.label()))
+                            .child(div().flex_1().min_w_0().truncate().child(h.label()))
                             .when(self.chat_agents.contains_key(&h), |d| {
                                 d.child(
                                     div()
                                         .id(SharedString::from(format!("chat-{}", h.label())))
+                                        .flex_none()
                                         .px_1p5()
                                         .rounded_sm()
                                         .text_xs()
@@ -920,7 +925,7 @@ impl ProjectView {
                                         })),
                                 )
                             })
-                            .child(div().text_xs().text_color(style::faint()).child(if installed { "+" } else { "instalar" }))
+                            .child(div().flex_none().text_xs().text_color(style::faint()).child(if installed { "+" } else { "instalar" }))
                             .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
                     }))
                     .when(self.repo.is_some(), |d| {
@@ -1005,10 +1010,11 @@ impl ProjectView {
                                         .child(
                                             h_flex()
                                                 .gap_1()
+                                                .min_w_0()
                                                 .text_xs()
                                                 .text_color(style::muted())
-                                                .child(div().size(px(6.)).rounded_full().bg(color))
-                                                .child(status),
+                                                .child(div().size(px(6.)).flex_none().rounded_full().bg(color))
+                                                .child(div().flex_1().min_w_0().truncate().child(status)),
                                         )
                                         .when_some(worktree, |d, w| {
                                             d.child(div().text_xs().text_color(style::faint()).truncate().child(format!("⑂ {w}")))
@@ -1027,11 +1033,14 @@ impl ProjectView {
                         .border_color(style::border())
                         .child(
                             h_flex()
+                                .gap_2()
+                                .items_center()
                                 .justify_between()
-                                .child(side_title("Sesiones anteriores"))
+                                .child(div().flex_1().min_w_0().truncate().child(side_title("Sesiones anteriores")))
                                 .child(
                                     div()
                                         .id("forget-previous")
+                                        .flex_none()
                                         .px_1()
                                         .text_xs()
                                         .cursor_pointer()
@@ -1064,10 +1073,10 @@ impl ProjectView {
                                         v_flex()
                                             .flex_1()
                                             .min_w_0()
-                                            .child(div().text_sm().child(h.label()))
+                                            .child(div().text_sm().truncate().child(h.label()))
                                             .child(div().text_xs().truncate().text_color(style::faint()).child(detail)),
                                     )
-                                    .child(div().text_xs().text_color(style::accent()).child("reanudar"))
+                                    .child(div().flex_none().text_xs().text_color(style::accent()).child("reanudar"))
                                     .on_click(cx.listener(move |this, _, window, cx| this.resume(i, window, cx))),
                             )
                         })),
@@ -1551,10 +1560,10 @@ impl Render for ProjectView {
             .bg(style::bg())
             .child({
                 let saved = state::get(cx);
-                let (left, right) = (saved.left_width.unwrap_or(232.), saved.right_width.unwrap_or(300.));
+                let (left, right) = (saved.left_width.unwrap_or(248.).max(220.), saved.right_width.unwrap_or(300.));
                 h_resizable("project-layout")
                     .with_state(&self.layout)
-                    .child(resizable_panel().size(px(left)).size_range(px(180.)..px(420.)).child(self.left_sidebar(cx)))
+                    .child(resizable_panel().size(px(left)).size_range(px(220.)..px(420.)).child(self.left_sidebar(cx)))
                     .child(resizable_panel().child(self.center(cx)))
                     .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx)))
             })

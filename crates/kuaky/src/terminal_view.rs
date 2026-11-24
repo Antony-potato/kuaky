@@ -5,9 +5,14 @@ use crate::style;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use kuaky_term::{Key, Launch, Rgb, Size, TermEvent, Terminal, key_to_bytes};
-use std::{cell::Cell, rc::Rc, time::Instant};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 const PADDING: f32 = 10.;
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
 pub enum TerminalViewEvent {
     TitleChanged,
@@ -29,6 +34,9 @@ pub struct TerminalView {
     focus: FocusHandle,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     cell: Option<(Pixels, Pixels)>,
+    sized: bool,
+    pending_size: Option<Size>,
+    resize_task: Option<Task<()>>,
     selecting: bool,
     /// El botón está presionado y se está enviando al programa.
     mouse_reporting: bool,
@@ -96,6 +104,9 @@ impl TerminalView {
             focus,
             bounds: Rc::new(Cell::new(None)),
             cell: None,
+            sized: false,
+            pending_size: None,
+            resize_task: None,
             selecting: false,
             mouse_reporting: false,
             scroll_acc: 0.,
@@ -206,7 +217,7 @@ impl TerminalView {
         let _ = window;
     }
 
-    fn sync_size(&mut self, window: &mut Window, cx: &mut Context<Self>) -> (Pixels, Pixels) {
+    fn measure_cell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> (Pixels, Pixels) {
         let font = font(cx.theme().mono_font_family.clone());
         let font_id = window.text_system().resolve_font(&font);
         let cw = window
@@ -216,19 +227,75 @@ impl TerminalView {
             .unwrap_or(px(8.));
         let lh = (self.font_size * 1.4).round();
         self.cell = Some((cw, lh));
-        if let (Some(bounds), Some(term)) = (self.bounds.get(), self.term.as_mut()) {
-            let w = (bounds.size.width - px(PADDING * 2.)).max(px(0.));
-            let h = (bounds.size.height - px(PADDING * 2.)).max(px(0.));
-            let size = Size {
-                cols: ((w / cw).floor() as u16).max(2),
-                rows: ((h / lh).floor() as u16).max(1),
-                cell_width: f32::from(cw) as u16,
-                cell_height: f32::from(lh) as u16,
-            };
-            term.resize(size);
-        }
         (cw, lh)
     }
+
+    fn target_size(&self) -> Option<Size> {
+        let bounds = self.bounds.get()?;
+        let (cw, lh) = self.cell?;
+        size_for_bounds(bounds.size.width, bounds.size.height, cw, lh)
+    }
+
+    fn apply_resize(&mut self, size: Size, cx: &mut Context<Self>) {
+        let Some(term) = self.term.as_mut() else { return };
+        let at_bottom = !term.scrolled_back();
+        term.resize(size);
+        if at_bottom && !term.alt_screen() {
+            term.scroll_to_bottom();
+        }
+        self.sized = true;
+        cx.notify();
+    }
+
+    /// Aplica el tamaño inicial de inmediato y amortigua los redimensionados
+    /// posteriores (~120 ms) para evitar que las TUIs brinquen al arrastrar.
+    fn schedule_resize(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target_size() else { return };
+        let Some(current) = self.term.as_ref().map(|t| t.size()) else { return };
+        if target == current {
+            self.sized = true;
+            self.pending_size = None;
+            self.resize_task = None;
+            return;
+        }
+        if !self.sized {
+            self.apply_resize(target, cx);
+            return;
+        }
+        if self.pending_size == Some(target) {
+            return;
+        }
+        self.pending_size = Some(target);
+        self.resize_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESIZE_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.pending_size = None;
+                if let Some(latest) = this.target_size() {
+                    this.apply_resize(latest, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+}
+
+fn size_for_bounds(width: Pixels, height: Pixels, cw: Pixels, lh: Pixels) -> Option<Size> {
+    let w = width - px(PADDING * 2.);
+    let h = height - px(PADDING * 2.);
+    if w <= px(1.) || h <= px(1.) || cw <= px(0.) || lh <= px(0.) {
+        return None;
+    }
+    let cols = (w / cw).floor() as u16;
+    let rows = (h / lh).floor() as u16;
+    if cols < 2 || rows < 1 {
+        return None;
+    }
+    Some(Size {
+        cols,
+        rows,
+        cell_width: f32::from(cw) as u16,
+        cell_height: f32::from(lh) as u16,
+    })
 }
 
 fn hsla(c: Rgb) -> Hsla {
@@ -237,7 +304,7 @@ fn hsla(c: Rgb) -> Hsla {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (_, lh) = self.sync_size(window, cx);
+        let (_, lh) = self.measure_cell(window, cx);
         let focused = self.focus.is_focused(window);
         let font_family = cx.theme().mono_font_family.clone();
         let base_font = font(font_family.clone());
@@ -312,6 +379,7 @@ impl Render for TerminalView {
         }
 
         let bounds = self.bounds.clone();
+        let entity = cx.entity().downgrade();
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -416,7 +484,15 @@ impl Render for TerminalView {
             }))
             .child(
                 canvas(
-                    move |b, _, _| bounds.set(Some(b)),
+                    move |b, _, cx| {
+                        if bounds.get() != Some(b) {
+                            bounds.set(Some(b));
+                            let entity = entity.clone();
+                            cx.defer(move |cx| {
+                                let _ = entity.update(cx, |this, cx| this.schedule_resize(cx));
+                            });
+                        }
+                    },
                     |_, _, _, _| {},
                 )
                 .absolute()
@@ -424,5 +500,20 @@ impl Render for TerminalView {
             )
             .children(self.error.clone().map(|e| div().text_color(style::bad()).child(e)))
             .children(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::size_for_bounds;
+    use gpui_kit::px;
+
+    #[test]
+    fn ignores_zero_and_hidden_bounds() {
+        assert!(size_for_bounds(px(0.), px(0.), px(8.), px(18.)).is_none());
+        assert!(size_for_bounds(px(20.), px(500.), px(8.), px(18.)).is_none());
+        assert!(size_for_bounds(px(500.), px(10.), px(8.), px(18.)).is_none());
+        let s = size_for_bounds(px(820.), px(380.), px(8.), px(18.)).unwrap();
+        assert_eq!((s.cols, s.rows), (100, 20));
     }
 }
