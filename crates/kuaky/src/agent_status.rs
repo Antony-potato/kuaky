@@ -134,6 +134,18 @@ pub fn parse_session_id(line: &str) -> Option<String> {
     crate::agent_history::valid_id(id).then(|| id.to_string())
 }
 
+/// Full prompt text (whitespace collapsed) from a `UserPromptSubmit` hook line.
+pub fn parse_prompt_text(line: &str) -> Option<String> {
+    let (event, payload) = line.split_once('\t')?;
+    if event.trim() != "UserPromptSubmit" {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    let raw = payload.get("prompt").or_else(|| payload.get("user_prompt")).and_then(Value::as_str)?;
+    let text = raw.trim();
+    (!text.is_empty()).then(|| text.chars().take(2000).collect())
+}
+
 /// Extracts a concise title from a `UserPromptSubmit` hook line, if present.
 pub fn parse_prompt(line: &str) -> Option<String> {
     let (event, payload) = line.split_once('\t')?;

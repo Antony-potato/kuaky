@@ -16,6 +16,8 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
 pub enum TerminalViewEvent {
     TitleChanged,
+    /// The user sent a prompt (full text, from agent hooks).
+    Prompt(String),
     Exited,
     /// El agente cambió de estado (según sus hooks).
     AgentState,
@@ -33,6 +35,8 @@ pub struct TerminalView {
     pub started_at: jiff::Timestamp,
     /// The agent's conversation ID (from hooks, or the one being resumed).
     pub agent_session: Option<String>,
+    /// Stable kuaky session ID (links the session to its metro line).
+    pub uid: String,
     pub state_changed_at: Option<jiff::Timestamp>,
     /// Estado reportado por los hooks del agente, si los tiene.
     pub agent_state: Option<AgentState>,
@@ -108,6 +112,7 @@ impl TerminalView {
             last_output: None,
             started_at: jiff::Timestamp::now(),
             agent_session: None,
+            uid: new_uid(),
             state_changed_at: None,
             agent_state: None,
             previous_state: None,
@@ -139,6 +144,38 @@ impl TerminalView {
         self.label.clone()
     }
 
+    /// Writes text into the program's input without pressing Enter.
+    pub fn paste_text(&self, text: &str) {
+        if let Some(term) = &self.term {
+            term.paste(text);
+        }
+    }
+
+    /// Pastes `text` once the program has started and its output settled
+    /// (agents ignore input while they boot). Gives up after 30 s.
+    pub fn paste_when_ready(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let start = Instant::now();
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+                let ready = this
+                    .update(cx, |t, _| {
+                        t.last_output.is_some_and(|at| at.elapsed() > std::time::Duration::from_millis(1200))
+                            && start.elapsed() > std::time::Duration::from_millis(1500)
+                    })
+                    .unwrap_or(true);
+                if ready || start.elapsed() > std::time::Duration::from_secs(30) {
+                    let _ = this.update(cx, |t, cx| {
+                        t.paste_text(&text);
+                        cx.notify();
+                    });
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub fn last_activity_at(&self) -> jiff::Timestamp {
         self.state_changed_at.unwrap_or(self.started_at)
     }
@@ -157,9 +194,10 @@ impl TerminalView {
                     offset += consumed;
                     let chunk = &new[..consumed];
                     let prompt = chunk.lines().find_map(agent_status::parse_prompt);
+                    let prompts: Vec<String> = chunk.lines().filter_map(agent_status::parse_prompt_text).collect();
                     let session = chunk.lines().filter_map(agent_status::parse_session_id).last();
                     let latest = chunk.lines().filter_map(agent_status::parse_line).last();
-                    if prompt.is_some() || latest.is_some() || session.is_some() {
+                    if prompt.is_some() || latest.is_some() || session.is_some() || !prompts.is_empty() {
                         let alive = this
                             .update(cx, |this, cx| {
                                 let mut changed = false;
@@ -167,6 +205,9 @@ impl TerminalView {
                                     this.agent_session = session;
                                     cx.emit(TerminalViewEvent::TitleChanged);
                                     changed = true;
+                                }
+                                for text in prompts {
+                                    cx.emit(TerminalViewEvent::Prompt(text));
                                 }
                                 if let Some(p) = prompt {
                                     if this.first_prompt.is_none() {
@@ -582,4 +623,12 @@ mod tests {
         let s = size_for_bounds(px(820.), px(380.), px(8.), px(18.)).unwrap();
         assert_eq!((s.cols, s.rows), (100, 20));
     }
+}
+
+/// Short unique ID for a session (`s` + milliseconds + counter).
+pub fn new_uid() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("s{}{n:03}", jiff::Timestamp::now().as_millisecond())
 }

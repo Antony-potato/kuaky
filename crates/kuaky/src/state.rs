@@ -108,6 +108,9 @@ pub struct SavedSession {
     pub custom_name: Option<String>,
     #[serde(default)]
     pub custom_color: Option<u32>,
+    /// kuaky's session ID (links the session to its metro line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     /// The agent's own conversation ID, to resume exactly this conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,

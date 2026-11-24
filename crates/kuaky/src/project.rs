@@ -3,6 +3,8 @@
 //! compact activity/status bar at the bottom.
 
 use crate::agent_status::AgentState;
+use crate::agent_tasks::TaskWatcher;
+use crate::lines::{LineKind, LineSession, LineStore};
 use crate::chat_view::{ChatEvent, ChatLaunch, ChatStatus, ChatView};
 use crate::conflict_view::{ConflictEvent, ConflictView};
 use crate::diff_view::DiffView;
@@ -33,6 +35,28 @@ use std::{
 };
 
 actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject]);
+
+#[path = "metro.rs"]
+mod metro;
+
+/// How to start an agent terminal.
+#[derive(Default)]
+struct SpawnOpts {
+    /// `None` = new conversation; `Some("")` = latest in the folder; `Some(id)` = that one.
+    resume: Option<String>,
+    custom_name: Option<String>,
+    custom_color: Option<u32>,
+    /// Keep this kuaky session ID (resumed sessions keep their metro line).
+    uid: Option<String>,
+    /// Metro line to attach the session to.
+    line: Option<String>,
+    /// Text left typed in the agent's input (not sent).
+    paste: Option<String>,
+    /// Connection role (review, tester, second opinion, relay).
+    role: Option<String>,
+    /// Extra CLI arguments for this launch only.
+    extra_args: Option<String>,
+}
 
 pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
@@ -290,6 +314,13 @@ pub struct ProjectView {
     merge_approval_ready: bool,
     layout: Entity<ResizableState>,
     lsp: Entity<crate::lsp::LspStore>,
+    /// Metro map: goals (lines) and their steps.
+    lines: LineStore,
+    /// Claude Code task lists per session uid.
+    task_watchers: HashMap<String, TaskWatcher>,
+    /// Full-screen board (`None` = closed).
+    board: Option<metro::Board>,
+    mini_map_collapsed: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -337,6 +368,7 @@ impl ProjectView {
         state::update(cx, |s| state::touch_recent(s, &key));
         let saved = state::get(cx).projects.get(&key).cloned().unwrap_or_default();
         let previous = with_agent_history(saved.sessions.clone(), &root);
+        let key_path = root.clone();
         let lsp = cx.new(|_| crate::lsp::LspStore::new(root.clone()));
         let lsp_sub = cx.subscribe_in(&lsp, window, |this, _, ev: &crate::lsp::LspStoreEvent, window, cx| match ev {
             crate::lsp::LspStoreEvent::OpenLocation { path, line, column } => {
@@ -373,8 +405,17 @@ impl ProjectView {
             merge_approval_ready: false,
             layout,
             lsp,
+            lines: {
+                let mut lines = LineStore::load(&key_path);
+                lines.prune_empty(&[]);
+                lines
+            },
+            task_watchers: HashMap::new(),
+            board: None,
+            mini_map_collapsed: false,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
         };
+        this.start_map_refresh(cx);
         this.detect_agents(cx);
         this.start_git_refresh(cx);
         this.start_limits_refresh(cx);
@@ -420,6 +461,7 @@ impl ProjectView {
                         _ => None,
                     });
                     Some(SavedSession {
+                        uid: Some(v.uid.clone()),
                         harness: harness.key().to_string(),
                         cwd: cwd.to_string_lossy().into_owned(),
                         worktree: worktree.clone(),
@@ -452,8 +494,14 @@ impl ProjectView {
         let Some(harness) = Harness::from_key(&saved.harness) else { return };
         let cwd = PathBuf::from(&saved.cwd);
         let cwd = if cwd.is_dir() { cwd } else { self.root.clone() };
-        let conversation = saved.conversation.clone().or(Some(String::new()));
-        self.spawn_terminal(harness, cwd, saved.worktree, conversation, saved.custom_name, saved.custom_color, window, cx);
+        let opts = SpawnOpts {
+            resume: saved.conversation.clone().or(Some(String::new())),
+            custom_name: saved.custom_name,
+            custom_color: saved.custom_color,
+            uid: saved.uid,
+            ..Default::default()
+        };
+        self.spawn_terminal(harness, cwd, saved.worktree, opts, window, cx);
     }
 
     fn open_rename_modal(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -584,6 +632,9 @@ impl ProjectView {
         if std::env::var("KUAKY_DEMO_NEW_SESSION").is_ok() {
             self.new_session_menu = true;
         }
+        if let Ok(mode) = std::env::var("KUAKY_DEMO_MAP") {
+            self.demo_map(mode == "board", window, cx);
+        }
         if std::env::var("KUAKY_DEMO_ACTIVITY").is_ok() {
             self.activity_open = true;
         }
@@ -692,7 +743,7 @@ impl ProjectView {
                 }
             }
         }
-        self.spawn_terminal(harness, cwd, worktree, None, None, None, window, cx);
+        self.spawn_terminal(harness, cwd, worktree, SpawnOpts::default(), window, cx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -701,13 +752,11 @@ impl ProjectView {
         harness: Harness,
         cwd: PathBuf,
         worktree: Option<String>,
-        // `None` = new conversation; `Some("")` = latest in the folder; `Some(id)` = that one.
-        resume: Option<String>,
-        custom_name: Option<String>,
-        custom_color: Option<u32>,
+        opts: SpawnOpts,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let SpawnOpts { resume, custom_name, custom_color, uid, line, paste, role, extra_args } = opts;
         let cfg = state::get(cx).settings.agent(harness.key());
         if harness != Harness::Shell && !self.installed.contains_key(&harness) {
             if !cfg.binary_path.trim().is_empty() {
@@ -733,6 +782,10 @@ impl ProjectView {
                 full.push(' ');
                 full.push_str(cfg.extra_args.trim());
             }
+            if let Some(extra) = extra_args.as_deref().filter(|e| !e.trim().is_empty()) {
+                full.push(' ');
+                full.push_str(extra.trim());
+            }
             full
         });
         let mut env = Vec::new();
@@ -745,14 +798,51 @@ impl ProjectView {
                 status_file = Some(file);
             }
         }
-        let launch = Launch { cwd, command, prefill: None, env };
+        let launch = Launch { cwd: cwd.clone(), command, prefill: None, env };
+        let branch = worktree.clone();
         self.add_terminal(harness, launch, worktree, status_file, custom_name, custom_color, window, cx);
-        if let Some(id) = resume.filter(|id| crate::agent_history::valid_id(id)) {
-            if let Some(Tab { kind: TabKind::Terminal { view, .. }, .. }) = self.tabs.last() {
-                view.update(cx, |v, _| v.agent_session = Some(id));
+        let Some(Tab { kind: TabKind::Terminal { view, .. }, .. }) = self.tabs.last() else { return };
+        let view = view.clone();
+        let conversation = resume.filter(|id| crate::agent_history::valid_id(id));
+        view.update(cx, |v, cx| {
+            if let Some(uid) = uid {
+                v.uid = uid;
             }
-            self.persist(cx);
+            if let Some(id) = &conversation {
+                v.agent_session = Some(id.clone());
+            }
+            if let Some(text) = paste {
+                v.paste_when_ready(text, cx);
+            }
+        });
+        if harness != Harness::Shell {
+            let uid = view.read(cx).uid.clone();
+            let line_id = line
+                .filter(|l| self.lines.get(l).is_some())
+                .or_else(|| self.lines.line_of(&uid).map(|l| l.id.clone()))
+                .unwrap_or_else(|| self.lines.create(&format!("New {} session", harness.label()), LineKind::Task, None, false));
+            self.lines.attach(
+                &line_id,
+                LineSession {
+                    uid: uid.clone(),
+                    harness: harness.key().to_string(),
+                    conversation: conversation.clone(),
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    label: harness.label().to_string(),
+                    last_active: jiff::Timestamp::now(),
+                    role,
+                },
+            );
+            if branch.is_some() {
+                self.lines.set_branch(&line_id, branch);
+            }
+            if harness == Harness::Claude {
+                if let Some(id) = &conversation {
+                    self.task_watchers.insert(uid, TaskWatcher::for_claude_session(id));
+                }
+            }
         }
+        self.persist(cx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -774,9 +864,21 @@ impl ProjectView {
                 TerminalViewEvent::Exited => this.persist(cx),
                 TerminalViewEvent::AgentState => {
                     this.on_agent_state(view, harness, window, cx);
+                    let v = view.read(cx);
+                    if matches!(v.agent_state, Some(AgentState::Done)) {
+                        let uid = v.uid.clone();
+                        this.lines.on_turn_done(&uid);
+                    }
                     this.persist(cx);
                 }
-                TerminalViewEvent::TitleChanged => this.persist(cx),
+                TerminalViewEvent::TitleChanged => {
+                    this.on_session_title(view, harness, cx);
+                    this.persist(cx);
+                }
+                TerminalViewEvent::Prompt(text) => {
+                    let uid = view.read(cx).uid.clone();
+                    this.lines.on_prompt(&uid, text);
+                }
             }
             cx.notify();
         });
@@ -1490,6 +1592,127 @@ impl ProjectView {
 
     // ── render ──────────────────────────────────────────────────────────
 
+    /// One row of the open-sessions list.
+    fn session_row(&self, i: usize, tab: &Tab, now: Instant, cx: &mut Context<Self>) -> Option<AnyElement> {
+                                let (harness, title, status_line, dot_color, worktree, accent_color, can_rename): (
+                                    Harness,
+                                    SharedString,
+                                    String,
+                                    Hsla,
+                                    Option<String>,
+                                    Option<u32>,
+                                    bool,
+                                ) = match &tab.kind {
+                                    TabKind::Terminal { view, harness, worktree, custom_name, custom_color, .. } => {
+                                        let t = view.read(cx);
+                                        let (status, dot) = terminal_status(t, now);
+                                        let title = custom_name
+                                            .as_ref()
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| SharedString::from(s.clone()))
+                                            .unwrap_or_else(|| t.auto_title());
+                                        let when = ago(t.last_activity_at());
+                                        (*harness, title, format!("{status} · {when}"), dot, worktree.clone(), *custom_color, true)
+                                    }
+                                    TabKind::Chat { view, harness } => {
+                                        let (status, dot) = chat_status(view.read(cx));
+                                        (*harness, format!("{} · chat", harness.label()).into(), status.to_string(), dot, None, None, false)
+                                    }
+                                    _ => return None,
+                                };
+                                let selected = self.active == Some(i);
+                                let tab_id = tab.id;
+                                Some(
+                                    h_flex()
+                                        .id(("session", tab_id))
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .when_some(accent_color, |d, c| d.border_l_2().border_color(rgb(c)))
+                                        .when(selected, |d| d.bg(style::panel_hover()))
+                                        .hover(|d| d.bg(style::panel_hover()))
+                                        .child(harness_badge(harness))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(div().text_sm().truncate().child(title))
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1()
+                                                        .min_w_0()
+                                                        .text_xs()
+                                                        .text_color(style::muted())
+                                                        .child(div().size(px(6.)).flex_none().rounded_full().bg(dot_color))
+                                                        .child(div().flex_1().min_w_0().truncate().child(status_line)),
+                                                )
+                                                .when_some(worktree, |d, w| {
+                                                    d.child(
+                                                        h_flex()
+                                                            .gap_1()
+                                                            .min_w_0()
+                                                            .text_xs()
+                                                            .text_color(style::faint())
+                                                            .child(icons::ui("git-branch", px(11.), style::faint()))
+                                                            .child(div().flex_1().min_w_0().truncate().child(w)),
+                                                    )
+                                                }),
+                                        )
+                                        .when(can_rename, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("session-rename", tab_id))
+                                                    .flex_none()
+                                                    .p_0p5()
+                                                    .rounded_sm()
+                                                    .hover(|d| d.bg(style::bg()))
+                                                    .tooltip(|window, cx| {
+                                                        Tooltip::new("Rename & color (double-click or right-click)").build(window, cx)
+                                                    })
+                                                    .child(icons::ui("pencil", px(11.), style::faint()))
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_rename_modal(tab_id, window, cx);
+                                                    })),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .id(("session-close", tab_id))
+                                                .flex_none()
+                                                .p_0p5()
+                                                .rounded_sm()
+                                                .hover(|d| d.bg(style::bg()))
+                                                .child(icons::ui("x", px(12.), style::faint()))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.close_tab(i, window, cx);
+                                                })),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                                if can_rename && ev.click_count >= 2 {
+                                                    this.open_rename_modal(tab_id, window, cx);
+                                                } else {
+                                                    this.activate(i, window, cx);
+                                                }
+                                            }),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(move |this, _, window, cx| {
+                                                if can_rename {
+                                                    this.open_rename_modal(tab_id, window, cx);
+                                                }
+                                            }),
+                                        ),
+                                )
+                                .map(|e| e.into_any_element())
+    }
+
     fn left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         let harnesses = self.available_harnesses(cx);
@@ -1626,124 +1849,7 @@ impl ProjectView {
                     })
                     .child(
                         div().id("open-sessions").flex_1().overflow_y_scroll().child(
-                            v_flex().gap_1().children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-                                let (harness, title, status_line, dot_color, worktree, accent_color, can_rename): (
-                                    Harness,
-                                    SharedString,
-                                    String,
-                                    Hsla,
-                                    Option<String>,
-                                    Option<u32>,
-                                    bool,
-                                ) = match &tab.kind {
-                                    TabKind::Terminal { view, harness, worktree, custom_name, custom_color, .. } => {
-                                        let t = view.read(cx);
-                                        let (status, dot) = terminal_status(t, now);
-                                        let title = custom_name
-                                            .as_ref()
-                                            .filter(|s| !s.is_empty())
-                                            .map(|s| SharedString::from(s.clone()))
-                                            .unwrap_or_else(|| t.auto_title());
-                                        let when = ago(t.last_activity_at());
-                                        (*harness, title, format!("{status} · {when}"), dot, worktree.clone(), *custom_color, true)
-                                    }
-                                    TabKind::Chat { view, harness } => {
-                                        let (status, dot) = chat_status(view.read(cx));
-                                        (*harness, format!("{} · chat", harness.label()).into(), status.to_string(), dot, None, None, false)
-                                    }
-                                    _ => return None,
-                                };
-                                let selected = self.active == Some(i);
-                                let tab_id = tab.id;
-                                Some(
-                                    h_flex()
-                                        .id(("session", tab_id))
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1p5()
-                                        .rounded_md()
-                                        .cursor_pointer()
-                                        .when_some(accent_color, |d, c| d.border_l_2().border_color(rgb(c)))
-                                        .when(selected, |d| d.bg(style::panel_hover()))
-                                        .hover(|d| d.bg(style::panel_hover()))
-                                        .child(harness_badge(harness))
-                                        .child(
-                                            v_flex()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .child(div().text_sm().truncate().child(title))
-                                                .child(
-                                                    h_flex()
-                                                        .gap_1()
-                                                        .min_w_0()
-                                                        .text_xs()
-                                                        .text_color(style::muted())
-                                                        .child(div().size(px(6.)).flex_none().rounded_full().bg(dot_color))
-                                                        .child(div().flex_1().min_w_0().truncate().child(status_line)),
-                                                )
-                                                .when_some(worktree, |d, w| {
-                                                    d.child(
-                                                        h_flex()
-                                                            .gap_1()
-                                                            .min_w_0()
-                                                            .text_xs()
-                                                            .text_color(style::faint())
-                                                            .child(icons::ui("git-branch", px(11.), style::faint()))
-                                                            .child(div().flex_1().min_w_0().truncate().child(w)),
-                                                    )
-                                                }),
-                                        )
-                                        .when(can_rename, |d| {
-                                            d.child(
-                                                div()
-                                                    .id(("session-rename", tab_id))
-                                                    .flex_none()
-                                                    .p_0p5()
-                                                    .rounded_sm()
-                                                    .hover(|d| d.bg(style::bg()))
-                                                    .tooltip(|window, cx| {
-                                                        Tooltip::new("Rename & color (double-click or right-click)").build(window, cx)
-                                                    })
-                                                    .child(icons::ui("pencil", px(11.), style::faint()))
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.open_rename_modal(tab_id, window, cx);
-                                                    })),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .id(("session-close", tab_id))
-                                                .flex_none()
-                                                .p_0p5()
-                                                .rounded_sm()
-                                                .hover(|d| d.bg(style::bg()))
-                                                .child(icons::ui("x", px(12.), style::faint()))
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.close_tab(i, window, cx);
-                                                })),
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                                if can_rename && ev.click_count >= 2 {
-                                                    this.open_rename_modal(tab_id, window, cx);
-                                                } else {
-                                                    this.activate(i, window, cx);
-                                                }
-                                            }),
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener(move |this, _, window, cx| {
-                                                if can_rename {
-                                                    this.open_rename_modal(tab_id, window, cx);
-                                                }
-                                            }),
-                                        ),
-                                )
-                            })),
+                            v_flex().gap_1().children(self.grouped_sessions(now, cx)),
                         ),
                     ),
             )
@@ -2095,7 +2201,7 @@ impl ProjectView {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(p, cx)))
             }));
 
-        let top_content = self.panel.map(|p| {
+        let panel_content = self.panel.map(|p| {
             v_flex()
                 .size_full()
                 .when_some(self.git.branch.clone(), |d, b| {
@@ -2120,6 +2226,14 @@ impl ProjectView {
                     SidePanel::Graph => self.graph_panel(cx).into_any_element(),
                 }))
         });
+        // The metro mini map always sits under the active section.
+        let mini_map = self.mini_map(cx);
+        let top_content = Some(
+            v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().children(panel_content))
+                .child(mini_map),
+        );
 
         let has_terms = !self.right_terminals.is_empty();
         let bottom_height = state::get(cx).right_bottom_height.unwrap_or(240.).clamp(120., 600.);
@@ -3208,6 +3322,7 @@ impl Render for ProjectView {
                 )
             })
             .when_some(self.rename_modal.as_ref().map(|m| self.rename_overlay(m, cx)), |d, el| d.child(el))
+            .when(self.board.is_some(), |d| d.child(self.board_overlay(cx)))
             .when_some(self.merge_modal.as_ref().map(|m| self.merge_overlay(m, cx)), |d, el| d.child(el))
     }
 }
@@ -3321,6 +3436,7 @@ fn with_agent_history(mut sessions: Vec<SavedSession>, root: &Path) -> Vec<Saved
         .filter(|c| !known.contains(&c.id))
         .take(MAX_FROM_HISTORY)
         .map(|c| SavedSession {
+            uid: None,
             harness: Harness::Antigravity.key().to_string(),
             cwd: root.to_string_lossy().into_owned(),
             worktree: None,

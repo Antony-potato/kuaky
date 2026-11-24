@@ -39,6 +39,12 @@ pub enum PrMergeMethod {
 use anyhow::{Context as _, bail};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchProgress {
+    pub ahead: u32,
+    pub merged: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Repo {
     root: PathBuf,
@@ -58,6 +64,15 @@ impl Repo {
 
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
         git_in(&self.root, args)
+    }
+
+    /// Progreso de `branch` respecto a `base`: commits por delante y si ya
+    /// está integrada en `base`.
+    pub fn branch_progress(&self, base: &str, branch: &str) -> Option<BranchProgress> {
+        let range = format!("{base}..{branch}");
+        let ahead = self.git(&["rev-list", "--count", &range]).ok()?.trim().parse().ok()?;
+        let merged = self.git(&["merge-base", "--is-ancestor", branch, base]).is_ok();
+        Some(BranchProgress { ahead, merged: merged && ahead == 0 })
     }
 
     pub fn current_branch(&self) -> anyhow::Result<String> {

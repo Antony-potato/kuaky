@@ -1,5 +1,6 @@
 mod agent_history;
 mod agent_status;
+mod agent_tasks;
 mod app;
 mod chat_view;
 mod conflict_view;
@@ -9,6 +10,7 @@ mod file_view;
 mod graph_view;
 mod home;
 mod icons;
+mod lines;
 mod lsp;
 mod project;
 mod quick_open;
