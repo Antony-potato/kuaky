@@ -52,7 +52,8 @@ while True:
         # Archivos a través del cliente: leer, escribir dentro y fuera de la carpeta permitida.
         import os, tempfile
         root = os.path.realpath(tempfile.gettempdir())
-        target = os.path.join(root, "kuaky-mock-acp.txt")
+        # Un archivo por proceso: las pruebas corren en paralelo y no deben pisarse.
+        target = os.path.join(root, f"kuaky-mock-acp-{os.getpid()}.txt")
         send({"jsonrpc": "2.0", "id": 97, "method": "fs/write_text_file", "params": {"sessionId": s, "path": target, "content": "uno\ndos\n"}})
         w = read()
         assert w.get("id") == 97 and "error" not in w, w

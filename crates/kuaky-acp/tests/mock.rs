@@ -80,10 +80,12 @@ fn file_writes_and_commands_are_reported() {
     let events = client.events();
     client.prompt(&session, "hola").unwrap();
     let (mut wrote, mut commands, mut located) = (false, false, false);
+    let mut written = None;
     loop {
         match events.recv_timeout(Duration::from_secs(10)).expect("sin respuesta") {
             Event::FileWritten { path, new_text, .. } => {
-                assert!(path.ends_with("kuaky-mock-acp.txt"));
+                assert!(path.to_string_lossy().contains("kuaky-mock-acp-"));
+                written = Some(path);
                 assert_eq!(new_text, "uno\ndos\n");
                 wrote = true;
             }
@@ -94,6 +96,9 @@ fn file_writes_and_commands_are_reported() {
             Event::Error(e) => panic!("{e}"),
             _ => {}
         }
+    }
+    if let Some(path) = written {
+        let _ = std::fs::remove_file(path);
     }
     assert!(wrote && commands && located);
 }
