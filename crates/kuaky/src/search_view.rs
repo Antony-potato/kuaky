@@ -50,7 +50,7 @@ impl EventEmitter<SearchEvent> for SearchView {}
 
 impl SearchView {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar en el proyecto…"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search in project…"));
         let sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _, cx| {
             if matches!(ev, InputEvent::Change | InputEvent::PressEnter { .. }) {
                 this.run(cx);
@@ -90,7 +90,7 @@ impl SearchView {
         let re = match regex::RegexBuilder::new(&pattern).case_insensitive(!self.case_sensitive).build() {
             Ok(re) => re,
             Err(e) => {
-                self.error = Some(format!("Expresión inválida: {e}"));
+                self.error = Some(format!("Invalid regex: {e}"));
                 cx.notify();
                 return;
             }
@@ -203,13 +203,13 @@ impl Render for SearchView {
         let summary = if let Some(e) = &self.error {
             e.clone()
         } else if self.searching {
-            "buscando…".into()
+            "searching…".into()
         } else if self.total == 0 {
             String::new()
         } else {
             format!(
-                "{}{} coincidencias en {} archivos",
-                if self.truncated { "más de " } else { "" },
+                "{}{} matches in {} files",
+                if self.truncated { "more than " } else { "" },
                 self.total,
                 self.results.len()
             )
@@ -288,7 +288,7 @@ impl Render for SearchView {
                 ),
             )
             .when(self.results.is_empty() && !self.searching && self.error.is_none(), |d| {
-                d.child(div().p_4().text_xs().text_color(style::faint()).child("Escribe para buscar. Aa: distingue mayúsculas · .*: expresión regular"))
+                d.child(div().p_4().text_xs().text_color(style::faint()).child("Type to search. Aa: match case · .*: regular expression"))
             })
     }
 }

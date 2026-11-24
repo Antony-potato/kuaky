@@ -29,7 +29,7 @@ impl EventEmitter<QuickOpenEvent> for QuickOpen {}
 
 impl QuickOpen {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Buscar archivo por nombre…"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find file by name…"));
         let sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _, cx| match ev {
             InputEvent::Change => this.refilter(cx),
             InputEvent::PressEnter { .. } => this.confirm(cx),
@@ -78,9 +78,9 @@ impl QuickOpen {
 impl Render for QuickOpen {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = if self.loading {
-            Some("Leyendo archivos…")
+            Some("Scanning files…")
         } else if self.results.is_empty() {
-            Some("Sin resultados")
+            Some("No results")
         } else {
             None
         };

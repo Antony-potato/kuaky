@@ -1,18 +1,21 @@
-//! Vista de proyecto: sesiones de agentes a la izquierda, pestañas en el
-//! centro (terminales, archivos, diffs) y archivos / git / PRs a la derecha.
+//! Project workspace view: open agent sessions on the left, tabs in the center,
+//! collapsible files/git/PRs/graph + embedded terminals on the right, and a
+//! compact activity/status bar at the bottom.
 
 use crate::agent_status::AgentState;
 use crate::chat_view::{ChatEvent, ChatLaunch, ChatStatus, ChatView};
-use crate::search_view::{SearchEvent, SearchView};
 use crate::diff_view::DiffView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
 use crate::home::tilde;
+use crate::icons;
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
+use crate::search_view::{SearchEvent, SearchView};
 use crate::state::{self, SavedSession};
 use crate::style::{self, human};
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
-use gpui_kit::component::resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -49,7 +52,7 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Agente (o shell) que se puede abrir en una terminal.
+/// Agent (or plain shell) that can be launched in a terminal session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Harness {
     Claude,
@@ -61,9 +64,9 @@ pub enum Harness {
 }
 
 impl Harness {
-    const AGENTS: [Harness; 5] = [Harness::Claude, Harness::Codex, Harness::Antigravity, Harness::Gemini, Harness::OpenCode];
+    pub(crate) const AGENTS: [Harness; 5] = [Harness::Claude, Harness::Codex, Harness::Antigravity, Harness::Gemini, Harness::OpenCode];
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Harness::Claude => "Claude Code",
             Harness::Codex => "Codex",
@@ -74,7 +77,7 @@ impl Harness {
         }
     }
 
-    fn command(self) -> Option<&'static str> {
+    pub(crate) fn command(self) -> Option<&'static str> {
         match self {
             Harness::Claude => Some("claude"),
             Harness::Codex => Some("codex"),
@@ -85,7 +88,8 @@ impl Harness {
         }
     }
 
-    /// Programa y argumentos para hablar con el agente por ACP, si está instalado.
+    /// Program and arguments for ACP chat mode (kept in code for future native agent UI).
+    #[allow(dead_code)]
     fn chat_command(self) -> Option<(PathBuf, Vec<String>)> {
         let (program, args): (&str, &[&str]) = match self {
             Harness::Claude => ("claude-agent-acp", &[]),
@@ -99,8 +103,8 @@ impl Harness {
         Some((path, args.iter().map(|a| a.to_string()).collect()))
     }
 
-    /// Clave estable para guardar el estado.
-    fn key(self) -> &'static str {
+    /// Stable key used for persisted state and settings.
+    pub(crate) fn key(self) -> &'static str {
         self.command().unwrap_or("shell")
     }
 
@@ -108,7 +112,7 @@ impl Harness {
         Harness::AGENTS.into_iter().chain([Harness::Shell]).find(|h| h.key() == key)
     }
 
-    /// Argumentos para retomar la última conversación en esa carpeta.
+    /// Arguments to resume the latest conversation in the folder.
     fn resume_args(self) -> &'static str {
         match self {
             Harness::Claude => " --continue",
@@ -117,18 +121,7 @@ impl Harness {
         }
     }
 
-    /// Comando sugerido para instalar la CLI cuando no está.
-    fn install_hint(self) -> Option<&'static str> {
-        match self {
-            Harness::Claude => Some("npm install -g @anthropic-ai/claude-code"),
-            Harness::Codex => Some("npm install -g @openai/codex"),
-            Harness::Gemini => Some("npm install -g @google/gemini-cli"),
-            Harness::OpenCode => Some("npm install -g opencode-ai"),
-            Harness::Antigravity | Harness::Shell => None,
-        }
-    }
-
-    fn agent(self) -> Option<Agent> {
+    pub(crate) fn agent(self) -> Option<Agent> {
         match self {
             Harness::Claude => Some(Agent::ClaudeCode),
             Harness::Codex => Some(Agent::Codex),
@@ -138,20 +131,13 @@ impl Harness {
             Harness::Shell => None,
         }
     }
-
-    fn color(self) -> Rgba {
-        self.agent().map(style::agent_color).unwrap_or_else(style::muted)
-    }
-
-    fn glyph(self) -> &'static str {
-        self.agent().map(style::agent_glyph).unwrap_or("›")
-    }
 }
 
 enum TabKind {
     Terminal { view: Entity<TerminalView>, harness: Harness, worktree: Option<String>, cwd: PathBuf },
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
+    #[allow(dead_code)]
     Chat { view: Entity<ChatView>, harness: Harness },
     Search(Entity<SearchView>),
 }
@@ -161,27 +147,45 @@ struct Tab {
     kind: TabKind,
 }
 
+struct RightTerminal {
+    id: usize,
+    view: Entity<TerminalView>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SidePanel {
     Files,
     Changes,
     Branches,
     Prs,
+    Graph,
 }
 
 impl SidePanel {
-    const ALL: [SidePanel; 4] = [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs];
+    const ALL: [SidePanel; 5] = [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs, SidePanel::Graph];
+
     fn label(self) -> &'static str {
         match self {
-            SidePanel::Files => "Archivos",
-            SidePanel::Changes => "Cambios",
-            SidePanel::Branches => "Ramas",
-            SidePanel::Prs => "PRs",
+            SidePanel::Files => "Files",
+            SidePanel::Changes => "Changes",
+            SidePanel::Branches => "Branches",
+            SidePanel::Prs => "Pull Requests",
+            SidePanel::Graph => "Graph",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            SidePanel::Files => "folder",
+            SidePanel::Changes => "git-compare",
+            SidePanel::Branches => "git-branch",
+            SidePanel::Prs => "git-pull-request",
+            SidePanel::Graph => "git-graph",
         }
     }
 }
 
-/// Resumen de una sesión de agente que trabajó en este proyecto.
+/// Summary of an agent session that ran in this project.
 struct ActivityRow {
     agent: Agent,
     model: Arc<str>,
@@ -208,17 +212,26 @@ pub struct ProjectView {
     active: Option<usize>,
     next_id: usize,
     tree: Entity<FileTree>,
-    panel: SidePanel,
+    /// Active top-right panel (`None` when hidden).
+    panel: Option<SidePanel>,
+    /// Embedded terminals in the bottom-right zone.
+    right_terminals: Vec<RightTerminal>,
+    active_right_terminal: Option<usize>,
+    right_split: Entity<ResizableState>,
     git: GitState,
-    /// Agentes encontrados en este equipo y la ruta de su CLI.
+    /// Agents detected on this machine and their CLI path.
     installed: HashMap<Harness, PathBuf>,
-    /// Agentes con modo chat (ACP) disponible.
+    /// ACP-capable agents (kept for future native agent UI).
+    #[allow(dead_code)]
     chat_agents: HashMap<Harness, (PathBuf, Vec<String>)>,
-    /// Abrir cada agente nuevo en su propio worktree y rama.
+    /// Launch target chosen in the New Session menu (`false` = This folder, `true` = New branch).
     isolate: bool,
+    new_session_menu: bool,
+    previous_expanded: bool,
+    activity_open: bool,
     activity: Vec<ActivityRow>,
     focus: FocusHandle,
-    /// Sesiones que estaban abiertas la última vez (para reanudarlas).
+    /// Previous sessions from the last time this project was open.
     previous: Vec<SavedSession>,
     quick_open: Option<Entity<QuickOpen>>,
     layout: Entity<ResizableState>,
@@ -243,6 +256,15 @@ impl ProjectView {
                 });
             }
         });
+        let right_split = cx.new(|_| ResizableState::default());
+        let right_split_sub = cx.subscribe(&right_split, |_, split, _: &ResizablePanelEvent, cx| {
+            let sizes = split.read(cx).sizes().clone();
+            if sizes.len() == 2 {
+                state::update(cx, |s| {
+                    s.right_bottom_height = Some(f32::from(sizes[1]));
+                });
+            }
+        });
         let key = root.to_string_lossy().into_owned();
         state::update(cx, |s| state::touch_recent(s, &key));
         let saved = state::get(cx).projects.get(&key).cloned().unwrap_or_default();
@@ -260,21 +282,26 @@ impl ProjectView {
             active: None,
             next_id: 0,
             tree,
-            panel: SidePanel::Files,
+            panel: Some(SidePanel::Files),
+            right_terminals: Vec::new(),
+            active_right_terminal: None,
+            right_split,
             git: GitState::default(),
             installed: HashMap::new(),
             chat_agents: HashMap::new(),
             isolate: false,
+            new_session_menu: false,
+            previous_expanded: false,
+            activity_open: false,
             focus: cx.focus_handle(),
             previous: saved.sessions.clone(),
             quick_open: None,
             layout,
             lsp,
-            _subs: vec![sub, layout_sub, lsp_sub],
+            _subs: vec![sub, layout_sub, right_split_sub, lsp_sub],
         };
         this.detect_agents(cx);
         this.start_git_refresh(cx);
-        // Reabrir los archivos que estaban abiertos.
         for file in &saved.files {
             let path = this.root.join(file);
             if path.is_file() {
@@ -287,7 +314,16 @@ impl ProjectView {
         this
     }
 
-    /// Guarda archivos y sesiones abiertas de este proyecto.
+    pub fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
+        self.detect_agents(cx);
+        cx.notify();
+    }
+
+    pub fn open_search_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_search(window, cx);
+    }
+
+    /// Saves open files and sessions for this project.
     fn persist(&self, cx: &mut Context<Self>) {
         let files: Vec<String> = self
             .tabs
@@ -305,11 +341,12 @@ impl ProjectView {
                     harness: harness.key().to_string(),
                     cwd: cwd.to_string_lossy().into_owned(),
                     worktree: worktree.clone(),
+                    custom_name: None,
+                    custom_color: None,
                 }),
                 _ => None,
             })
             .collect();
-        // Las anteriores que no se han reanudado se conservan.
         for p in &self.previous {
             if !sessions.contains(p) {
                 sessions.push(p.clone());
@@ -353,16 +390,40 @@ impl ProjectView {
         &self.root
     }
 
-    // ── agentes y terminales ───────────────────────────────────────────
+    /// Agents that are both installed (or configured with a custom path) and visible in settings.
+    fn available_harnesses(&self, cx: &App) -> Vec<Harness> {
+        let settings = &state::get(cx).settings;
+        let mut out: Vec<Harness> = Harness::AGENTS
+            .into_iter()
+            .filter(|h| {
+                if !settings.is_visible(h.key()) {
+                    return false;
+                }
+                let custom = settings.agent(h.key()).binary_path;
+                !custom.trim().is_empty() || self.installed.contains_key(h)
+            })
+            .collect();
+        out.push(Harness::Shell);
+        out
+    }
+
+    // ── agents and terminals ───────────────────────────────────────────
 
     fn detect_agents(&self, cx: &mut Context<Self>) {
+        let settings = state::get(cx).settings.clone();
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
-                .spawn(async {
+                .spawn(async move {
                     let installed = Harness::AGENTS
                         .into_iter()
-                        .filter_map(|h| Some((h, kuaky_git::find_agent(h.command()?)?)))
+                        .filter_map(|h| {
+                            let custom = settings.agent(h.key()).binary_path;
+                            if !custom.trim().is_empty() {
+                                return Some((h, PathBuf::from(custom.trim())));
+                            }
+                            Some((h, kuaky_git::find_agent(h.command()?)?))
+                        })
                         .collect::<HashMap<_, _>>();
                     let chat = Harness::AGENTS
                         .into_iter()
@@ -382,18 +443,31 @@ impl ProjectView {
         .detach();
     }
 
-    /// Estado de demostración para las capturas de desarrollo
-    /// (`KUAKY_DEMO_PANEL`, `KUAKY_DEMO_FILE`, `KUAKY_DEMO_DIFF`).
+    /// Demo state for development screenshots.
     #[cfg(feature = "screenshot")]
     pub fn demo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(panel) = std::env::var("KUAKY_DEMO_PANEL") {
             let p = match panel.as_str() {
-                "changes" => SidePanel::Changes,
-                "branches" => SidePanel::Branches,
-                "prs" => SidePanel::Prs,
-                _ => SidePanel::Files,
+                "changes" => Some(SidePanel::Changes),
+                "branches" => Some(SidePanel::Branches),
+                "prs" => Some(SidePanel::Prs),
+                "graph" => Some(SidePanel::Graph),
+                "none" => None,
+                _ => Some(SidePanel::Files),
             };
-            self.set_panel(p, cx);
+            self.panel = p;
+            if p == Some(SidePanel::Prs) && self.git.prs.is_none() {
+                self.load_prs(cx);
+            }
+        }
+        if std::env::var("KUAKY_DEMO_NEW_SESSION").is_ok() {
+            self.new_session_menu = true;
+        }
+        if std::env::var("KUAKY_DEMO_ACTIVITY").is_ok() {
+            self.activity_open = true;
+        }
+        if std::env::var("KUAKY_DEMO_RIGHT_TERM").is_ok() {
+            self.open_right_terminal(window, cx);
         }
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
@@ -404,7 +478,6 @@ impl ProjectView {
             }
         }
         match std::env::var("KUAKY_DEMO_CHAT").as_deref() {
-            // Agente falso de las pruebas de kuaky-acp: no usa red ni tokens.
             Ok("mock") => {
                 let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kuaky-acp/tests/mock_agent.py");
                 self.chat_agents.insert(Harness::Claude, (PathBuf::from("python3"), vec![script.to_string_lossy().into_owned()]));
@@ -418,7 +491,7 @@ impl ProjectView {
         }
         if std::env::var("KUAKY_DEMO_DIFF").is_ok() {
             if let Some(repo) = self.repo.clone() {
-                self.open_diff("Cambios locales".into(), "sin commit".into(), move || repo.diff_worktree(), window, cx);
+                self.open_diff("Local changes".into(), "uncommitted".into(), move || repo.diff_worktree(), window, cx);
             }
         }
     }
@@ -429,34 +502,39 @@ impl ProjectView {
     }
 
     pub fn open_terminal(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_session_menu = false;
+        let settings = state::get(cx).settings.clone();
+        let custom_path = settings.agent(harness.key()).binary_path;
         if harness != Harness::Shell && !self.installed.contains_key(&harness) {
-            // La detección en segundo plano pudo no haber terminado: buscar ahora.
-            if let Some(path) = harness.command().and_then(kuaky_git::find_agent) {
+            if !custom_path.trim().is_empty() {
+                self.installed.insert(harness, PathBuf::from(custom_path.trim()));
+            } else if let Some(path) = harness.command().and_then(kuaky_git::find_agent) {
                 self.installed.insert(harness, path);
             }
         }
         let installed = harness == Harness::Shell || self.installed.contains_key(&harness);
-        let mut cwd = self.root.clone();
-        let mut worktree = None;
         if !installed {
-            // La CLI no está: abrir un shell con el comando de instalación escrito, sin ejecutarlo.
-            let launch = Launch { cwd, command: None, prefill: harness.install_hint().map(str::to_string), env: Vec::new() };
-            self.add_terminal(harness, launch, None, None, window, cx);
             return;
         }
+        let mut cwd = self.root.clone();
+        let mut worktree = None;
         if self.isolate && harness != Harness::Shell {
             if let Some(repo) = &self.repo {
                 let name = format!(
                     "{}-{}",
-                    harness.command().unwrap_or("agente"),
+                    harness.command().unwrap_or("agent"),
                     jiff::Zoned::now().strftime("%m%d-%H%M%S")
                 );
-                match repo.create_worktree(&name) {
+                let created = match settings.resolved_worktrees_dir() {
+                    Some(dir) => repo.create_worktree_in(&dir, &name),
+                    None => repo.create_worktree(&name),
+                };
+                match created {
                     Ok(path) => {
                         cwd = path;
                         worktree = Some(format!("kuaky/{name}"));
                     }
-                    Err(err) => tracing::warn!(%err, "no se pudo crear el worktree"),
+                    Err(err) => tracing::warn!(%err, "failed to create worktree"),
                 }
             }
         }
@@ -472,20 +550,30 @@ impl ProjectView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let cfg = state::get(cx).settings.agent(harness.key());
         if harness != Harness::Shell && !self.installed.contains_key(&harness) {
-            if let Some(path) = harness.command().and_then(kuaky_git::find_agent) {
+            if !cfg.binary_path.trim().is_empty() {
+                self.installed.insert(harness, PathBuf::from(cfg.binary_path.trim()));
+            } else if let Some(path) = harness.command().and_then(kuaky_git::find_agent) {
                 self.installed.insert(harness, path);
             }
         }
-        // Si la CLI no está en el PATH del shell (p. ej. la instaló Zed), se usa su ruta completa.
         let command = harness.command().map(|name| {
-            let base = match self.installed.get(&harness) {
-                Some(path) if kuaky_git::find_program(name).is_none() => kuaky_git::shell_command(path),
-                _ => name.to_string(),
+            let base = if !cfg.binary_path.trim().is_empty() {
+                kuaky_git::shell_command(Path::new(cfg.binary_path.trim()))
+            } else {
+                match self.installed.get(&harness) {
+                    Some(path) if kuaky_git::find_program(name).is_none() => kuaky_git::shell_command(path),
+                    _ => name.to_string(),
+                }
             };
-            if resume { format!("{base}{}", harness.resume_args()) } else { base }
+            let mut full = if resume { format!("{base}{}", harness.resume_args()) } else { base };
+            if !cfg.extra_args.trim().is_empty() {
+                full.push(' ');
+                full.push_str(cfg.extra_args.trim());
+            }
+            full
         });
-        // Claude Code: hooks de kuaky para conocer su estado exacto (sin tocar tus ajustes).
         let mut env = Vec::new();
         let mut status_file = None;
         let mut command = command;
@@ -524,16 +612,39 @@ impl ProjectView {
         self.push_tab(TabKind::Terminal { view, harness, worktree, cwd }, window, cx);
     }
 
-    /// Avisa cuando un agente termina o necesita tu permiso: dentro de kuaky si
-    /// estás en otra pestaña, y con una notificación de macOS si kuaky no está
-    /// en primer plano.
+    fn open_right_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let launch = Launch { cwd: self.root.clone(), command: None, prefill: None, env: Vec::new() };
+        let id = self.next_id;
+        self.next_id += 1;
+        let label = format!("Terminal {}", self.right_terminals.len() + 1);
+        let view = cx.new(|cx| TerminalView::new(label, launch, None, window, cx));
+        let obs = cx.observe(&view, |_, _, cx| cx.notify());
+        self._subs.push(obs);
+        self.right_terminals.push(RightTerminal { id, view });
+        self.active_right_terminal = Some(self.right_terminals.len() - 1);
+        cx.notify();
+    }
+
+    fn close_right_terminal(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.right_terminals.len() {
+            return;
+        }
+        self.right_terminals.remove(index);
+        if self.right_terminals.is_empty() {
+            self.active_right_terminal = None;
+        } else {
+            self.active_right_terminal = Some(index.min(self.right_terminals.len() - 1));
+        }
+        cx.notify();
+    }
+
     fn on_agent_state(&mut self, view: &Entity<TerminalView>, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
         let t = view.read(cx);
         let Some(state) = t.agent_state.clone() else { return };
         let was_working = t.previous_state == Some(AgentState::Working);
         let (title, message) = match &state {
-            AgentState::NeedsYou(msg) => (format!("{} necesita tu permiso", harness.label()), msg.clone()),
-            AgentState::Done if was_working => (format!("{} terminó", harness.label()), "Es tu turno.".to_string()),
+            AgentState::NeedsYou(msg) => (format!("{} needs your permission", harness.label()), msg.clone()),
+            AgentState::Done if was_working => (format!("{} finished", harness.label()), "Your turn.".to_string()),
             _ => return,
         };
         let is_active_tab = self
@@ -560,7 +671,7 @@ impl ProjectView {
         }
     }
 
-    /// Abre una terminal con `text` escrito, sin ejecutarlo: tú confirmas con Enter.
+    /// Opens a shell with `text` prefilled (not executed until user presses Enter).
     fn prefilled_shell(&mut self, cwd: PathBuf, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let launch = Launch { cwd, command: None, prefill: Some(text), env: Vec::new() };
         self.add_terminal(Harness::Shell, launch, None, None, window, cx);
@@ -593,7 +704,7 @@ impl ProjectView {
                 .border_color(style::border())
                 .child(div().px_2().text_xs().text_color(style::faint()).child(format!("WORKTREES · base {base}")))
                 .children(worktrees.into_iter().enumerate().map(|(i, wt)| {
-                    let branch = wt.branch.clone().unwrap_or_else(|| "(sin rama)".into());
+                    let branch = wt.branch.clone().unwrap_or_else(|| "(detached)".into());
                     let name = wt.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let path_q = kuaky_git::shell_command(&wt.path);
                     let (wt1, wt2, wt3) = (wt.clone(), wt.clone(), wt.clone());
@@ -609,7 +720,7 @@ impl ProjectView {
                             h_flex()
                                 .gap_1p5()
                                 .text_sm()
-                                .child(div().text_color(style::accent()).child("⑂"))
+                                .child(icons::ui("git-branch", px(13.), style::accent()))
                                 .child(div().truncate().child(name)),
                         )
                         .child(div().text_xs().truncate().text_color(style::faint()).child(branch.clone()))
@@ -617,26 +728,39 @@ impl ProjectView {
                             h_flex()
                                 .gap_1()
                                 .flex_wrap()
-                                .child(action(("wt-diff", i), "cambios").on_click(cx.listener(move |this, _, window, cx| {
+                                .child(action(("wt-diff", i), "changes").on_click(cx.listener(move |this, _, window, cx| {
                                     let Some(repo) = this.repo.clone() else { return };
                                     let (base, wt) = (b1.clone(), wt1.clone());
-                                    let title = format!("⑂ {}", wt.branch.clone().unwrap_or_default());
-                                    this.open_diff(title, format!("cambios del worktree contra {base}"), move || repo.diff_worktree_branch(&base, &wt), window, cx);
+                                    let title = format!("Worktree {}", wt.branch.clone().unwrap_or_default());
+                                    this.open_diff(
+                                        title,
+                                        format!("worktree changes against {base}"),
+                                        move || repo.diff_worktree_branch(&base, &wt),
+                                        window,
+                                        cx,
+                                    );
                                 })))
                                 .child(action(("wt-term", i), "terminal").on_click(cx.listener(move |this, _, window, cx| {
-                                    this.add_terminal(Harness::Shell, Launch { cwd: wt2.path.clone(), command: None, prefill: None, env: Vec::new() }, wt2.branch.clone(), None, window, cx);
+                                    this.add_terminal(
+                                        Harness::Shell,
+                                        Launch { cwd: wt2.path.clone(), command: None, prefill: None, env: Vec::new() },
+                                        wt2.branch.clone(),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
                                 })))
-                                .child(action(("wt-pr", i), "crear PR").on_click(cx.listener(move |this, _, window, cx| {
+                                .child(action(("wt-pr", i), "create PR").on_click(cx.listener(move |this, _, window, cx| {
                                     let text = format!("git push -u origin {b2} && gh pr create --fill --head {b2}");
                                     this.prefilled_shell(wt3.path.clone(), text, window, cx);
                                 })))
-                                .child(action(("wt-merge", i), "fusionar").on_click(cx.listener({
+                                .child(action(("wt-merge", i), "merge").on_click(cx.listener({
                                     let root = root.clone();
                                     move |this, _, window, cx| {
                                         this.prefilled_shell(root.clone(), format!("git merge --no-ff {b3}"), window, cx);
                                     }
                                 })))
-                                .child(action(("wt-remove", i), "eliminar").on_click(cx.listener(move |this, _, window, cx| {
+                                .child(action(("wt-remove", i), "remove").on_click(cx.listener(move |this, _, window, cx| {
                                     let text = format!("git worktree remove {path_q} && git branch -D {b4}");
                                     this.prefilled_shell(root.clone(), text, window, cx);
                                 }))),
@@ -646,6 +770,7 @@ impl ProjectView {
         )
     }
 
+    #[allow(dead_code)]
     pub fn open_chat(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
         let Some((program, args)) = self.chat_agents.get(&harness).cloned().or_else(|| harness.chat_command()) else {
             return;
@@ -660,12 +785,12 @@ impl ProjectView {
             match ev {
                 ChatEvent::OpenDiff { title, patch } => {
                     let patch = patch.clone();
-                    this.open_diff(title.clone(), "cambio propuesto por el agente".into(), move || Ok(patch), window, cx);
+                    this.open_diff(title.clone(), "proposed agent change".into(), move || Ok(patch), window, cx);
                 }
                 ChatEvent::NeedsYou(msg) => {
-                    this.notify(format!("{} necesita tu permiso", harness.label()), msg.clone(), is_active_tab, window, cx)
+                    this.notify(format!("{} needs your permission", harness.label()), msg.clone(), is_active_tab, window, cx)
                 }
-                ChatEvent::TurnDone => this.notify(format!("{} terminó", harness.label()), "Es tu turno.".into(), is_active_tab, window, cx),
+                ChatEvent::TurnDone => this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx),
                 ChatEvent::Status => {}
             }
             cx.notify();
@@ -693,7 +818,7 @@ impl ProjectView {
         cx.notify();
     }
 
-    /// Abre un archivo y pone el cursor en `line`/`column` (base 0).
+    /// Opens a file and places the cursor at 0-based `line`/`column`.
     pub fn open_file_at(&mut self, path: PathBuf, line: u32, column: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.open_file(path.clone(), window, cx);
         if let Some(TabKind::File(f)) = self.active.and_then(|i| self.tabs.get(i)).map(|t| &t.kind) {
@@ -839,10 +964,14 @@ impl ProjectView {
         .detach();
     }
 
-    fn set_panel(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
-        self.panel = panel;
-        if panel == SidePanel::Prs && self.git.prs.is_none() {
-            self.load_prs(cx);
+    fn toggle_panel(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
+        if self.panel == Some(panel) {
+            self.panel = None;
+        } else {
+            self.panel = Some(panel);
+            if panel == SidePanel::Prs && self.git.prs.is_none() {
+                self.load_prs(cx);
+            }
         }
         cx.notify();
     }
@@ -853,7 +982,7 @@ impl ProjectView {
             let result = cx.background_executor().spawn(async move { repo.checkout(&branch) }).await;
             this.update(cx, |this, cx| {
                 if let Err(err) = result {
-                    tracing::warn!(%err, "checkout falló");
+                    tracing::warn!(%err, "checkout failed");
                     this.git.prs = this.git.prs.take();
                 }
                 cx.notify();
@@ -867,8 +996,7 @@ impl ProjectView {
 
     fn left_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
-        let mut launchers: Vec<Harness> = Harness::AGENTS.to_vec();
-        launchers.push(Harness::Shell);
+        let harnesses = self.available_harnesses(cx);
 
         v_flex()
             .size_full()
@@ -879,152 +1007,202 @@ impl ProjectView {
                 v_flex()
                     .p_3()
                     .gap_2()
-                    .child(side_title("Nueva sesión"))
-                    .children(launchers.into_iter().map(|h| {
-                        let installed = h == Harness::Shell || self.installed.contains_key(&h);
-                        let tip: SharedString = if installed {
-                            format!("Abrir {} en esta carpeta", h.label()).into()
-                        } else {
-                            match h.install_hint() {
-                                Some(cmd) => format!("No está instalado. Clic para abrir una terminal con: {cmd}").into(),
-                                None => format!("No está instalado: instala la CLI `{}`", h.command().unwrap_or_default()).into(),
-                            }
-                        };
+                    .border_b_1()
+                    .border_color(style::border())
+                    .child(
                         h_flex()
-                            .id(SharedString::from(format!("launch-{}", h.label())))
-                            .gap_2()
-                            .px_2()
+                            .id("new-session-btn")
+                            .px_3()
                             .py_1p5()
-                            .rounded_md()
-                            .text_sm()
+                            .gap_2()
+                            .justify_between()
+                            .items_center()
+                            .rounded_lg()
                             .cursor_pointer()
-                            .when(!installed, |d| d.opacity(0.45))
-                            .hover(|d| d.bg(style::panel_hover()))
-                            .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
-                            .child(harness_badge(h))
-                            .child(div().flex_1().min_w_0().truncate().child(h.label()))
-                            .when(self.chat_agents.contains_key(&h), |d| {
-                                d.child(
-                                    div()
-                                        .id(SharedString::from(format!("chat-{}", h.label())))
-                                        .flex_none()
-                                        .px_1p5()
-                                        .rounded_sm()
-                                        .text_xs()
-                                        .text_color(style::accent())
-                                        .border_1()
-                                        .border_color(style::soft(style::accent(), 0.4))
-                                        .hover(|d| d.bg(style::soft(style::accent(), 0.12)))
-                                        .tooltip(|window, cx| {
-                                            gpui_kit::component::tooltip::Tooltip::new("Abrir en modo chat (ACP)").build(window, cx)
-                                        })
-                                        .child("chat")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.open_chat(h, window, cx);
-                                        })),
-                                )
-                            })
-                            .child(div().flex_none().text_xs().text_color(style::faint()).child(if installed { "+" } else { "instalar" }))
-                            .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
-                    }))
-                    .when(self.repo.is_some(), |d| {
-                        let on = self.isolate;
+                            .bg(style::accent())
+                            .text_color(style::bg())
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("New session")
+                            .child(icons::ui("plus", px(14.), style::bg()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.new_session_menu = !this.new_session_menu;
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.new_session_menu, |d| {
+                        let isolated = self.isolate;
                         d.child(
-                            h_flex()
-                                .id("isolate")
-                                .mt_1()
+                            v_flex()
+                                .p_2()
                                 .gap_2()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .text_xs()
-                                .cursor_pointer()
-                                .text_color(if on { style::text() } else { style::muted() })
-                                .hover(|d| d.bg(style::panel_hover()))
-                                .tooltip(|window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new(
-                                        "Cada agente nuevo trabaja en su propio worktree y rama kuaky/…, sin tocar tu carpeta",
+                                .rounded_lg()
+                                .bg(style::bg())
+                                .border_1()
+                                .border_color(style::border())
+                                .when(self.repo.is_some(), |d| {
+                                    d.child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(div().px_1().text_xs().text_color(style::faint()).child("WORKSPACE"))
+                                            .child(
+                                                h_flex()
+                                                    .id("target-folder")
+                                                    .px_2()
+                                                    .py_1()
+                                                    .gap_2()
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .when(!isolated, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                                                    .when(isolated, |d| d.text_color(style::muted()))
+                                                    .hover(|d| d.bg(style::panel_hover()))
+                                                    .tooltip(|window, cx| {
+                                                        Tooltip::new("Work directly in this project folder").build(window, cx)
+                                                    })
+                                                    .child(icons::ui("folder", px(13.), if !isolated { style::accent() } else { style::muted() }))
+                                                    .child(div().flex_1().min_w_0().truncate().child("This folder"))
+                                                    .when(!isolated, |d| d.child(icons::ui("check", px(12.), style::accent())))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.isolate = false;
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .id("target-branch")
+                                                    .px_2()
+                                                    .py_1()
+                                                    .gap_2()
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .when(isolated, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                                                    .when(!isolated, |d| d.text_color(style::muted()))
+                                                    .hover(|d| d.bg(style::panel_hover()))
+                                                    .tooltip(|window, cx| {
+                                                        Tooltip::new(
+                                                            "Create a separate git worktree and branch (kuaky/…) without touching your current folder",
+                                                        )
+                                                        .build(window, cx)
+                                                    })
+                                                    .child(icons::ui("git-branch", px(13.), if isolated { style::accent() } else { style::muted() }))
+                                                    .child(div().flex_1().min_w_0().truncate().child("New branch (separate copy)"))
+                                                    .when(isolated, |d| d.child(icons::ui("check", px(12.), style::accent())))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.isolate = true;
+                                                        cx.notify();
+                                                    })),
+                                            ),
                                     )
-                                    .build(window, cx)
+                                    .child(div().h(px(1.)).bg(style::border()))
                                 })
                                 .child(
-                                    div()
-                                        .w(px(26.))
-                                        .h(px(14.))
-                                        .p(px(2.))
-                                        .rounded_full()
-                                        .flex()
-                                        .when(on, |d| d.justify_end())
-                                        .bg(if on { style::soft(style::accent(), 0.8) } else { style::soft(style::faint(), 0.6) })
-                                        .child(div().size(px(10.)).rounded_full().bg(style::text())),
-                                )
-                                .child("Aislar en worktree")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.isolate = !this.isolate;
-                                    cx.notify();
-                                })),
+                                    v_flex()
+                                        .gap_0p5()
+                                        .children(harnesses.into_iter().map(|h| {
+                                            h_flex()
+                                                .id(SharedString::from(format!("launch-{}", h.label())))
+                                                .gap_2()
+                                                .px_2()
+                                                .py_1p5()
+                                                .rounded_md()
+                                                .text_sm()
+                                                .cursor_pointer()
+                                                .hover(|d| d.bg(style::panel_hover()))
+                                                .child(harness_badge(h))
+                                                .child(div().flex_1().min_w_0().truncate().child(h.label()))
+                                                .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
+                                        })),
+                                ),
                         )
                     }),
             )
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_h_0()
                     .p_3()
                     .gap_1()
-                    .border_t_1()
-                    .border_color(style::border())
-                    .child(side_title("Sesiones abiertas"))
+                    .child(side_title("Open sessions"))
                     .when(!self.tabs.iter().any(|t| matches!(t.kind, TabKind::Terminal { .. } | TabKind::Chat { .. })), |d| {
-                        d.child(div().px_2().text_xs().text_color(style::faint()).child("Ninguna todavía"))
+                        d.child(div().px_2().text_xs().text_color(style::faint()).child("No open sessions"))
                     })
-                    .children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-                        let (harness, title, status, color, worktree): (Harness, SharedString, &str, Hsla, Option<String>) = match &tab.kind {
-                            TabKind::Terminal { view, harness, worktree, .. } => {
-                                let t = view.read(cx);
-                                let (status, color) = terminal_status(t, now);
-                                (*harness, t.title.clone().unwrap_or_else(|| t.label.clone()), status, color, worktree.clone())
-                            }
-                            TabKind::Chat { view, harness } => {
-                                let (status, color) = chat_status(view.read(cx));
-                                (*harness, format!("{} · chat", harness.label()).into(), status, color, None)
-                            }
-                            _ => return None,
-                        };
-                        let selected = self.active == Some(i);
-                        Some(
-                            h_flex()
-                                .id(("session", tab.id))
-                                .gap_2()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .when(selected, |d| d.bg(style::panel_hover()))
-                                .hover(|d| d.bg(style::panel_hover()))
-                                .child(harness_badge(harness))
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .child(div().text_sm().truncate().child(title))
+                    .child(
+                        div().id("open-sessions").flex_1().overflow_y_scroll().child(
+                            v_flex().gap_1().children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
+                                let (harness, title, status, color, worktree): (Harness, SharedString, &str, Hsla, Option<String>) =
+                                    match &tab.kind {
+                                        TabKind::Terminal { view, harness, worktree, .. } => {
+                                            let t = view.read(cx);
+                                            let (status, color) = terminal_status(t, now);
+                                            (*harness, t.title.clone().unwrap_or_else(|| t.label.clone()), status, color, worktree.clone())
+                                        }
+                                        TabKind::Chat { view, harness } => {
+                                            let (status, color) = chat_status(view.read(cx));
+                                            (*harness, format!("{} · chat", harness.label()).into(), status, color, None)
+                                        }
+                                        _ => return None,
+                                    };
+                                let selected = self.active == Some(i);
+                                Some(
+                                    h_flex()
+                                        .id(("session", tab.id))
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .when(selected, |d| d.bg(style::panel_hover()))
+                                        .hover(|d| d.bg(style::panel_hover()))
+                                        .child(harness_badge(harness))
                                         .child(
-                                            h_flex()
-                                                .gap_1()
+                                            v_flex()
+                                                .flex_1()
                                                 .min_w_0()
-                                                .text_xs()
-                                                .text_color(style::muted())
-                                                .child(div().size(px(6.)).flex_none().rounded_full().bg(color))
-                                                .child(div().flex_1().min_w_0().truncate().child(status)),
+                                                .child(div().text_sm().truncate().child(title))
+                                                .child(
+                                                    h_flex()
+                                                        .gap_1()
+                                                        .min_w_0()
+                                                        .text_xs()
+                                                        .text_color(style::muted())
+                                                        .child(div().size(px(6.)).flex_none().rounded_full().bg(color))
+                                                        .child(div().flex_1().min_w_0().truncate().child(status)),
+                                                )
+                                                .when_some(worktree, |d, w| {
+                                                    d.child(
+                                                        h_flex()
+                                                            .gap_1()
+                                                            .min_w_0()
+                                                            .text_xs()
+                                                            .text_color(style::faint())
+                                                            .child(icons::ui("git-branch", px(11.), style::faint()))
+                                                            .child(div().flex_1().min_w_0().truncate().child(w)),
+                                                    )
+                                                }),
                                         )
-                                        .when_some(worktree, |d, w| {
-                                            d.child(div().text_xs().text_color(style::faint()).truncate().child(format!("⑂ {w}")))
-                                        }),
+                                        .child(
+                                            div()
+                                                .id(("session-close", tab.id))
+                                                .flex_none()
+                                                .p_0p5()
+                                                .rounded_sm()
+                                                .hover(|d| d.bg(style::bg()))
+                                                .child(icons::ui("x", px(12.), style::faint()))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.close_tab(i, window, cx);
+                                                })),
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| this.activate(i, window, cx))),
                                 )
-                                .on_click(cx.listener(move |this, _, window, cx| this.activate(i, window, cx))),
-                        )
-                    })),
+                            })),
+                        ),
+                    ),
             )
             .when(!self.previous.is_empty(), |d| {
+                let expanded = self.previous_expanded;
                 d.child(
                     v_flex()
                         .p_3()
@@ -1033,10 +1211,32 @@ impl ProjectView {
                         .border_color(style::border())
                         .child(
                             h_flex()
-                                .gap_2()
+                                .id("toggle-previous")
+                                .gap_1p5()
                                 .items_center()
                                 .justify_between()
-                                .child(div().flex_1().min_w_0().truncate().child(side_title("Sesiones anteriores")))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.previous_expanded = !this.previous_expanded;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(icons::ui(if expanded { "chevron-down" } else { "chevron-right" }, px(12.), style::muted()))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(style::muted())
+                                                .child(format!("PREVIOUS ({})", self.previous.len())),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .id("forget-previous")
@@ -1046,81 +1246,45 @@ impl ProjectView {
                                         .cursor_pointer()
                                         .text_color(style::faint())
                                         .hover(|d| d.text_color(style::text()))
-                                        .child("olvidar")
+                                        .child("Clear")
                                         .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
                                             this.previous.clear();
                                             this.persist(cx);
                                             cx.notify();
                                         })),
                                 ),
                         )
-                        .children(self.previous.iter().enumerate().filter_map(|(i, p)| {
-                            let h = Harness::from_key(&p.harness)?;
-                            let detail = p.worktree.clone().map(|w| format!("⑂ {w}")).unwrap_or_else(|| {
-                                if h.resume_args().is_empty() { "abrir de nuevo".into() } else { "retomar conversación".into() }
-                            });
-                            Some(
-                                h_flex()
-                                    .id(("previous", i))
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(style::panel_hover()))
-                                    .child(harness_badge(h))
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(div().text_sm().truncate().child(h.label()))
-                                            .child(div().text_xs().truncate().text_color(style::faint()).child(detail)),
-                                    )
-                                    .child(div().flex_none().text_xs().text_color(style::accent()).child("reanudar"))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.resume(i, window, cx))),
-                            )
-                        })),
+                        .when(expanded, |d| {
+                            d.children(self.previous.iter().enumerate().filter_map(|(i, p)| {
+                                let h = Harness::from_key(&p.harness)?;
+                                let detail = p.worktree.clone().unwrap_or_else(|| {
+                                    if h.resume_args().is_empty() { "reopen".into() } else { "resume conversation".into() }
+                                });
+                                Some(
+                                    h_flex()
+                                        .id(("previous", i))
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(style::panel_hover()))
+                                        .child(harness_badge(h))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(div().text_sm().truncate().child(h.label()))
+                                                .child(div().text_xs().truncate().text_color(style::faint()).child(detail)),
+                                        )
+                                        .child(div().flex_none().text_xs().text_color(style::accent()).child("Resume"))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.resume(i, window, cx))),
+                                )
+                            }))
+                        }),
                 )
             })
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .p_3()
-                    .gap_1()
-                    .border_t_1()
-                    .border_color(style::border())
-                    .child(side_title("Actividad en este proyecto"))
-                    .when(self.activity.is_empty(), |d| {
-                        d.child(div().px_2().text_xs().text_color(style::faint()).child("Sin sesiones registradas"))
-                    })
-                    .child(
-                        div().id("activity").flex_1().overflow_y_scroll().child(v_flex().gap_1().children(
-                            self.activity.iter().take(30).map(|a| {
-                                h_flex()
-                                    .gap_2()
-                                    .px_2()
-                                    .py_1()
-                                    .child(crate::icons::logo(crate::icons::agent(a.agent), px(18.)))
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(div().text_xs().truncate().child(format!(
-                                                "{} · {}",
-                                                style::model_name(&a.model),
-                                                ago(a.last)
-                                            )))
-                                            .child(div().text_xs().text_color(style::faint()).child(format!(
-                                                "{} resp · {} tokens",
-                                                a.turns,
-                                                human(a.tokens)
-                                            ))),
-                                    )
-                            }),
-                        )),
-                    ),
-            )
     }
 
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1135,23 +1299,22 @@ impl ProjectView {
             .bg(style::panel())
             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = self.active == Some(i);
-                let text_icon = |glyph: &'static str, color: Hsla| div().text_xs().text_color(color).child(glyph).into_any_element();
                 let (icon, status, title, dirty): (AnyElement, Option<Hsla>, SharedString, bool) = match &tab.kind {
                     TabKind::Terminal { view, harness, .. } => {
                         let t = view.read(cx);
                         let (_, dot) = terminal_status(t, now);
-                        let icon = match harness.agent() {
-                            Some(_) => harness_badge(*harness),
-                            None => text_icon(harness.glyph(), style::muted().into()),
-                        };
-                        (icon, Some(dot), t.title.clone().unwrap_or_else(|| t.label.clone()), false)
+                        (harness_badge(*harness), Some(dot), t.title.clone().unwrap_or_else(|| t.label.clone()), false)
                     }
                     TabKind::File(f) => {
                         let f = f.read(cx);
-                        (text_icon("◇", style::muted().into()), None, f.title().into(), f.dirty)
+                        (icons::ui("file", px(14.), style::muted()).into_any_element(), None, f.title().into(), f.dirty)
                     }
-                    TabKind::Diff(d) => (text_icon("±", style::accent().into()), None, d.read(cx).title.clone(), false),
-                    TabKind::Search(_) => (text_icon("⌕", style::accent().into()), None, "Buscar".into(), false),
+                    TabKind::Diff(d) => {
+                        (icons::ui("git-compare", px(14.), style::accent()).into_any_element(), None, d.read(cx).title.clone(), false)
+                    }
+                    TabKind::Search(_) => {
+                        (icons::ui("search", px(14.), style::accent()).into_any_element(), None, "Search".into(), false)
+                    }
                     TabKind::Chat { view, harness } => {
                         let (_, dot) = chat_status(view.read(cx));
                         (harness_badge(*harness), Some(dot), format!("{} · chat", harness.label()).into(), false)
@@ -1177,12 +1340,11 @@ impl ProjectView {
                     .child(
                         div()
                             .id(("close", tab.id))
-                            .px_1()
+                            .flex_none()
+                            .p_0p5()
                             .rounded_sm()
-                            .text_xs()
-                            .text_color(style::faint())
-                            .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
-                            .child("✕")
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .child(icons::ui("x", px(12.), style::faint()))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(i, window, cx);
@@ -1212,8 +1374,12 @@ impl ProjectView {
 
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut launchers: Vec<Harness> = Harness::AGENTS.into_iter().filter(|h| self.installed.contains_key(h)).collect();
-        launchers.push(Harness::Shell);
+        let launchers = self.available_harnesses(cx);
+        let shortcuts = if cfg!(target_os = "macos") {
+            "⌘T new terminal · ⌘P quick open · ⌘⇧F search · ⌘W close tab · ⌘, settings"
+        } else {
+            "Ctrl+Shift+T new terminal · Ctrl+P quick open · Ctrl+Shift+F search · Ctrl+, settings"
+        };
         v_flex()
             .size_full()
             .items_center()
@@ -1221,10 +1387,10 @@ impl ProjectView {
             .gap_4()
             .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child(name))
             .child(div().text_sm().text_color(style::muted()).child(match &self.git.branch {
-                Some(b) => format!("{} · rama {b}", tilde(&self.root)),
+                Some(b) => format!("{} · branch {b}", tilde(&self.root)),
                 None => tilde(&self.root),
             }))
-            .child(h_flex().gap_2().mt_2().children(launchers.into_iter().map(|h| {
+            .child(h_flex().gap_2().mt_2().flex_wrap().justify_center().children(launchers.into_iter().map(|h| {
                 h_flex()
                     .id(SharedString::from(format!("empty-{}", h.label())))
                     .gap_2()
@@ -1241,7 +1407,7 @@ impl ProjectView {
                     .child(h.label())
                     .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
             })))
-            .child(div().text_xs().text_color(style::faint()).child("⌘T nueva terminal · ⌘W cerrar pestaña · ⌘O abrir carpeta"))
+            .child(div().text_xs().text_color(style::faint()).child(shortcuts))
     }
 
     fn right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1250,63 +1416,312 @@ impl ProjectView {
             (SidePanel::Branches, self.git.branches.len()),
             (SidePanel::Prs, self.git.prs.as_ref().and_then(|p| p.as_ref().ok()).map_or(0, |p| p.len())),
         ]);
+
+        let top_toolbar = h_flex()
+            .px_2()
+            .py_1p5()
+            .gap_1()
+            .border_b_1()
+            .border_color(style::border())
+            .children(SidePanel::ALL.into_iter().map(|p| {
+                let selected = self.panel == Some(p);
+                let count = counts.get(&p).copied().unwrap_or(0);
+                let tip: SharedString = p.label().into();
+                h_flex()
+                    .id(SharedString::from(format!("panel-{}", p.label())))
+                    .flex_1()
+                    .justify_center()
+                    .items_center()
+                    .gap_1()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(style::panel_hover()))
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .child(icons::ui(p.icon(), px(15.), if selected { style::accent() } else { style::muted() }))
+                    .when(count > 0 && p != SidePanel::Files && p != SidePanel::Graph, |d| {
+                        d.child(div().text_color(style::accent()).child(count.to_string()))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(p, cx)))
+            }));
+
+        let top_content = self.panel.map(|p| {
+            v_flex()
+                .size_full()
+                .when_some(self.git.branch.clone(), |d, b| {
+                    d.child(
+                        h_flex()
+                            .px_3()
+                            .py_1p5()
+                            .gap_1p5()
+                            .items_center()
+                            .text_xs()
+                            .border_b_1()
+                            .border_color(style::border())
+                            .child(icons::ui("git-branch", px(12.), style::muted()))
+                            .child(div().text_color(style::accent()).truncate().child(b)),
+                    )
+                })
+                .child(div().flex_1().min_h_0().child(match p {
+                    SidePanel::Files => self.tree.clone().into_any_element(),
+                    SidePanel::Changes => self.changes_panel(cx).into_any_element(),
+                    SidePanel::Branches => self.branches_panel(cx).into_any_element(),
+                    SidePanel::Prs => self.prs_panel(cx).into_any_element(),
+                    SidePanel::Graph => self.graph_panel(cx).into_any_element(),
+                }))
+        });
+
+        let has_terms = !self.right_terminals.is_empty();
+        let bottom_height = state::get(cx).right_bottom_height.unwrap_or(240.).clamp(120., 600.);
+
         v_flex()
             .size_full()
             .border_l_1()
             .border_color(style::border())
             .bg(style::panel())
+            .child(top_toolbar)
+            .child(div().flex_1().min_h_0().map(|d| match (top_content, has_terms) {
+                (Some(top), true) => d.child(
+                    v_resizable("right-split")
+                        .with_state(&self.right_split)
+                        .child(resizable_panel().child(top))
+                        .child(
+                            resizable_panel()
+                                .size(px(bottom_height))
+                                .size_range(px(120.)..px(600.))
+                                .child(self.right_terminal_zone(cx)),
+                        ),
+                ),
+                (Some(top), false) => d.child(v_flex().size_full().child(div().flex_1().min_h_0().child(top)).child(self.right_terminal_bar(cx))),
+                (None, true) => d.child(self.right_terminal_zone(cx)),
+                (None, false) => d.child(
+                    v_flex()
+                        .size_full()
+                        .justify_between()
+                        .child(div().p_3().text_xs().text_color(style::faint()).child("Click an icon above to open a section."))
+                        .child(self.right_terminal_bar(cx)),
+                ),
+            }))
+    }
+
+    fn right_terminal_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .h(px(32.))
+            .flex_none()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_t_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .child(icons::ui("terminal", px(13.), style::muted()))
             .child(
                 h_flex()
-                    .p_2()
+                    .id("right-term-tabs")
+                    .flex_1()
+                    .min_w_0()
                     .gap_1()
-                    .border_b_1()
-                    .border_color(style::border())
-                    .children(SidePanel::ALL.into_iter().map(|p| {
-                        let selected = p == self.panel;
-                        let count = counts.get(&p).copied().unwrap_or(0);
+                    .overflow_x_scroll()
+                    .when(self.right_terminals.is_empty(), |d| {
+                        d.child(div().text_xs().text_color(style::muted()).child("Terminals"))
+                    })
+                    .children(self.right_terminals.iter().enumerate().map(|(i, rt)| {
+                        let active = self.active_right_terminal == Some(i);
+                        let label = rt.view.read(cx).title.clone().unwrap_or_else(|| rt.view.read(cx).label.clone());
                         h_flex()
-                            .id(SharedString::from(format!("panel-{}", p.label())))
-                            .flex_1()
-                            .justify_center()
+                            .id(("rterm", rt.id))
+                            .px_1p5()
+                            .py_0p5()
                             .gap_1()
-                            .py_1()
-                            .rounded_md()
+                            .rounded_sm()
                             .text_xs()
                             .cursor_pointer()
-                            .text_color(if selected { style::text() } else { style::muted() })
-                            .when(selected, |d| d.bg(style::panel_hover()))
+                            .when(active, |d| d.bg(style::bg()).text_color(style::text()))
+                            .when(!active, |d| d.text_color(style::muted()))
                             .hover(|d| d.text_color(style::text()))
-                            .child(p.label())
-                            .when(count > 0 && p != SidePanel::Files, |d| {
-                                d.child(div().text_color(style::accent()).child(count.to_string()))
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_panel(p, cx)))
+                            .child(div().max_w(px(90.)).truncate().child(label))
+                            .child(
+                                div()
+                                    .id(("rterm-close", rt.id))
+                                    .flex_none()
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .child(icons::ui("x", px(11.), style::faint()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_right_terminal(i, cx);
+                                    })),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.active_right_terminal = Some(i);
+                                if let Some(rt) = this.right_terminals.get(i) {
+                                    let h = rt.view.read(cx).focus_handle(cx);
+                                    window.focus(&h, cx);
+                                }
+                                cx.notify();
+                            }))
                     })),
             )
+            .child(
+                div()
+                    .id("right-term-new")
+                    .flex_none()
+                    .p_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(|window, cx| Tooltip::new("New terminal in side panel").build(window, cx))
+                    .child(icons::ui("plus", px(13.), style::muted()))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_right_terminal(window, cx))),
+            )
+    }
+
+    fn right_terminal_zone(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_view = self.active_right_terminal.and_then(|i| self.right_terminals.get(i)).map(|rt| rt.view.clone());
+        v_flex()
+            .size_full()
+            .bg(style::bg())
+            .child(self.right_terminal_bar(cx))
+            .when_some(active_view, |d, view| d.child(div().flex_1().min_h_0().child(view)))
+    }
+
+    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let latest = self.activity.first();
+        let total_turns: u64 = self.activity.iter().map(|a| a.turns).sum();
+        let total_tokens: u64 = self.activity.iter().map(|a| a.tokens).sum();
+
+        h_flex()
+            .h(px(26.))
+            .flex_none()
+            .px_3()
+            .gap_3()
+            .items_center()
+            .text_xs()
+            .border_t_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .text_color(style::muted())
             .when_some(self.git.branch.clone(), |d, b| {
                 d.child(
                     h_flex()
-                        .px_3()
-                        .py_2()
-                        .gap_2()
-                        .text_xs()
-                        .border_b_1()
-                        .border_color(style::border())
-                        .child(div().text_color(style::muted()).child("rama"))
-                        .child(div().text_color(style::accent()).truncate().child(b)),
+                        .gap_1()
+                        .items_center()
+                        .child(icons::ui("git-branch", px(12.), style::accent()))
+                        .child(div().text_color(style::text()).child(b)),
                 )
             })
-            .child(div().flex_1().min_h_0().child(match self.panel {
-                SidePanel::Files => self.tree.clone().into_any_element(),
-                SidePanel::Changes => self.changes_panel(cx).into_any_element(),
-                SidePanel::Branches => self.branches_panel(cx).into_any_element(),
-                SidePanel::Prs => self.prs_panel(cx).into_any_element(),
+            .when_some(latest, |d, row| {
+                let summary = format!(
+                    "{} · {} resp · {} tok · {}",
+                    style::model_name(&row.model),
+                    total_turns,
+                    human(total_tokens),
+                    ago(row.last),
+                );
+                d.child(
+                    h_flex()
+                        .id("status-activity")
+                        .gap_1p5()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(self.activity_open, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                        .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                        .tooltip(|window, cx| Tooltip::new("Click to view project agent activity").build(window, cx))
+                        .child(icons::logo(icons::agent(row.agent), px(13.)))
+                        .child(summary)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.activity_open = !this.activity_open;
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(div().flex_1())
+            .child(div().text_color(style::faint()).child(if self.tabs.is_empty() {
+                String::new()
+            } else if self.tabs.len() == 1 {
+                "1 tab".into()
+            } else {
+                format!("{} tabs", self.tabs.len())
             }))
+    }
+
+    fn activity_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .id("activity-popover")
+            .w(px(340.))
+            .max_h(px(360.))
+            .rounded_xl()
+            .border_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .shadow_lg()
+            .overflow_hidden()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .justify_between()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(style::border())
+                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child("Project Activity"))
+                    .child(
+                        div()
+                            .id("activity-close")
+                            .p_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .child(icons::ui("x", px(12.), style::muted()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.activity_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div().id("activity-list").flex_1().overflow_y_scroll().child(
+                    v_flex()
+                        .p_2()
+                        .gap_1()
+                        .when(self.activity.is_empty(), |d| {
+                            d.child(div().p_2().text_xs().text_color(style::faint()).child("No recorded sessions"))
+                        })
+                        .children(self.activity.iter().take(30).map(|a| {
+                            h_flex()
+                                .gap_2()
+                                .px_2()
+                                .py_1p5()
+                                .rounded_md()
+                                .hover(|d| d.bg(style::panel_hover()))
+                                .child(icons::logo(icons::agent(a.agent), px(18.)))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(div().text_xs().truncate().child(format!(
+                                            "{} · {}",
+                                            style::model_name(&a.model),
+                                            ago(a.last)
+                                        )))
+                                        .child(div().text_xs().text_color(style::faint()).child(format!(
+                                            "{} resp · {} tokens",
+                                            a.turns,
+                                            human(a.tokens)
+                                        ))),
+                                )
+                        })),
+                ),
+            )
     }
 
     fn changes_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.repo.is_none() {
-            return panel_message("Esta carpeta no es un repositorio git.").into_any_element();
+            return panel_message("This folder is not a git repository.").into_any_element();
         }
         div()
             .id("changes")
@@ -1316,15 +1731,15 @@ impl ProjectView {
                 v_flex()
                     .p_2()
                     .gap_0p5()
-                    .when(self.git.changes.is_empty(), |d| d.child(panel_message("Sin cambios locales.")))
+                    .when(self.git.changes.is_empty(), |d| d.child(panel_message("No local changes.")))
                     .when(!self.git.changes.is_empty(), |d| {
                         d.child(
-                            panel_button("Ver todos los cambios").on_click(cx.listener(|this, _, window, cx| {
+                            panel_button("View all changes").on_click(cx.listener(|this, _, window, cx| {
                                 let Some(repo) = this.repo.clone() else { return };
                                 let branch = this.git.branch.clone().unwrap_or_default();
                                 this.open_diff(
-                                    "Cambios locales".into(),
-                                    format!("{branch} · sin commit"),
+                                    "Local changes".into(),
+                                    format!("{branch} · uncommitted"),
                                     move || repo.diff_worktree(),
                                     window,
                                     cx,
@@ -1361,7 +1776,7 @@ impl ProjectView {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let Some(repo) = this.repo.clone() else { return };
                                 let ch = change.clone();
-                                this.open_diff(ch.path.clone(), "cambio local".into(), move || repo.diff_change(&ch), window, cx);
+                                this.open_diff(ch.path.clone(), "local change".into(), move || repo.diff_change(&ch), window, cx);
                             }))
                     })),
             )
@@ -1370,7 +1785,7 @@ impl ProjectView {
 
     fn branches_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.repo.is_none() {
-            return panel_message("Esta carpeta no es un repositorio git.").into_any_element();
+            return panel_message("This folder is not a git repository.").into_any_element();
         }
         let base = self.git.default_branch.clone();
         let worktrees = self.worktree_section(cx);
@@ -1384,7 +1799,7 @@ impl ProjectView {
                     .gap_0p5()
                     .children(worktrees)
                     .when_some(base.clone(), |d, b| {
-                        d.child(div().px_2().pb_1().text_xs().text_color(style::faint()).child(format!("clic: diff contra {b}")))
+                        d.child(div().px_2().pb_1().text_xs().text_color(style::faint()).child(format!("click: diff against {b}")))
                     })
                     .children(self.git.branches.iter().enumerate().map(|(i, b)| {
                         let name = b.name.clone();
@@ -1428,12 +1843,13 @@ impl ProjectView {
                                 d.child(
                                     div()
                                         .id(("checkout", i))
+                                        .flex_none()
                                         .px_1p5()
                                         .rounded_sm()
                                         .text_xs()
                                         .text_color(style::muted())
                                         .hover(|d| d.bg(style::bg()).text_color(style::text()))
-                                        .child("cambiar")
+                                        .child("switch")
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.checkout(checkout_name.clone(), cx);
@@ -1448,7 +1864,7 @@ impl ProjectView {
                                 let h2 = head.clone();
                                 this.open_diff(
                                     format!("{head} vs {base}"),
-                                    format!("lo que {head} agrega sobre {base}"),
+                                    format!("changes in {head} relative to {base}"),
                                     move || repo.diff_refs(&b2, &h2),
                                     window,
                                     cx,
@@ -1461,20 +1877,20 @@ impl ProjectView {
 
     fn prs_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.repo.is_none() {
-            return panel_message("Esta carpeta no es un repositorio git.").into_any_element();
+            return panel_message("This folder is not a git repository.").into_any_element();
         }
         let body = match &self.git.prs {
-            None => panel_message("Cargando PRs…").into_any_element(),
+            None => panel_message("Loading PRs…").into_any_element(),
             Some(Err(e)) => panel_message(e.clone()).into_any_element(),
-            Some(Ok(prs)) if prs.is_empty() => panel_message("No hay PRs abiertos.").into_any_element(),
+            Some(Ok(prs)) if prs.is_empty() => panel_message("No open PRs.").into_any_element(),
             Some(Ok(prs)) => v_flex()
                 .gap_0p5()
                 .children(prs.iter().map(|pr| {
                     let number = pr.number;
                     let title = pr.title.clone();
                     let review = match pr.review_decision.as_deref() {
-                        Some("APPROVED") => Some(("aprobado", style::good())),
-                        Some("CHANGES_REQUESTED") => Some(("cambios pedidos", style::bad())),
+                        Some("APPROVED") => Some(("approved", style::good())),
+                        Some("CHANGES_REQUESTED") => Some(("changes requested", style::bad())),
                         _ => None,
                     };
                     v_flex()
@@ -1500,7 +1916,7 @@ impl ProjectView {
                                 .child(format!("{} → {}", pr.head_ref_name, pr.base_ref_name))
                                 .child(div().text_color(style::good()).child(format!("+{}", pr.additions)))
                                 .child(div().text_color(style::bad()).child(format!("−{}", pr.deletions)))
-                                .when(pr.is_draft, |d| d.child("borrador"))
+                                .when(pr.is_draft, |d| d.child("draft"))
                                 .when_some(review, |d, (t, c)| d.child(div().text_color(c).child(t))),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -1518,7 +1934,7 @@ impl ProjectView {
                 v_flex()
                     .p_2()
                     .gap_1()
-                    .child(panel_button(if self.git.prs_loading { "Actualizando…" } else { "Actualizar" }).on_click(
+                    .child(panel_button(if self.git.prs_loading { "Refreshing…" } else { "Refresh" }).on_click(
                         cx.listener(|this, _, _, cx| {
                             this.load_prs(cx);
                             cx.notify();
@@ -1528,11 +1944,18 @@ impl ProjectView {
             )
             .into_any_element()
     }
+
+    fn graph_panel(&self, _: &mut Context<Self>) -> impl IntoElement {
+        if self.repo.is_none() {
+            return panel_message("This folder is not a git repository.").into_any_element();
+        }
+        panel_message("Git commit graph ready for Part E.").into_any_element()
+    }
 }
 
 impl Render for ProjectView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        v_flex()
             .key_context("Project")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &NewTerminal, window, cx| this.open_terminal(Harness::Shell, window, cx)))
@@ -1558,14 +1981,36 @@ impl Render for ProjectView {
             .size_full()
             .relative()
             .bg(style::bg())
-            .child({
-                let saved = state::get(cx);
-                let (left, right) = (saved.left_width.unwrap_or(248.).max(220.), saved.right_width.unwrap_or(300.));
-                h_resizable("project-layout")
-                    .with_state(&self.layout)
-                    .child(resizable_panel().size(px(left)).size_range(px(220.)..px(420.)).child(self.left_sidebar(cx)))
-                    .child(resizable_panel().child(self.center(cx)))
-                    .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx)))
+            .child(
+                div().flex_1().min_h_0().child({
+                    let saved = state::get(cx);
+                    let (left, right) = (saved.left_width.unwrap_or(248.).max(220.), saved.right_width.unwrap_or(300.));
+                    h_resizable("project-layout")
+                        .with_state(&self.layout)
+                        .child(resizable_panel().size(px(left)).size_range(px(220.)..px(420.)).child(self.left_sidebar(cx)))
+                        .child(resizable_panel().child(self.center(cx)))
+                        .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx)))
+                }),
+            )
+            .child(self.status_bar(cx))
+            .when(self.activity_open, |d| {
+                d.child(
+                    div()
+                        .id("activity-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.activity_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom(px(34.))
+                                .left(px(12.))
+                                .child(self.activity_popover(cx)),
+                        ),
+                )
             })
             .when_some(self.quick_open.clone(), |d, qo| {
                 d.child(
@@ -1587,7 +2032,7 @@ impl Render for ProjectView {
     }
 }
 
-// ── piezas ───────────────────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────
 
 fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
     if !t.exited {
@@ -1602,28 +2047,28 @@ fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
         }
     }
     if t.exited {
-        ("terminó", style::faint().into())
+        ("exited", style::faint().into())
     } else if t.last_output.is_some_and(|o| now.duration_since(o) < Duration::from_secs(2)) {
-        ("trabajando", style::accent().into())
+        ("working", style::accent().into())
     } else {
-        ("en espera", style::good().into())
+        ("idle", style::good().into())
     }
 }
 
 fn chat_status(c: &ChatView) -> (&'static str, Hsla) {
     if c.is_waiting_permission() {
-        return ("necesita tu permiso", style::bad().into());
+        return ("needs permission", style::bad().into());
     }
     match &c.status {
-        ChatStatus::Connecting => ("conectando", style::faint().into()),
-        ChatStatus::Ready => ("tu turno", style::good().into()),
-        ChatStatus::Running => ("trabajando", style::accent().into()),
+        ChatStatus::Connecting => ("connecting", style::faint().into()),
+        ChatStatus::Ready => ("your turn", style::good().into()),
+        ChatStatus::Running => ("working", style::accent().into()),
         ChatStatus::Error(_) => ("error", style::bad().into()),
-        ChatStatus::Exited => ("terminó", style::faint().into()),
+        ChatStatus::Exited => ("exited", style::faint().into()),
     }
 }
 
-/// Notificación del sistema (macOS) en segundo plano.
+/// Background macOS system notification.
 fn system_notification(title: &str, message: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -1641,27 +2086,21 @@ fn side_title(text: &'static str) -> impl IntoElement {
     div().px_2().pb_1().text_xs().text_color(style::muted()).child(text.to_uppercase())
 }
 
-/// Logo del agente; la terminal simple usa el símbolo `›`.
+/// Agent logo, or Lucide terminal icon for plain shell.
 fn harness_badge(h: Harness) -> AnyElement {
     match h.agent() {
-        Some(agent) => crate::icons::logo(crate::icons::agent(agent), px(18.)).into_any_element(),
-        None => glyph_badge(h.glyph(), h.color()).into_any_element(),
+        Some(agent) => icons::logo(icons::agent(agent), px(18.)).into_any_element(),
+        None => div()
+            .size(px(18.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .bg(style::soft(style::muted(), 0.16))
+            .child(icons::ui("terminal", px(12.), style::muted()))
+            .into_any_element(),
     }
-}
-
-fn glyph_badge(glyph: &'static str, color: Rgba) -> impl IntoElement {
-    div()
-        .size(px(18.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .bg(style::soft(color, 0.18))
-        .text_color(color)
-        .text_xs()
-        .font_weight(FontWeight::BOLD)
-        .child(glyph)
 }
 
 fn panel_message(text: impl Into<SharedString>) -> impl IntoElement {
@@ -1699,15 +2138,14 @@ fn ago(ts: jiff::Timestamp) -> String {
 fn ago_unix(secs: i64) -> String {
     let now = jiff::Timestamp::now().as_second();
     match (now - secs).max(0) {
-        s if s < 60 => "ahora".into(),
-        s if s < 3600 => format!("hace {} min", s / 60),
-        s if s < 86_400 => format!("hace {} h", s / 3600),
-        s => format!("hace {} d", s / 86_400),
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86_400),
     }
 }
 
-/// Sesiones de agentes cuya carpeta está dentro de `root`, de la más reciente a
-/// la más antigua.
+/// Agent sessions whose working directory is inside `root`, newest first.
 fn activity_for(root: &Path, events: &[UsageEvent]) -> Vec<ActivityRow> {
     let mut by_session: HashMap<(Agent, Arc<str>), ActivityRow> = HashMap::new();
     for e in events {

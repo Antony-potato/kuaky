@@ -111,12 +111,12 @@ impl HomeView {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let subtitle = match (self.report.start, self.report.end) {
-            (Some(s), Some(_)) => format!("{} – hoy", short_date(s)),
-            _ => "Leyendo logs locales…".to_string(),
+            (Some(s), Some(_)) => format!("{} – today", short_date(s)),
+            _ => "Reading local logs…".to_string(),
         };
         let title = match self.agent {
-            Some(a) => format!("Consumo · {}", a.name()),
-            None => "Consumo de agentes".to_string(),
+            Some(a) => format!("Usage · {}", a.name()),
+            None => "Agent usage".to_string(),
         };
         h_flex()
             .justify_between()
@@ -165,7 +165,7 @@ impl HomeView {
                             .bg(style::accent())
                             .text_color(style::bg())
                             .font_weight(FontWeight::MEDIUM)
-                            .child("Abrir carpeta")
+                            .child("Open folder")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::PickFolder))),
                     ),
             )
@@ -176,38 +176,38 @@ impl HomeView {
         let k = r.kpis;
         let series = |f: fn(&kuaky_usage::report::DayStat) -> u64| r.days.iter().map(f).collect::<Vec<_>>();
         let parallel = if k.max_parallel > 1 {
-            format!("hasta {} a la vez", k.max_parallel)
+            format!("up to {} in parallel", k.max_parallel)
         } else {
-            "una sesión a la vez".into()
+            "one session at a time".into()
         };
         h_flex()
             .gap_4()
             .child(kpi_card(
-                "Tokens de entrada",
+                "Input tokens",
                 human(k.input_total),
-                format!("{:.0}% desde caché", k.cache_pct()),
+                format!("{:.0}% from cache", k.cache_pct()),
                 r.delta(|k| k.input_total),
                 series(|d| d.input_total),
                 style::accent(),
             ))
             .child(kpi_card(
-                "Tokens de salida",
+                "Output tokens",
                 human(k.output),
-                format!("{} por respuesta", human(k.output_per_turn())),
+                format!("{} per response", human(k.output_per_turn())),
                 r.delta(|k| k.output),
                 series(|d| d.output),
                 style::output(),
             ))
             .child(kpi_card(
-                "Sesiones",
+                "Sessions",
                 thousands(k.sessions),
-                format!("{} respuestas", thousands(k.turns)),
+                format!("{} responses", thousands(k.turns)),
                 r.delta(|k| k.sessions),
                 series(|d| d.sessions),
                 style::accent(),
             ))
             .child(kpi_card(
-                "Tiempo de agentes",
+                "Agent time",
                 style::duration(k.agent_secs),
                 parallel,
                 r.delta(|k| k.agent_secs),
@@ -215,12 +215,12 @@ impl HomeView {
                 style::accent(),
             ))
             .child(kpi_card(
-                "Costo en API",
+                "API cost",
                 style::money(k.cost),
                 if k.unpriced > 0 {
-                    format!("{} respuestas sin precio", thousands(k.unpriced))
+                    format!("{} unpriced responses", thousands(k.unpriced))
                 } else {
-                    "equivalente a precios de API".into()
+                    "API-equivalent pricing".into()
                 },
                 r.cost_delta(),
                 r.days.iter().map(|d| (d.cost * 100.0) as u64).collect(),
@@ -235,13 +235,13 @@ impl HomeView {
         let max_out = days.iter().map(|d| d.output).max().unwrap_or(0).max(1);
         let total: u64 = days.iter().map(|d| d.input_total + d.output).sum();
         let per_day = if r.active_days > 0 { total / r.active_days as u64 } else { 0 };
-        let right = format!("{} de {} días con agentes · {}/día", r.active_days, days.len(), human(per_day));
+        let right = format!("{} of {} active days · {}/day", r.active_days, days.len(), human(per_day));
         let first = days.first().and_then(|d| d.date).map(short_date).unwrap_or_default();
         let middle = days.get(days.len() / 2).and_then(|d| d.date).map(short_date).unwrap_or_default();
         let gap = if days.len() > 60 { px(1.) } else { px(3.) };
 
         section(
-            "Tokens por día",
+            "Tokens per day",
             Some(right),
             h_flex()
                 .gap_4()
@@ -250,8 +250,8 @@ impl HomeView {
                         .w(px(64.))
                         .h(px(196.))
                         .justify_between()
-                        .child(axis_label(human(max_in), "entrada", style::accent()))
-                        .child(axis_label(human(max_out), "salida", style::output())),
+                        .child(axis_label(human(max_in), "input", style::accent()))
+                        .child(axis_label(human(max_out), "output", style::output())),
                 )
                 .child(
                     v_flex()
@@ -263,7 +263,7 @@ impl HomeView {
                                 .gap(gap)
                                 .children(days.iter().enumerate().map(|(i, d)| {
                                     let tip = format!(
-                                        "{} · entrada {} · salida {} · {}",
+                                        "{} · in {} · out {} · {}",
                                         d.date.map(short_date).unwrap_or_default(),
                                         human(d.input_total),
                                         human(d.output),
@@ -302,23 +302,23 @@ impl HomeView {
                                 .text_color(style::muted())
                                 .child(first)
                                 .child(middle)
-                                .child("hoy"),
+                                .child("today"),
                         ),
                 ),
         )
     }
 
     fn heatmap(&self) -> impl IntoElement {
-        const DAYS: [&str; 7] = ["L", "M", "M", "J", "V", "S", "D"];
-        const DAY_NAMES: [&str; 7] = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"];
+        const DAYS: [&str; 7] = ["M", "T", "W", "T", "F", "S", "S"];
+        const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
         let r = &self.report;
         let max = r.heatmap_max().max(1) as f32;
         let right = r
             .busiest_slot()
-            .map(|(d, h)| format!("más activo {} {} h", DAY_NAMES[d], h))
+            .map(|(d, h)| format!("busiest {} {}:00", DAY_NAMES[d], h))
             .unwrap_or_default();
         section(
-            "Cuándo trabajan",
+            "When agents work",
             Some(right),
             v_flex()
                 .gap_1()
@@ -356,9 +356,9 @@ impl HomeView {
                         .gap_1()
                         .text_xs()
                         .text_color(style::muted())
-                        .child("menos")
+                        .child("less")
                         .children([0.15f32, 0.4, 0.7, 1.0].map(|a| div().size(px(10.)).rounded_sm().bg(style::accent_alpha(a))))
-                        .child("más"),
+                        .child("more"),
                 ),
         )
     }
@@ -375,8 +375,8 @@ impl HomeView {
         });
 
         section(
-            "Modelos",
-            Some(format!("{} modelos", r.models.len())),
+            "Models",
+            Some(format!("{} models", r.models.len())),
             v_flex()
                 .gap_3()
                 .child(
@@ -404,7 +404,7 @@ impl HomeView {
                             )))
                     })),
                 )
-                .child(table_header(&["entrada", "salida", "respuestas", "costo"]))
+                .child(table_header(&["input", "output", "responses", "cost"]))
                 .children(r.models.iter().take(SHOWN).map(|m| {
                     let share = (m.input_total + m.output) as f32 / max as f32;
                     table_row(
@@ -418,7 +418,7 @@ impl HomeView {
                 .when(rest_count > 0, |d| {
                     d.child(table_row(
                         div().size(px(8.)).into_any_element(),
-                        format!("{rest_count} más"),
+                        format!("{rest_count} more"),
                         0.0,
                         style::faint(),
                         vec![human(rest_in), human(rest_out), thousands(rest_turns), style::money(rest_cost)],
@@ -431,15 +431,15 @@ impl HomeView {
         let r = &self.report;
         let max = r.agents.first().map(|a| a.input_total + a.output).unwrap_or(1).max(1);
         let right = match self.agent {
-            Some(a) => format!("solo {} · clic para ver todos", a.name()),
-            None => "clic en uno para ver solo su consumo".into(),
+            Some(a) => format!("only {} · click to show all", a.name()),
+            None => "click one to filter".into(),
         };
         section(
-            "Agentes",
+            "Agents",
             Some(right),
             v_flex()
                 .gap_1()
-                .child(table_header(&["entrada", "salida", "tiempo", "costo"]))
+                .child(table_header(&["input", "output", "time", "cost"]))
                 .children(r.agents.iter().map(|a| {
                     let agent = a.agent;
                     let selected = self.agent == Some(agent);
@@ -509,12 +509,12 @@ impl HomeView {
         rows.truncate(8);
         let now = self.now;
         section(
-            "Proyectos recientes",
-            Some("clic para abrir".into()),
+            "Recent projects",
+            Some("click to open".into()),
             v_flex()
                 .gap_1()
                 .when(rows.is_empty(), |d| {
-                    d.child(div().text_sm().text_color(style::muted()).child("Aún no hay proyectos con actividad de agentes."))
+                    d.child(div().text_sm().text_color(style::muted()).child("No projects with agent activity yet."))
                 })
                 .children(rows.into_iter().enumerate().map(|(i, p)| {
                     let path = PathBuf::from(&*p.path);
@@ -576,8 +576,8 @@ impl Render for HomeView {
                     .p_8()
                     .gap_8()
                     .child(self.header(cx))
-                    .when(loading, |d| d.child(placeholder("Leyendo los logs de tus agentes…")))
-                    .when(empty, |d| d.child(placeholder("No hay actividad de agentes en este periodo.")))
+                    .when(loading, |d| d.child(placeholder("Reading your agent logs…")))
+                    .when(empty, |d| d.child(placeholder("No agent activity in this period.")))
                     .when(!loading && !empty, |d| {
                         d.child(self.kpi_cards())
                             .child(
@@ -737,19 +737,19 @@ fn placeholder(text: &'static str) -> impl IntoElement {
         .child(text)
 }
 
-const MONTHS: [&str; 12] = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 fn short_date(d: Date) -> String {
-    format!("{} {}", d.day(), MONTHS[(d.month() - 1) as usize])
+    format!("{} {}", MONTHS[(d.month() - 1) as usize], d.day())
 }
 
 fn ago(ts: Timestamp, now: Timestamp) -> String {
     let secs = (now.as_second() - ts.as_second()).max(0);
     match secs {
-        s if s < 60 => "ahora".into(),
-        s if s < 3600 => format!("hace {} min", s / 60),
-        s if s < 86_400 => format!("hace {} h", s / 3600),
-        s => format!("hace {} d", s / 86_400),
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s => format!("{} d ago", s / 86_400),
     }
 }
 

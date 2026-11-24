@@ -1,7 +1,7 @@
-//! Estado que kuaky recuerda entre aperturas: proyectos recientes, anchos de
-//! paneles y, por proyecto, archivos abiertos y sesiones de agentes.
+//! Persistent application state: recent projects, panel sizes, settings,
+//! and per-project open files and agent sessions.
 //!
-//! Se guarda en `<config>/kuaky/state.json` (en macOS,
+//! Stored in `<config>/kuaky/state.json` (on macOS,
 //! `~/Library/Application Support/kuaky/state.json`).
 
 use gpui_kit::{App, Global};
@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf};
 
 const MAX_RECENT: usize = 20;
+
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
@@ -20,12 +24,65 @@ pub struct State {
     pub left_width: Option<f32>,
     #[serde(default)]
     pub right_width: Option<f32>,
+    #[serde(default)]
+    pub right_bottom_height: Option<f32>,
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
+pub struct Settings {
+    /// Per-agent configuration keyed by harness key (`claude`, `codex`, `agy`, `gemini`, `opencode`).
+    #[serde(default)]
+    pub agents: HashMap<String, AgentConfig>,
+    /// Custom base directory for git worktrees (defaults to `~/.kuaky/worktrees`).
+    #[serde(default)]
+    pub worktrees_dir: String,
+}
+
+impl Settings {
+    pub fn agent(&self, key: &str) -> AgentConfig {
+        self.agents.get(key).cloned().unwrap_or_default()
+    }
+
+    pub fn is_visible(&self, key: &str) -> bool {
+        self.agents.get(key).map(|a| a.visible).unwrap_or(true)
+    }
+
+    pub fn resolved_worktrees_dir(&self) -> Option<PathBuf> {
+        let raw = self.worktrees_dir.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Some(rest) = raw.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return Some(home.join(rest));
+            }
+        }
+        Some(PathBuf::from(raw))
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct AgentConfig {
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    #[serde(default)]
+    pub binary_path: String,
+    #[serde(default)]
+    pub extra_args: String,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self { visible: true, binary_path: String::new(), extra_args: String::new() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RecentProject {
     pub path: String,
-    /// Última apertura (segundos Unix).
+    /// Last opened (Unix seconds).
     pub opened: i64,
 }
 
@@ -39,11 +96,15 @@ pub struct ProjectState {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct SavedSession {
-    /// Clave del agente (`claude`, `codex`, `shell`…).
+    /// Harness key (`claude`, `codex`, `shell`…).
     pub harness: String,
     pub cwd: String,
     #[serde(default)]
     pub worktree: Option<String>,
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
+    pub custom_color: Option<u32>,
 }
 
 struct Persisted(State);
@@ -65,7 +126,7 @@ pub fn get(cx: &App) -> &State {
     &cx.global::<Persisted>().0
 }
 
-/// Modifica el estado y lo guarda en disco.
+/// Mutates state and writes it atomically to disk.
 pub fn update(cx: &mut App, f: impl FnOnce(&mut State)) {
     let state = &mut cx.global_mut::<Persisted>().0;
     let before = serde_json::to_string(state).ok();
@@ -75,7 +136,6 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut State)) {
         return;
     }
     let Some(path) = path() else { return };
-    // Escritura atómica: archivo temporal y luego renombrar.
     cx.background_executor()
         .spawn(async move {
             if let Some(dir) = path.parent() {

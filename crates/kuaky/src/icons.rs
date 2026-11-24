@@ -57,3 +57,12 @@ pub fn provider(p: Provider) -> Option<Arc<Image>> {
 pub fn logo(image: Arc<Image>, size: Pixels) -> Img {
     img(image).size(size).flex_none()
 }
+
+/// Lucide UI icon bundled via `gpui-kit-assets` (`AllAssets`).
+pub fn ui(name: &'static str, size: Pixels, color: impl Into<Hsla>) -> Svg {
+    svg()
+        .path(format!("icons/{name}.svg"))
+        .size(size)
+        .flex_none()
+        .text_color(color.into())
+}

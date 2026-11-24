@@ -22,10 +22,10 @@ pub enum AgentState {
 impl AgentState {
     pub fn label(&self) -> &'static str {
         match self {
-            AgentState::Working => "trabajando",
-            AgentState::NeedsYou(_) => "necesita tu permiso",
-            AgentState::Done => "terminó · tu turno",
-            AgentState::Ended => "sesión cerrada",
+            AgentState::Working => "working",
+            AgentState::NeedsYou(_) => "needs permission",
+            AgentState::Done => "done · your turn",
+            AgentState::Ended => "session closed",
         }
     }
 }
@@ -84,11 +84,11 @@ pub fn parse_line(line: &str) -> Option<AgentState> {
     match event.trim() {
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(AgentState::Working),
         "PermissionRequest" => {
-            let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("una herramienta");
-            Some(AgentState::NeedsYou(format!("Quiere usar {tool}")))
+            let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("a tool");
+            Some(AgentState::NeedsYou(format!("Wants to use {tool}")))
         }
         "Notification" if kind == "idle_prompt" => Some(AgentState::Done),
-        "Notification" => Some(AgentState::NeedsYou(if message.is_empty() { "Necesita tu atención".into() } else { message })),
+        "Notification" => Some(AgentState::NeedsYou(if message.is_empty() { "Needs your attention".into() } else { message })),
         "Stop" => Some(AgentState::Done),
         "SessionEnd" => Some(AgentState::Ended),
         _ => None,
@@ -110,7 +110,7 @@ mod tests {
         assert_eq!(parse_line("Notification\t{\"notification_type\":\"idle_prompt\"}"), Some(AgentState::Done));
         assert_eq!(
             parse_line("PermissionRequest\t{\"tool_name\":\"Bash\"}"),
-            Some(AgentState::NeedsYou("Quiere usar Bash".into()))
+            Some(AgentState::NeedsYou("Wants to use Bash".into()))
         );
         assert_eq!(parse_line("Otro\t{}"), None);
     }

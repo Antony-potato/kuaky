@@ -24,11 +24,11 @@ impl Range {
 
     pub fn label(self) -> &'static str {
         match self {
-            Range::Days(7) => "7 días",
-            Range::Days(30) => "30 días",
-            Range::Days(90) => "90 días",
-            Range::Days(_) => "días",
-            Range::All => "Todo",
+            Range::Days(7) => "7 days",
+            Range::Days(30) => "30 days",
+            Range::Days(90) => "90 days",
+            Range::Days(_) => "days",
+            Range::All => "All",
         }
     }
 }

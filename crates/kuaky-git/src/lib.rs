@@ -192,7 +192,7 @@ fn git_in(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 fn gh_in(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     if find_program("gh").is_none() {
-        bail!("No se encontró la CLI de GitHub (`gh`). Instálala y ejecuta `gh auth login`.");
+        bail!("GitHub CLI (`gh`) not found. Install it and run `gh auth login`.");
     }
     run(dir, "gh", args)
 }

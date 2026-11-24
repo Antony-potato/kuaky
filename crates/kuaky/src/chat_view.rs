@@ -65,7 +65,7 @@ impl ChatView {
             TextareaState::new(window, cx)
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
-                .placeholder(format!("Escribe a {}…  (Enter envía · ⇧Enter nueva línea)", launch.label))
+                .placeholder(format!("Message {}…  (Enter sends · ⇧Enter new line)", launch.label))
         });
         let sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = ev {
@@ -206,10 +206,10 @@ impl ChatView {
                 self.status = ChatStatus::Ready;
                 if reason != "end_turn" {
                     let msg = match reason.as_str() {
-                        "cancelled" => "Detenido.".to_string(),
-                        "max_tokens" => "Se alcanzó el límite de tokens de la respuesta.".to_string(),
-                        "refusal" => "El agente se negó a continuar.".to_string(),
-                        other => format!("Turno terminado: {other}"),
+                        "cancelled" => "Stopped.".to_string(),
+                        "max_tokens" => "Reached response token limit.".to_string(),
+                        "refusal" => "The agent declined to continue.".to_string(),
+                        other => format!("Turn ended: {other}"),
                     };
                     self.items.push(Item::Notice(msg));
                 }
@@ -235,7 +235,7 @@ impl ChatView {
         }
         let (Some(client), Some(session)) = (&self.client, &self.session) else { return };
         if let Err(err) = client.prompt(session, &text) {
-            self.items.push(Item::Notice(format!("No se pudo enviar: {err:#}")));
+            self.items.push(Item::Notice(format!("Failed to send: {err:#}")));
             cx.notify();
             return;
         }
@@ -331,10 +331,10 @@ impl ChatView {
                     .border_1()
                     .border_color(if pending { style::soft(style::bad(), 0.6) } else { style::border().into() })
                     .bg(if pending { style::soft(style::bad(), 0.06) } else { style::panel().into() })
-                    .child(div().text_xs().text_color(style::muted()).child("PERMISO"))
+                    .child(div().text_xs().text_color(style::muted()).child("PERMISSION"))
                     .child(div().text_sm().child(req.title.clone()))
                     .map(|d| match answer {
-                        Some(a) => d.child(div().text_xs().text_color(style::muted()).child(format!("Respondiste: {a}"))),
+                        Some(a) => d.child(div().text_xs().text_color(style::muted()).child(format!("Answered: {a}"))),
                         None => d.child(h_flex().gap_2().flex_wrap().children(req.options.iter().enumerate().map(|(oi, o)| {
                             let allow = o.kind.starts_with("allow");
                             let choice = (o.id.clone(), o.name.clone());
@@ -419,13 +419,13 @@ impl ChatView {
 impl Render for ChatView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status_text = match &self.status {
-            ChatStatus::Connecting => "conectando…".to_string(),
-            ChatStatus::Ready if self.is_waiting_permission() => "necesita tu permiso".into(),
-            ChatStatus::Ready => "listo".into(),
-            ChatStatus::Running if self.is_waiting_permission() => "necesita tu permiso".into(),
-            ChatStatus::Running => "trabajando…".into(),
+            ChatStatus::Connecting => "connecting…".to_string(),
+            ChatStatus::Ready if self.is_waiting_permission() => "needs permission".into(),
+            ChatStatus::Ready => "ready".into(),
+            ChatStatus::Running if self.is_waiting_permission() => "needs permission".into(),
+            ChatStatus::Running => "working…".into(),
             ChatStatus::Error(e) => format!("error: {e}"),
-            ChatStatus::Exited => "el agente terminó".into(),
+            ChatStatus::Exited => "agent exited".into(),
         };
         let running = self.status == ChatStatus::Running;
         let items: Vec<AnyElement> = self
@@ -465,9 +465,9 @@ impl Render for ChatView {
                             .gap_3()
                             .when(self.items.is_empty(), |d| {
                                 d.child(div().pt_8().text_sm().text_color(style::muted()).child(match &self.status {
-                                    ChatStatus::Connecting => format!("Conectando con {}…", self.launch.label),
-                                    ChatStatus::Error(e) => format!("No se pudo iniciar el chat: {e}"),
-                                    _ => format!("Escríbele a {} abajo. Trabaja en {}.", self.launch.label, crate::home::tilde(&self.launch.cwd)),
+                                    ChatStatus::Connecting => format!("Connecting to {}…", self.launch.label),
+                                    ChatStatus::Error(e) => format!("Failed to start chat: {e}"),
+                                    _ => format!("Message {} below. Working in {}.", self.launch.label, crate::home::tilde(&self.launch.cwd)),
                                 }))
                             })
                             .children(items),
@@ -491,11 +491,11 @@ impl Render for ChatView {
                             .cursor_pointer()
                             .map(|d| {
                                 if running {
-                                    d.border_1().border_color(style::border()).child("Detener").on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                                    d.border_1().border_color(style::border()).child("Stop").on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                                 } else {
                                     d.bg(style::accent())
                                         .text_color(style::bg())
-                                        .child("Enviar")
+                                        .child("Send")
                                         .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
                                 }
                             }),

@@ -67,9 +67,9 @@ impl DiffView {
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let status = if self.loading {
-            "cargando…".to_string()
+            "loading…".to_string()
         } else if self.error.is_none() {
-            format!("{} archivos", self.files)
+            if self.files == 1 { "1 file".to_string() } else { format!("{} files", self.files) }
         } else {
             String::new()
         };
@@ -92,7 +92,7 @@ impl Render for DiffView {
                             .cursor_pointer()
                             .text_color(style::muted())
                             .hover(|d| d.text_color(style::text()))
-                            .child(if self.mode == DiffMode::Unified { "Vista dividida" } else { "Vista unificada" })
+                            .child(if self.mode == DiffMode::Unified { "Split view" } else { "Unified view" })
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_mode(cx))),
                     ),
             )
@@ -102,7 +102,7 @@ impl Render for DiffView {
                     .min_h_0()
                     .when_some(self.error.clone(), |d, e| d.p_4().text_sm().text_color(style::bad()).child(e))
                     .when(!self.loading && self.error.is_none() && self.files == 0, |d| {
-                        d.p_4().text_sm().text_color(style::muted()).child("Sin diferencias.")
+                        d.p_4().text_sm().text_color(style::muted()).child("No differences.")
                     })
                     .when(self.error.is_none() && self.files > 0, |d| d.child(Diff::new(&self.state).size_full())),
             )

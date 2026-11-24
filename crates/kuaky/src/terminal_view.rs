@@ -67,7 +67,7 @@ impl TerminalView {
         let size = Size { cols: 100, rows: 30, cell_width: 8, cell_height: 18 };
         let (term, error) = match Terminal::spawn(&launch, size) {
             Ok(t) => (Some(t), None),
-            Err(err) => (None, Some(format!("No se pudo abrir la terminal: {err:#}"))),
+            Err(err) => (None, Some(format!("Failed to open terminal: {err:#}"))),
         };
         if let Some(term) = &term {
             let rx = term.events();

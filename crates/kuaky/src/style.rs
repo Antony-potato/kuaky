@@ -86,6 +86,7 @@ pub fn agent_color(a: Agent) -> Rgba {
 }
 
 /// Letra que identifica al agente en su insignia.
+#[allow(dead_code)]
 pub fn agent_glyph(a: Agent) -> &'static str {
     match a {
         Agent::ClaudeCode => "C",

@@ -1,14 +1,17 @@
-//! Raíz de la ventana: barra de título y pantalla actual (inicio o proyecto).
+//! Root window: title bar, active screen (Home or Project), and Settings modal.
 
 use crate::home::{HomeEvent, HomeView, tilde};
-use crate::project::ProjectView;
+use crate::icons;
+use crate::project::{ProjectView, SearchProject};
+use crate::settings::{SettingsEvent, SettingsView};
 use crate::style;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{TitleBar, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 
-actions!(kuaky, [Quit, GoHome, OpenFolder, Hide, HideOthers, ShowAll, Minimize, Zoom, OpenRepo]);
+actions!(kuaky, [Quit, GoHome, OpenFolder, OpenSettings, Hide, HideOthers, ShowAll, Minimize, Zoom, OpenRepo]);
 
 const REPO_URL: &str = "https://github.com/Antony-potato/kuaky";
 
@@ -26,63 +29,68 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-shift-h", GoHome, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
         KeyBinding::new("ctrl-o", OpenFolder, Some("!Terminal")),
         KeyBinding::new("ctrl-shift-h", GoHome, Some("!Terminal")),
+        KeyBinding::new("ctrl-,", OpenSettings, Some("!Terminal")),
     ]);
     set_menus(cx);
 }
 
-/// Barra de menús nativa (en macOS arriba de la pantalla).
+/// Native menu bar (macOS top bar).
 fn set_menus(cx: &mut App) {
-    use crate::project::{CloseTab, NewTerminal, NextTab, PrevTab, QuickOpenFile, SearchProject};
+    use crate::project::{CloseTab, NewTerminal, NextTab, PrevTab, QuickOpenFile};
     use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
     cx.set_menus([
         Menu::new("kuaky").items([
-            MenuItem::action("Ocultar kuaky", Hide),
-            MenuItem::action("Ocultar otros", HideOthers),
-            MenuItem::action("Mostrar todo", ShowAll),
+            MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Salir de kuaky", Quit),
+            MenuItem::action("Hide kuaky", Hide),
+            MenuItem::action("Hide Others", HideOthers),
+            MenuItem::action("Show All", ShowAll),
+            MenuItem::separator(),
+            MenuItem::action("Quit kuaky", Quit),
         ]),
-        Menu::new("Archivo").items([
-            MenuItem::action("Abrir carpeta…", OpenFolder),
-            MenuItem::action("Buscar archivo…", QuickOpenFile),
-            MenuItem::action("Buscar en el proyecto…", SearchProject),
+        Menu::new("File").items([
+            MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Quick Open…", QuickOpenFile),
+            MenuItem::action("Search in Project…", SearchProject),
             MenuItem::separator(),
-            MenuItem::action("Nueva terminal", NewTerminal),
-            MenuItem::action("Cerrar pestaña", CloseTab),
+            MenuItem::action("New Terminal", NewTerminal),
+            MenuItem::action("Close Tab", CloseTab),
             MenuItem::separator(),
-            MenuItem::action("Ir al inicio", GoHome),
+            MenuItem::action("Home", GoHome),
         ]),
-        Menu::new("Edición").items([
-            MenuItem::os_action("Deshacer", Undo, OsAction::Undo),
-            MenuItem::os_action("Rehacer", Redo, OsAction::Redo),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Undo", Undo, OsAction::Undo),
+            MenuItem::os_action("Redo", Redo, OsAction::Redo),
             MenuItem::separator(),
-            MenuItem::os_action("Cortar", Cut, OsAction::Cut),
-            MenuItem::os_action("Copiar", Copy, OsAction::Copy),
-            MenuItem::os_action("Pegar", Paste, OsAction::Paste),
-            MenuItem::os_action("Seleccionar todo", SelectAll, OsAction::SelectAll),
+            MenuItem::os_action("Cut", Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", Paste, OsAction::Paste),
+            MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
         ]),
-        Menu::new("Ver").items([
-            MenuItem::action("Inicio", GoHome),
+        Menu::new("View").items([
+            MenuItem::action("Home", GoHome),
             MenuItem::separator(),
-            MenuItem::action("Pestaña siguiente", NextTab),
-            MenuItem::action("Pestaña anterior", PrevTab),
+            MenuItem::action("Next Tab", NextTab),
+            MenuItem::action("Previous Tab", PrevTab),
         ]),
-        Menu::new("Ventana").items([
-            MenuItem::action("Minimizar", Minimize),
+        Menu::new("Window").items([
+            MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
         ]),
-        Menu::new("Ayuda").items([MenuItem::action("Repositorio de kuaky", OpenRepo)]),
+        Menu::new("Help").items([MenuItem::action("kuaky Repository", OpenRepo)]),
     ]);
 }
 
 pub struct KuakyApp {
     home: Entity<HomeView>,
     project: Option<Entity<ProjectView>>,
+    settings: Option<Entity<SettingsView>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -93,14 +101,12 @@ impl KuakyApp {
             HomeEvent::OpenProject(path) => this.open_project(path.clone(), window, cx),
             HomeEvent::PickFolder => this.pick_folder(window, cx),
         });
-        // Cuando termina de cargar el consumo, la vista de proyecto actualiza su actividad.
         let obs = cx.observe(&home, |this, home, cx| {
             if let (Some(project), Some(events)) = (&this.project, home.read(cx).events()) {
                 project.update(cx, |p, cx| p.set_usage(&events, cx));
             }
         });
-        // Abrir directo una carpeta pasada por línea de comandos: `kuaky ~/proyecto`.
-        let mut this = Self { home, project: None, _subscriptions: vec![sub, obs] };
+        let mut this = Self { home, project: None, settings: None, _subscriptions: vec![sub, obs] };
         if let Some(arg) = std::env::args().nth(1) {
             let path = PathBuf::from(arg);
             if path.is_dir() {
@@ -108,12 +114,17 @@ impl KuakyApp {
             }
         }
         #[cfg(feature = "screenshot")]
-        Self::schedule_screenshot(window, cx);
+        {
+            if std::env::var("KUAKY_DEMO_SETTINGS").is_ok() {
+                this.toggle_settings(window, cx);
+            }
+            Self::schedule_screenshot(window, cx);
+        }
         this
     }
 
-    /// `KUAKY_SCREENSHOT=ruta.png` guarda una captura de la ventana tras unos
-    /// segundos (`KUAKY_SCREENSHOT_DELAY`, por defecto 6) y cierra la app.
+    /// `KUAKY_SCREENSHOT=path.png` saves a window capture after a few seconds
+    /// (`KUAKY_SCREENSHOT_DELAY`, default 6) and quits.
     #[cfg(feature = "screenshot")]
     fn schedule_screenshot(window: &mut Window, cx: &mut Context<Self>) {
         let Ok(path) = std::env::var("KUAKY_SCREENSHOT") else {
@@ -126,17 +137,15 @@ impl KuakyApp {
         cx.spawn_in(window, async move |_, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(delay)).await;
             cx.update(|window, cx| {
-                // Dibujar un cuadro nuevo aunque la ventana esté tapada (macOS
-                // deja de pintar ventanas ocultas).
                 window.refresh();
                 let arena = window.draw(cx);
                 arena.clear(cx);
                 match window.render_to_image() {
                     Ok(img) => match img.save(&path) {
-                        Ok(()) => tracing::info!(%path, "captura guardada"),
-                        Err(err) => tracing::error!(%err, "no se pudo guardar la captura"),
+                        Ok(()) => tracing::info!(%path, "screenshot saved"),
+                        Err(err) => tracing::error!(%err, "failed to save screenshot"),
                     },
-                    Err(err) => tracing::error!(%err, "no se pudo renderizar la captura"),
+                    Err(err) => tracing::error!(%err, "failed to render screenshot"),
                 }
                 cx.quit();
             })
@@ -166,12 +175,34 @@ impl KuakyApp {
         cx.notify();
     }
 
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let view = cx.new(|cx| SettingsView::new(window, cx));
+        let sub = cx.subscribe(&view, |this, _, ev: &SettingsEvent, cx| match ev {
+            SettingsEvent::Close => {
+                this.settings = None;
+                cx.notify();
+            }
+            SettingsEvent::Changed => {
+                if let Some(project) = &this.project {
+                    project.update(cx, |p, cx| p.on_settings_changed(cx));
+                }
+            }
+        });
+        self._subscriptions.push(sub);
+        self.settings = Some(view);
+        cx.notify();
+    }
+
     fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Abrir".into()),
+            prompt: Some("Open".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
@@ -185,10 +216,16 @@ impl KuakyApp {
 
     fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let location = self.project.as_ref().map(|p| tilde(p.read(cx).root()));
+        let home_tip: SharedString = if cfg!(target_os = "macos") { "Home (⌘⇧H)".into() } else { "Home (Ctrl+Shift+H)".into() };
+        let settings_tip: SharedString = if cfg!(target_os = "macos") { "Settings (⌘,)".into() } else { "Settings (Ctrl+,)".into() };
+        let search_tip: SharedString = if cfg!(target_os = "macos") { "Search in project (⌘⇧F)".into() } else { "Search in project (Ctrl+Shift+F)".into() };
+        let has_project = self.project.is_some();
+
         TitleBar::new().child(
             h_flex()
                 .flex_1()
                 .gap_2()
+                .items_center()
                 .text_sm()
                 .child(
                     div()
@@ -201,24 +238,48 @@ impl KuakyApp {
                 )
                 .when_some(location, |d, loc| {
                     d.child(div().text_color(style::faint()).child("/"))
-                        .child(div().text_color(style::muted()).child(loc))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .id("go-home")
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .text_xs()
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(style::border())
-                                .text_color(style::muted())
-                                .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
-                                .child("← Inicio")
-                                .on_click(cx.listener(|this, _, _, cx| this.go_home(cx))),
-                        )
-                }),
+                        .child(div().text_color(style::muted()).truncate().child(loc))
+                })
+                .child(div().flex_1())
+                .when(has_project, |d| {
+                    d.child(
+                        div()
+                            .id("title-search")
+                            .p_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .tooltip(move |window, cx| Tooltip::new(search_tip.clone()).build(window, cx))
+                            .child(icons::ui("search", px(15.), style::muted()))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(project) = &this.project {
+                                    project.update(cx, |p, cx| p.open_search_tab(window, cx));
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("go-home")
+                            .p_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .tooltip(move |window, cx| Tooltip::new(home_tip.clone()).build(window, cx))
+                            .child(icons::ui("house", px(15.), style::muted()))
+                            .on_click(cx.listener(|this, _, _, cx| this.go_home(cx))),
+                    )
+                })
+                .child(
+                    div()
+                        .id("open-settings")
+                        .p_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .tooltip(move |window, cx| Tooltip::new(settings_tip.clone()).build(window, cx))
+                        .child(icons::ui("settings", px(15.), style::muted()))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
+                ),
         )
     }
 }
@@ -227,12 +288,14 @@ impl Render for KuakyApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(style::bg())
             .text_color(style::text())
             .on_action(cx.listener(|this, _: &GoHome, _, cx| this.go_home(cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.pick_folder(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings(window, cx)))
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
             .child(self.title_bar(cx))
@@ -245,5 +308,22 @@ impl Render for KuakyApp {
                         None => d.child(self.home.clone()),
                     }),
             )
+            .when_some(self.settings.clone(), |d, view| {
+                d.child(
+                    div()
+                        .id("settings-overlay")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(style::soft(style::bg(), 0.6))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings = None;
+                            cx.notify();
+                        }))
+                        .child(div().id("settings-box").on_click(|_, _, cx| cx.stop_propagation()).child(view)),
+                )
+            })
     }
 }

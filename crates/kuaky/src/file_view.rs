@@ -181,7 +181,7 @@ impl FileView {
                     provider.saved(&text);
                 }
             }
-            Err(err) => self.message = Some(format!("No se pudo guardar: {err}")),
+            Err(err) => self.message = Some(format!("Failed to save: {err}")),
         }
         cx.notify();
     }
@@ -190,13 +190,13 @@ impl FileView {
 fn read_text(path: &PathBuf) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.len() > MAX_BYTES {
-        return Err(format!("El archivo pesa {} MB; kuaky abre archivos de hasta 4 MB.", meta.len() / 1_048_576));
+        return Err(format!("File is {} MB; kuaky opens files up to 4 MB.", meta.len() / 1_048_576));
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.iter().take(8000).any(|&b| b == 0) {
-        return Err("Es un archivo binario.".into());
+        return Err("Binary file.".into());
     }
-    String::from_utf8(bytes).map_err(|_| "El archivo no está en UTF-8.".into())
+    String::from_utf8(bytes).map_err(|_| "File is not valid UTF-8.".into())
 }
 
 impl Render for FileView {
@@ -218,15 +218,15 @@ impl Render for FileView {
                     .when_some(self.lsp.as_ref().map(|(name, p)| (*name, p.counts())), |d, (name, (errors, warnings))| {
                         d.child(div().text_color(style::good()).child(format!("● {name}")))
                             .when(errors > 0, |d| {
-                                let label = if errors == 1 { "1 error".into() } else { format!("{errors} errores") };
+                                let label = if errors == 1 { "1 error".into() } else { format!("{errors} errors") };
                                 d.child(div().text_color(style::bad()).child(label))
                             })
                             .when(warnings > 0, |d| {
-                                let label = if warnings == 1 { "1 aviso".into() } else { format!("{warnings} avisos") };
+                                let label = if warnings == 1 { "1 warning".into() } else { format!("{warnings} warnings") };
                                 d.child(div().text_color(rgb(0xfbbf24)).child(label))
                             })
                     })
-                    .when(self.dirty, |d| d.child(div().text_color(style::accent()).child("● sin guardar · ⌘S")))
+                    .when(self.dirty, |d| d.child(div().text_color(style::accent()).child("● unsaved · ⌘S")))
                     .when_some(self.message.clone().filter(|_| self.editor.is_some()), |d, m| {
                         d.child(div().text_color(style::bad()).child(m))
                     }),
