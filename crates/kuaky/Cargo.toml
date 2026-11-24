@@ -12,6 +12,8 @@ kuaky-git.workspace = true
 kuaky-term.workspace = true
 gpui-kit = { workspace = true, features = ["syntect"] }
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 jiff.workspace = true
 dirs.workspace = true
 ignore.workspace = true

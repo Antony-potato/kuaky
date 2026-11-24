@@ -5,8 +5,11 @@ use crate::diff_view::DiffView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
 use crate::home::tilde;
+use crate::quick_open::{QuickOpen, QuickOpenEvent};
+use crate::state::{self, SavedSession};
 use crate::style::{self, human};
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
+use gpui_kit::component::resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -20,11 +23,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab]);
+actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-t", NewTerminal, Some("Project")),
+        KeyBinding::new("cmd-p", QuickOpenFile, Some("Project")),
+        KeyBinding::new("ctrl-p", QuickOpenFile, Some("Project")),
         KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Project")),
         KeyBinding::new("cmd-w", CloseTab, Some("Project")),
         KeyBinding::new("ctrl-shift-w", CloseTab, Some("Project")),
@@ -71,6 +76,24 @@ impl Harness {
         }
     }
 
+    /// Clave estable para guardar el estado.
+    fn key(self) -> &'static str {
+        self.command().unwrap_or("shell")
+    }
+
+    fn from_key(key: &str) -> Option<Harness> {
+        Harness::AGENTS.into_iter().chain([Harness::Shell]).find(|h| h.key() == key)
+    }
+
+    /// Argumentos para retomar la última conversación en esa carpeta.
+    fn resume_args(self) -> &'static str {
+        match self {
+            Harness::Claude => " --continue",
+            Harness::Codex => " resume --last",
+            _ => "",
+        }
+    }
+
     /// Comando sugerido para instalar la CLI cuando no está.
     fn install_hint(self) -> Option<&'static str> {
         match self {
@@ -103,7 +126,7 @@ impl Harness {
 }
 
 enum TabKind {
-    Terminal { view: Entity<TerminalView>, harness: Harness, worktree: Option<String> },
+    Terminal { view: Entity<TerminalView>, harness: Harness, worktree: Option<String>, cwd: PathBuf },
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
 }
@@ -167,6 +190,10 @@ pub struct ProjectView {
     isolate: bool,
     activity: Vec<ActivityRow>,
     focus: FocusHandle,
+    /// Sesiones que estaban abiertas la última vez (para reanudarlas).
+    previous: Vec<SavedSession>,
+    quick_open: Option<Entity<QuickOpen>>,
+    layout: Entity<ResizableState>,
     _subs: Vec<Subscription>,
 }
 
@@ -177,7 +204,20 @@ impl ProjectView {
             FileTreeEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
         });
         let repo = Repo::discover(&root);
-        let this = Self {
+        let layout = cx.new(|_| ResizableState::default());
+        let layout_sub = cx.subscribe(&layout, |_, layout, _: &ResizablePanelEvent, cx| {
+            let sizes = layout.read(cx).sizes().clone();
+            if sizes.len() == 3 {
+                state::update(cx, |s| {
+                    s.left_width = Some(f32::from(sizes[0]));
+                    s.right_width = Some(f32::from(sizes[2]));
+                });
+            }
+        });
+        let key = root.to_string_lossy().into_owned();
+        state::update(cx, |s| state::touch_recent(s, &key));
+        let saved = state::get(cx).projects.get(&key).cloned().unwrap_or_default();
+        let mut this = Self {
             activity: usage.map(|u| activity_for(&root, &u)).unwrap_or_default(),
             root,
             repo,
@@ -190,11 +230,86 @@ impl ProjectView {
             installed: HashMap::new(),
             isolate: false,
             focus: cx.focus_handle(),
-            _subs: vec![sub],
+            previous: saved.sessions.clone(),
+            quick_open: None,
+            layout,
+            _subs: vec![sub, layout_sub],
         };
         this.detect_agents(cx);
         this.start_git_refresh(cx);
+        // Reabrir los archivos que estaban abiertos.
+        for file in &saved.files {
+            let path = this.root.join(file);
+            if path.is_file() {
+                this.open_file(path, window, cx);
+            }
+        }
+        if !saved.files.is_empty() {
+            this.active = this.tabs.len().checked_sub(1);
+        }
         this
+    }
+
+    /// Guarda archivos y sesiones abiertas de este proyecto.
+    fn persist(&self, cx: &mut Context<Self>) {
+        let files: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::File(f) => f.read(cx).path.strip_prefix(&self.root).ok().map(|p| p.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let mut sessions: Vec<SavedSession> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TabKind::Terminal { harness, worktree, cwd, view } if !view.read(cx).exited => Some(SavedSession {
+                    harness: harness.key().to_string(),
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    worktree: worktree.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        // Las anteriores que no se han reanudado se conservan.
+        for p in &self.previous {
+            if !sessions.contains(p) {
+                sessions.push(p.clone());
+            }
+        }
+        let key = self.root.to_string_lossy().into_owned();
+        state::update(cx, |s| {
+            s.projects.insert(key, state::ProjectState { files, sessions });
+        });
+    }
+
+    fn resume(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.previous.len() {
+            return;
+        }
+        let saved = self.previous.remove(index);
+        let Some(harness) = Harness::from_key(&saved.harness) else { return };
+        let cwd = PathBuf::from(&saved.cwd);
+        let cwd = if cwd.is_dir() { cwd } else { self.root.clone() };
+        self.spawn_terminal(harness, cwd, saved.worktree, true, window, cx);
+    }
+
+    fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_open.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let qo = cx.new(|cx| QuickOpen::new(self.root.clone(), window, cx));
+        self._subs.push(cx.subscribe_in(&qo, window, |this, _, ev: &QuickOpenEvent, window, cx| {
+            this.quick_open = None;
+            if let QuickOpenEvent::Open(path) = ev {
+                this.open_file(path.clone(), window, cx);
+            }
+            cx.notify();
+        }));
+        self.quick_open = Some(qo);
+        cx.notify();
     }
 
     pub fn root(&self) -> &Path {
@@ -239,6 +354,9 @@ impl ProjectView {
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
         }
+        if std::env::var("KUAKY_DEMO_QUICKOPEN").is_ok() {
+            self.toggle_quick_open(window, cx);
+        }
         if std::env::var("KUAKY_DEMO_DIFF").is_ok() {
             if let Some(repo) = self.repo.clone() {
                 self.open_diff("Cambios locales".into(), "sin commit".into(), move || repo.diff_worktree(), window, cx);
@@ -261,7 +379,13 @@ impl ProjectView {
         let installed = harness == Harness::Shell || self.installed.contains_key(&harness);
         let mut cwd = self.root.clone();
         let mut worktree = None;
-        if installed && self.isolate && harness != Harness::Shell {
+        if !installed {
+            // La CLI no está: abrir un shell con el comando de instalación escrito, sin ejecutarlo.
+            let launch = Launch { cwd, command: None, prefill: harness.install_hint().map(str::to_string) };
+            self.add_terminal(harness, launch, None, window, cx);
+            return;
+        }
+        if self.isolate && harness != Harness::Shell {
             if let Some(repo) = &self.repo {
                 let name = format!(
                     "{}-{}",
@@ -277,28 +401,54 @@ impl ProjectView {
                 }
             }
         }
-        let launch = if installed {
-            // Si la CLI no está en el PATH del shell (p. ej. la instaló Zed), se usa su ruta completa.
-            let command = harness.command().map(|name| match self.installed.get(&harness) {
+        self.spawn_terminal(harness, cwd, worktree, false, window, cx);
+    }
+
+    fn spawn_terminal(
+        &mut self,
+        harness: Harness,
+        cwd: PathBuf,
+        worktree: Option<String>,
+        resume: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if harness != Harness::Shell && !self.installed.contains_key(&harness) {
+            if let Some(path) = harness.command().and_then(kuaky_git::find_agent) {
+                self.installed.insert(harness, path);
+            }
+        }
+        // Si la CLI no está en el PATH del shell (p. ej. la instaló Zed), se usa su ruta completa.
+        let command = harness.command().map(|name| {
+            let base = match self.installed.get(&harness) {
                 Some(path) if kuaky_git::find_program(name).is_none() => kuaky_git::shell_command(path),
                 _ => name.to_string(),
-            });
-            Launch { cwd, command, prefill: None }
-        } else {
-            // La CLI no está: abrir un shell con el comando de instalación escrito, sin ejecutarlo.
-            Launch { cwd: self.root.clone(), command: None, prefill: harness.install_hint().map(str::to_string) }
-        };
+            };
+            if resume { format!("{base}{}", harness.resume_args()) } else { base }
+        });
+        let launch = Launch { cwd, command, prefill: None };
+        self.add_terminal(harness, launch, worktree, window, cx);
+    }
+
+    fn add_terminal(&mut self, harness: Harness, launch: Launch, worktree: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = launch.cwd.clone();
         let view = cx.new(|cx| TerminalView::new(harness.label(), launch, window, cx));
-        let sub = cx.subscribe(&view, |_, _, _: &TerminalViewEvent, cx| cx.notify());
+        let sub = cx.subscribe(&view, |this, _, ev: &TerminalViewEvent, cx| {
+            if matches!(ev, TerminalViewEvent::Exited) {
+                this.persist(cx);
+            }
+            cx.notify();
+        });
         let obs = cx.observe(&view, |_, _, cx| cx.notify());
         self._subs.extend([sub, obs]);
-        self.push_tab(TabKind::Terminal { view, harness, worktree }, window, cx);
+        self.push_tab(TabKind::Terminal { view, harness, worktree, cwd }, window, cx);
     }
 
     fn push_tab(&mut self, kind: TabKind, window: &mut Window, cx: &mut Context<Self>) {
         self.tabs.push(Tab { id: self.next_id, kind });
         self.next_id += 1;
         self.activate(self.tabs.len() - 1, window, cx);
+        self.persist(cx);
     }
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -315,6 +465,7 @@ impl ProjectView {
             return;
         }
         self.tabs.remove(index);
+        self.persist(cx);
         if self.tabs.is_empty() {
             self.active = None;
             window.focus(&self.focus, cx);
@@ -455,9 +606,7 @@ impl ProjectView {
         launchers.push(Harness::Shell);
 
         v_flex()
-            .w(px(232.))
-            .h_full()
-            .flex_none()
+            .size_full()
             .border_r_1()
             .border_color(style::border())
             .bg(style::panel())
@@ -542,7 +691,7 @@ impl ProjectView {
                         d.child(div().px_2().text_xs().text_color(style::faint()).child("Ninguna todavía"))
                     })
                     .children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-                        let TabKind::Terminal { view, harness, worktree } = &tab.kind else { return None };
+                        let TabKind::Terminal { view, harness, worktree, .. } = &tab.kind else { return None };
                         let t = view.read(cx);
                         let (status, color) = terminal_status(t, now);
                         let selected = self.active == Some(i);
@@ -578,6 +727,61 @@ impl ProjectView {
                         )
                     })),
             )
+            .when(!self.previous.is_empty(), |d| {
+                d.child(
+                    v_flex()
+                        .p_3()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(style::border())
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child(side_title("Sesiones anteriores"))
+                                .child(
+                                    div()
+                                        .id("forget-previous")
+                                        .px_1()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .text_color(style::faint())
+                                        .hover(|d| d.text_color(style::text()))
+                                        .child("olvidar")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.previous.clear();
+                                            this.persist(cx);
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .children(self.previous.iter().enumerate().filter_map(|(i, p)| {
+                            let h = Harness::from_key(&p.harness)?;
+                            let detail = p.worktree.clone().map(|w| format!("⑂ {w}")).unwrap_or_else(|| {
+                                if h.resume_args().is_empty() { "abrir de nuevo".into() } else { "retomar conversación".into() }
+                            });
+                            Some(
+                                h_flex()
+                                    .id(("previous", i))
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .child(harness_badge(h))
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(div().text_sm().child(h.label()))
+                                            .child(div().text_xs().truncate().text_color(style::faint()).child(detail)),
+                                    )
+                                    .child(div().text_xs().text_color(style::accent()).child("reanudar"))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.resume(i, window, cx))),
+                            )
+                        })),
+                )
+            })
             .child(
                 v_flex()
                     .flex_1()
@@ -693,9 +897,8 @@ impl ProjectView {
             None => self.empty_state(cx).into_any_element(),
         };
         v_flex()
-            .flex_1()
+            .size_full()
             .min_w_0()
-            .h_full()
             .when(!self.tabs.is_empty(), |d| d.child(self.tab_bar(cx)))
             .child(div().flex_1().min_h_0().child(content))
     }
@@ -741,9 +944,7 @@ impl ProjectView {
             (SidePanel::Prs, self.git.prs.as_ref().and_then(|p| p.as_ref().ok()).map_or(0, |p| p.len())),
         ]);
         v_flex()
-            .w(px(300.))
-            .h_full()
-            .flex_none()
+            .size_full()
             .border_l_1()
             .border_color(style::border())
             .bg(style::panel())
@@ -1043,11 +1244,36 @@ impl Render for ProjectView {
                     this.activate((i + n - 1) % n, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &QuickOpenFile, window, cx| this.toggle_quick_open(window, cx)))
             .size_full()
+            .relative()
             .bg(style::bg())
-            .child(self.left_sidebar(cx))
-            .child(self.center(cx))
-            .child(self.right_panel(cx))
+            .child({
+                let saved = state::get(cx);
+                let (left, right) = (saved.left_width.unwrap_or(232.), saved.right_width.unwrap_or(300.));
+                h_resizable("project-layout")
+                    .with_state(&self.layout)
+                    .child(resizable_panel().size(px(left)).size_range(px(180.)..px(420.)).child(self.left_sidebar(cx)))
+                    .child(resizable_panel().child(self.center(cx)))
+                    .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx)))
+            })
+            .when_some(self.quick_open.clone(), |d, qo| {
+                d.child(
+                    div()
+                        .id("quick-open-overlay")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .justify_center()
+                        .pt(px(72.))
+                        .bg(style::soft(style::bg(), 0.55))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.quick_open = None;
+                            cx.notify();
+                        }))
+                        .child(div().id("quick-open-box").on_click(|_, _, cx| cx.stop_propagation()).child(qo)),
+                )
+            })
     }
 }
 

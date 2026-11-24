@@ -33,7 +33,7 @@ pub fn init(cx: &mut App) {
 
 /// Barra de menús nativa (en macOS arriba de la pantalla).
 fn set_menus(cx: &mut App) {
-    use crate::project::{CloseTab, NewTerminal, NextTab, PrevTab};
+    use crate::project::{CloseTab, NewTerminal, NextTab, PrevTab, QuickOpenFile};
     use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
     cx.set_menus([
         Menu::new("kuaky").items([
@@ -45,6 +45,7 @@ fn set_menus(cx: &mut App) {
         ]),
         Menu::new("Archivo").items([
             MenuItem::action("Abrir carpeta…", OpenFolder),
+            MenuItem::action("Buscar archivo…", QuickOpenFile),
             MenuItem::separator(),
             MenuItem::action("Nueva terminal", NewTerminal),
             MenuItem::action("Cerrar pestaña", CloseTab),

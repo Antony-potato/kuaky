@@ -419,14 +419,31 @@ impl HomeView {
     }
 
     fn projects(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<_> = self
+        // Proyectos con actividad de agentes + carpetas abiertas en kuaky,
+        // del más reciente al más antiguo.
+        let mut rows: Vec<kuaky_usage::report::ProjectRow> = self
             .report
             .projects
             .iter()
             .filter(|p| !p.path.contains("/scratch-workspaces/") && std::path::Path::new(&*p.path).is_dir())
-            .take(8)
             .cloned()
             .collect();
+        for recent in &crate::state::get(cx).recent {
+            let opened = jiff::Timestamp::from_second(recent.opened).unwrap_or(self.now);
+            match rows.iter_mut().find(|r| &*r.path == recent.path) {
+                Some(row) => row.last_active = row.last_active.max(opened),
+                None if std::path::Path::new(&recent.path).is_dir() => rows.push(kuaky_usage::report::ProjectRow {
+                    path: Arc::from(recent.path.as_str()),
+                    last_active: opened,
+                    tokens: 0,
+                    sessions: 0,
+                    agents: Vec::new(),
+                }),
+                None => {}
+            }
+        }
+        rows.sort_by_key(|r| std::cmp::Reverse(r.last_active));
+        rows.truncate(8);
         let now = self.now;
         section(
             "Proyectos recientes",
@@ -466,7 +483,7 @@ impl HomeView {
                                 .text_right()
                                 .text_sm()
                                 .text_color(style::muted())
-                                .child(human(p.tokens)),
+                                .child(if p.tokens > 0 { human(p.tokens) } else { "—".into() }),
                         )
                         .child(
                             div()

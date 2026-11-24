@@ -4098,6 +4098,8 @@ dependencies = [
  "kuaky-git",
  "kuaky-term",
  "kuaky-usage",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

@@ -5,6 +5,8 @@ mod file_view;
 mod home;
 mod icons;
 mod project;
+mod quick_open;
+mod state;
 mod style;
 mod terminal_view;
 
@@ -34,6 +36,7 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
+            state::init(cx);
             app::init(cx);
             project::init(cx);
             file_view::init(cx);
