@@ -1,7 +1,7 @@
 //! Conversación completa contra un agente ACP falso (sin red ni tokens).
 #![cfg(unix)]
 
-use kuaky_acp::{Client, Event};
+use kuaky_acp::{Client, Event, McpServer};
 use std::{path::PathBuf, time::Duration};
 
 #[test]
@@ -122,4 +122,18 @@ fn agent_death_is_reported() {
         assert!(std::time::Instant::now() < deadline);
     }
     assert!(client.is_closed());
+}
+
+#[test]
+fn passes_mcp_servers_to_the_session() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mock_agent.py");
+    let client = Client::spawn(&PathBuf::from("python3"), &[script.to_string_lossy().into_owned()], &std::env::temp_dir(), &[]).unwrap();
+    client.set_mcp_servers(vec![McpServer {
+        name: "echo".into(),
+        command: PathBuf::from("/bin/kuaky"),
+        args: vec!["mcp".into()],
+        env: vec![("KUAKY_SESSION".into(), "s7".into())],
+    }]);
+    let session = client.new_session(&std::env::temp_dir()).unwrap();
+    assert_eq!(session, "mcp:echo:/bin/kuaky:KUAKY_SESSION:mcp__echo");
 }

@@ -4144,6 +4144,7 @@ dependencies = [
  "kuaky-acp",
  "kuaky-git",
  "kuaky-lsp",
+ "kuaky-mcp",
  "kuaky-term",
  "kuaky-usage",
  "lsp-types",
@@ -4181,6 +4182,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flume 0.11.1",
+ "serde_json",
+]
+
+[[package]]
+name = "kuaky-mcp"
+version = "0.1.0"
+dependencies = [
  "serde_json",
 ]
 

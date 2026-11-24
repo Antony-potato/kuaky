@@ -101,6 +101,28 @@ pub struct AgentCapabilities {
     pub embedded_context: bool,
 }
 
+/// Servidor MCP (stdio) que el cliente ofrece a la sesión: el agente lo lanza
+/// y usa sus herramientas.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl McpServer {
+    fn to_json(&self) -> Value {
+        // Sin `type`: así es el transporte stdio en ACP.
+        json!({
+            "name": self.name,
+            "command": self.command.to_string_lossy(),
+            "args": self.args,
+            "env": self.env.iter().map(|(k, v)| json!({ "name": k, "value": v })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 /// Un bloque del mensaje que se envía al agente.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptBlock {
@@ -203,6 +225,8 @@ pub struct Client {
     roots: Arc<Mutex<Vec<PathBuf>>>,
     /// El proceso del agente cerró su salida (murió o terminó).
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Servidores MCP que se pasan al crear o retomar cada sesión.
+    mcp_servers: Mutex<Vec<McpServer>>,
 }
 
 impl Client {
@@ -265,6 +289,7 @@ impl Client {
             capabilities: AgentCapabilities::default(),
             roots,
             closed,
+            mcp_servers: Mutex::new(Vec::new()),
         };
         let init = client.request(
             "initialize",
@@ -301,6 +326,24 @@ impl Client {
         if !roots.iter().any(|r| r == dir) {
             roots.push(dir.to_path_buf());
         }
+    }
+
+    /// Servidores MCP para las sesiones que se creen o retomen desde ahora.
+    /// Sus herramientas no piden permiso en Claude: las ofrece el cliente, que
+    /// ya confía en ellas (`_meta.claudeCode.options.allowedTools`).
+    pub fn set_mcp_servers(&self, servers: Vec<McpServer>) {
+        *self.mcp_servers.lock().unwrap() = servers;
+    }
+
+    /// `mcpServers` (y su permiso) para `session/new` y `session/load`.
+    fn session_params(&self, mut params: Value) -> Value {
+        let servers = self.mcp_servers.lock().unwrap();
+        params["mcpServers"] = Value::Array(servers.iter().map(McpServer::to_json).collect());
+        if !servers.is_empty() {
+            let allowed: Vec<String> = servers.iter().map(|s| format!("mcp__{}", s.name)).collect();
+            params["_meta"] = json!({ "claudeCode": { "options": { "allowedTools": allowed } } });
+        }
+        params
     }
 
     pub fn events(&self) -> flume::Receiver<Event> {
@@ -340,7 +383,7 @@ impl Client {
     pub fn new_session_info(&self, cwd: &Path) -> anyhow::Result<SessionInfo> {
         let result = self.request(
             "session/new",
-            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+            self.session_params(json!({ "cwd": cwd.to_string_lossy() })),
             Duration::from_secs(120),
         )?;
         let id = result.get("sessionId").and_then(Value::as_str).map(str::to_string).context("session/new sin sessionId")?;
@@ -352,7 +395,7 @@ impl Client {
     pub fn load_session(&self, cwd: &Path, id: &str) -> anyhow::Result<SessionInfo> {
         let result = self.request(
             "session/load",
-            json!({ "sessionId": id, "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
+            self.session_params(json!({ "sessionId": id, "cwd": cwd.to_string_lossy() })),
             Duration::from_secs(120),
         )?;
         Ok(SessionInfo { id: id.to_string(), config: parse_session_config(&result) })

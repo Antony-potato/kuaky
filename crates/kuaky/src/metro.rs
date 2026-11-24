@@ -570,7 +570,7 @@ impl ProjectView {
         cx.notify();
     }
 
-    fn chat_view_of(&self, uid: &str, cx: &App) -> Option<Entity<crate::chat_view::ChatView>> {
+    pub(super) fn chat_view_of(&self, uid: &str, cx: &App) -> Option<Entity<crate::chat_view::ChatView>> {
         self.tabs.iter().find_map(|t| match &t.kind {
             TabKind::Chat { view, .. } if view.read(cx).uid == uid => Some(view.clone()),
             _ => None,
@@ -1240,6 +1240,7 @@ impl ProjectView {
             last_active: jiff::Timestamp::now(),
             role: None,
             chat: false,
+            opened_by: None,
         };
         self.lines.lines.clear();
         let plan = self.lines.create("Plan · search + LSP", LineKind::Plan, None, true);

@@ -27,7 +27,12 @@ while True:
         send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentInfo": {"name": "mock", "title": "Mock Agent"},
               "agentCapabilities": {"loadSession": True, "promptCapabilities": {"image": True}}}})
     elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s1",
+        servers = msg["params"].get("mcpServers", [])
+        sid = "s1"
+        if servers and servers[0]["name"] == "echo":  # devuelve en el id lo que recibió, para la prueba
+            allowed = msg["params"]["_meta"]["claudeCode"]["options"]["allowedTools"]
+            sid = ":".join(["mcp", servers[0]["name"], servers[0]["command"], servers[0]["env"][0]["name"], allowed[0]])
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": sid,
               "modes": {"currentModeId": "default", "availableModes": [{"id": "default", "name": "Default"}, {"id": "plan", "name": "Plan"}]}}})
     elif method == "session/load":
         s = msg["params"]["sessionId"]

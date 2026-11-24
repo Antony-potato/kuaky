@@ -158,6 +158,7 @@ impl KuakyApp {
             _subscriptions: vec![sub, obs, appearance],
         };
         this.watch_memory(cx);
+        this.watch_tools(window, cx);
         let capture = std::env::var_os("KUAKY_SCREENSHOT").is_some();
         if let Some(path) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir()) {
             this.open_project(path, window, cx);
@@ -395,6 +396,30 @@ impl KuakyApp {
             }
         })
         .detach();
+    }
+
+    /// Atiende las herramientas que llaman los agentes de los chats (`kuaky mcp`):
+    /// revisa el buzón cada 250 ms y pasa cada llamada al proyecto de ese chat.
+    fn watch_tools(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mailbox) = crate::project::delegate::mailbox() else { return };
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let calls = cx.background_executor().spawn(async move { mailbox.take() }).await;
+            for call in calls {
+                let Ok(reply) = this.update_in(cx, |this, window, cx| this.tool_call(&call, window, cx)) else { return };
+                if let Err(err) = mailbox.answer(&call.id, &reply) {
+                    tracing::warn!(%err, tool = call.tool, "no se pudo contestar la herramienta");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn tool_call(&mut self, call: &kuaky_mcp::Call, window: &mut Window, cx: &mut Context<Self>) -> kuaky_mcp::Reply {
+        let Some(project) = self.projects.iter().find(|p| p.read(cx).has_chat(&call.session, cx)).cloned() else {
+            return kuaky_mcp::Reply::error("This session is no longer open in kuaky.");
+        };
+        project.update(cx, |p, cx| p.tool_call(call, window, cx))
     }
 
     /// Mide la memoria cada 5 s; solo redibuja si cambió al menos 1 MB.

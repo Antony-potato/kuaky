@@ -49,6 +49,10 @@ pub struct ChatLaunch {
     pub resume: Option<String>,
     /// Texto que queda escrito en la caja (no se envía).
     pub draft: Option<String>,
+    /// Servidores MCP para la sesión (las herramientas de kuaky).
+    pub tools: Vec<kuaky_acp::McpServer>,
+    /// Se abre sin tomar el foco (la abrió otro agente mientras escribes).
+    pub background: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -329,7 +333,9 @@ impl ChatView {
         if let Some(draft) = &launch.draft {
             input.update(cx, |s, cx| s.set_value(draft.clone(), window, cx));
         }
-        input.update(cx, |s, cx| s.focus(window, cx));
+        if !launch.background {
+            input.update(cx, |s, cx| s.focus(window, cx));
+        }
         #[allow(unused_mut)]
         let mut this = Self {
             launch,
@@ -481,6 +487,7 @@ impl ChatView {
                 .spawn(async move {
                     let env = vec![("PATH".to_string(), kuaky_git::login_path().to_string_lossy().into_owned())];
                     let client = Arc::new(Client::spawn(&launch.program, &launch.args, &launch.cwd, &env)?);
+                    client.set_mcp_servers(launch.tools.clone());
                     let resumed = launch.resume.is_some() && client.capabilities.load_session;
                     let mut info = match &launch.resume {
                         Some(id) if client.capabilities.load_session => client.load_session(&launch.cwd, id)?,
@@ -990,6 +997,21 @@ impl ChatView {
         self.follow = on;
         self.last_followed = None;
         cx.notify();
+    }
+
+    /// Plan del agente (para las herramientas de kuaky).
+    pub fn plan_entries(&self) -> &[PlanEntry] {
+        &self.plan
+    }
+
+    /// ¿Ya hubo algún mensaje en la conversación?
+    pub fn has_turns(&self) -> bool {
+        self.turns.iter().any(|t| t.user.is_some() || !t.items.is_empty())
+    }
+
+    /// Mensajes en cola (llegaron mientras el agente estaba ocupado).
+    pub fn queued(&self) -> usize {
+        self.queue.len()
     }
 
     /// Respuesta del agente en el último turno (para pasarla a la sesión conectada).

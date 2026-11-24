@@ -40,6 +40,8 @@ actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, Searc
 mod metro;
 #[path = "prs.rs"]
 mod prs;
+#[path = "delegate.rs"]
+pub(crate) mod delegate;
 pub(crate) use prs::pr_numbers_in;
 pub use metro::LiveSummary;
 
@@ -52,6 +54,10 @@ struct ChatOpts {
     draft: Option<String>,
     role: Option<String>,
     cwd: Option<PathBuf>,
+    /// Sesión que la abrió con las herramientas de kuaky.
+    opened_by: Option<String>,
+    /// Abrir la pestaña sin cambiar a ella ni tomar el foco.
+    background: bool,
 }
 
 /// How to start an agent terminal.
@@ -826,6 +832,13 @@ impl ProjectView {
                 .await;
             this.update(cx, |this, cx| {
                 let (found, chat) = found;
+                // Las capturas de desarrollo ponen agentes falsos antes de que termine la detección.
+                #[cfg(feature = "screenshot")]
+                let chat = {
+                    let mut chat = chat;
+                    chat.extend(this.chat_agents.iter().filter(|(_, c)| c.0 == Path::new("python3")).map(|(h, c)| (*h, c.clone())));
+                    chat
+                };
                 this.chat_agents = chat;
                 this.installed = found;
                 cx.notify();
@@ -919,6 +932,17 @@ impl ProjectView {
                 self.chat_agents.insert(Harness::Claude, (PathBuf::from("python3"), vec![script.to_string_lossy().into_owned()]));
                 self.open_chat(Harness::Claude, window, cx);
             }
+            Ok("delegate") => {
+                // Claude abre una sesión de Antigravity con las herramientas de kuaky.
+                let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kuaky-mcp/tests/mock_delegator.py");
+                for h in [Harness::Claude, Harness::Antigravity] {
+                    self.chat_agents.insert(h, (PathBuf::from("python3"), vec![script.to_string_lossy().into_owned()]));
+                }
+                self.open_chat(Harness::Claude, window, cx);
+                if let Some(TabKind::Chat { view, .. }) = self.tabs.last().map(|t| &t.kind) {
+                    view.update(cx, |v, cx| v.submit_text("delegate".into(), cx));
+                }
+            }
             Ok(_) => self.open_chat(Harness::Claude, window, cx),
             Err(_) => {}
         }
@@ -965,6 +989,12 @@ impl ProjectView {
         if harness == Harness::Shell || !settings.agent(harness.key()).in_worktree() {
             return None;
         }
+        self.create_worktree_for(harness, cx)
+    }
+
+    /// Worktree nuevo (rama `kuaky/<agente>-<fecha>`) para un agente.
+    fn create_worktree_for(&self, harness: Harness, cx: &App) -> Option<(PathBuf, String)> {
+        let settings = &state::get(cx).settings;
         let repo = self.repo.as_ref()?;
         let name = format!("{}-{}", harness.command().unwrap_or("agent"), jiff::Zoned::now().strftime("%m%d-%H%M%S"));
         let created = match settings.resolved_worktrees_dir() {
@@ -1207,6 +1237,7 @@ impl ProjectView {
                     last_active: jiff::Timestamp::now(),
                     role,
                     chat: false,
+                    opened_by: None,
                 },
             );
             if branch.is_some() {
@@ -1465,12 +1496,20 @@ impl ProjectView {
             return;
         };
         let cwd = opts.cwd.clone().filter(|c| c.is_dir()).unwrap_or_else(|| self.root.clone());
-        let launch = ChatLaunch { label: harness.label(), program, args, cwd: cwd.clone(), resume: opts.resume.clone(), draft: opts.draft.clone() };
+        // El uid va en las herramientas de kuaky (así sabe qué sesión las llama).
+        let uid = opts.uid.clone().unwrap_or_else(crate::terminal_view::new_uid);
+        let launch = ChatLaunch {
+            label: harness.label(),
+            program,
+            args,
+            cwd: cwd.clone(),
+            resume: opts.resume.clone(),
+            draft: opts.draft.clone(),
+            tools: delegate::mcp_server(&uid).into_iter().collect(),
+            background: opts.background,
+        };
         let view = cx.new(|cx| ChatView::new(launch, window, cx));
-        if let Some(uid) = opts.uid.clone() {
-            view.update(cx, |v, _| v.uid = uid);
-        }
-        let uid = view.read(cx).uid.clone();
+        view.update(cx, |v, _| v.uid = uid.clone());
         let line_id = opts
             .line
             .filter(|l| self.lines.get(l).is_some())
@@ -1487,6 +1526,7 @@ impl ProjectView {
                 last_active: jiff::Timestamp::now(),
                 role: opts.role.clone(),
                 chat: true,
+                opened_by: opts.opened_by.clone(),
             },
         );
         let sub = cx.subscribe_in(&view, window, move |this, view, ev: &ChatEvent, window, cx| {
@@ -1565,7 +1605,14 @@ impl ProjectView {
             cx.notify();
         });
         self._subs.push(sub);
-        self.push_tab(TabKind::Chat { view, harness }, window, cx);
+        if opts.background {
+            self.tabs.push(Tab { id: self.next_id, kind: TabKind::Chat { view, harness } });
+            self.next_id += 1;
+            self.persist(cx);
+            cx.notify();
+        } else {
+            self.push_tab(TabKind::Chat { view, harness }, window, cx);
+        }
     }
 
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {

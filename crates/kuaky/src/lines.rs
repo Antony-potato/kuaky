@@ -89,6 +89,9 @@ pub struct LineSession {
     /// Tipo de conexión si llegó a revisar/probar lo de otra sesión.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Sesión (uid) que la abrió con las herramientas de kuaky (`open_session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -254,6 +257,32 @@ impl LineStore {
         self.lines.iter().find(|l| l.sessions.iter().any(|s| s.uid == uid))
     }
 
+    pub fn session(&self, uid: &str) -> Option<&LineSession> {
+        self.lines.iter().flat_map(|l| &l.sessions).find(|s| s.uid == uid)
+    }
+
+    /// Sesión principal de la que salió esta (siguiendo `opened_by`); ella misma si nadie la abrió.
+    pub fn root_of(&self, uid: &str) -> String {
+        let mut root = uid.to_string();
+        // Tope por si un archivo editado a mano trae un ciclo.
+        for _ in 0..16 {
+            match self.session(&root).and_then(|s| s.opened_by.clone()) {
+                Some(parent) if parent != root => root = parent,
+                _ => break,
+            }
+        }
+        root
+    }
+
+    /// Sesiones abiertas desde `root` (a cualquier profundidad), con su línea.
+    pub fn opened_from(&self, root: &str) -> Vec<(&Line, &LineSession)> {
+        self.lines
+            .iter()
+            .flat_map(|l| l.sessions.iter().map(move |s| (l, s)))
+            .filter(|(_, s)| s.uid != root && s.opened_by.is_some() && self.root_of(&s.uid) == root)
+            .collect()
+    }
+
     pub fn create(&mut self, name: &str, kind: LineKind, parent: Option<String>, named: bool) -> String {
         let now = Timestamp::now();
         let id = format!("l{}", now.as_millisecond());
@@ -282,7 +311,11 @@ impl LineStore {
     }
 
     /// Asocia una sesión a una línea (la saca de cualquier otra).
-    pub fn attach(&mut self, line_id: &str, session: LineSession) {
+    pub fn attach(&mut self, line_id: &str, mut session: LineSession) {
+        // Quién la abrió no se pierde al moverla ni al retomarla.
+        if session.opened_by.is_none() {
+            session.opened_by = self.session(&session.uid).and_then(|s| s.opened_by.clone());
+        }
         for l in &mut self.lines {
             if l.id != line_id {
                 l.sessions.retain(|s| s.uid != session.uid);
@@ -297,6 +330,9 @@ impl LineStore {
                     }
                     if session.role.is_some() {
                         existing.role = session.role;
+                    }
+                    if session.opened_by.is_some() {
+                        existing.opened_by = session.opened_by;
                     }
                 }
                 None => line.sessions.push(session),
@@ -673,7 +709,26 @@ mod tests {
             last_active: Timestamp::now(),
             role: None,
             chat: false,
+            opened_by: None,
         }
+    }
+
+    #[test]
+    fn sessions_opened_by_others_form_a_family() {
+        let mut store = LineStore::in_memory();
+        let main = store.create("Plan", LineKind::Plan, None, true);
+        let sub = store.create("Tests", LineKind::Plan, Some(main.clone()), false);
+        store.attach(&main, session("a"));
+        store.attach(&sub, LineSession { opened_by: Some("a".into()), ..session("b") });
+        store.attach(&sub, LineSession { opened_by: Some("b".into()), ..session("c") });
+        store.attach(&main, session("other"));
+        assert_eq!(store.root_of("c"), "a");
+        assert_eq!(store.root_of("a"), "a");
+        let family: Vec<&str> = store.opened_from("a").iter().map(|(_, s)| s.uid.as_str()).collect();
+        assert_eq!(family, ["b", "c"]);
+        // Al moverla o retomarla sin decir quién la abrió, se conserva.
+        store.attach(&main, session("c"));
+        assert_eq!(store.session("c").unwrap().opened_by.as_deref(), Some("b"));
     }
 
     #[test]

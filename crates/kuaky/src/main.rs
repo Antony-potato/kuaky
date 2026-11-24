@@ -34,6 +34,15 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 fn main() {
+    // `kuaky mcp`: herramientas para los agentes de los chats (las lanza el
+    // agente). Antes que nada más: su salida estándar es el protocolo.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        if let Err(err) = kuaky_mcp::serve_stdio() {
+            eprintln!("kuaky mcp: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Si kuaky se abrió desde una sesión de Claude Code, no heredar sus marcas:
     // los agentes que se abren aquí deben comportarse como en tu terminal.
     // Se hace antes de crear cualquier hilo.
