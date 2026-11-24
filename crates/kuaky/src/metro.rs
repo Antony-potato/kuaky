@@ -126,6 +126,25 @@ fn meaningful_title(title: &str, harness: Harness) -> Option<String> {
     Some(t.to_string())
 }
 
+/// Dos chats conectados (revisor ↔ autor) con rondas automáticas opcionales.
+pub(super) struct Relay {
+    author: String,
+    reviewer: String,
+    author_label: String,
+    reviewer_label: String,
+    verb: &'static str,
+    auto: bool,
+    rounds_left: u8,
+}
+
+const RELAY_ROUNDS: u8 = 3;
+
+/// El revisor dice que ya no hay nada que corregir.
+fn reviewer_is_done(answer: &str) -> bool {
+    let a = answer.to_lowercase();
+    a.trim_start().starts_with("lgtm") || a.contains("\nlgtm") || a.contains("no further issues") || a.contains("nothing left to fix")
+}
+
 /// Agentes vivos de un proyecto (para las pestañas de proyectos e Inicio).
 #[derive(Clone, Default)]
 pub struct LiveSummary {
@@ -431,8 +450,122 @@ impl ProjectView {
         let station = format!("{} · {}", kind.station(), harness.label());
         self.lines.add_station(&line_id, &station, StationSource::Connection, None, StationState::Active);
         self.board = None;
+        // Si la sesión autora es un chat, el revisor también: así sus respuestas
+        // pueden ir y venir solas (rondas automáticas).
+        let trains = self.trains(cx);
+        let author = line
+            .sessions
+            .iter()
+            .filter(|s| s.chat && (s.role.is_none() || s.role.as_deref() == Some("relay")))
+            .filter(|s| trains.contains_key(&s.uid))
+            .max_by_key(|s| s.last_active)
+            .and_then(|s| Some((s.uid.clone(), self.chat_view_of(&s.uid, cx)?)));
+        let can_chat = self.chat_agents.contains_key(&harness) || harness.chat_command().is_some();
+        if let (Some((author_uid, author_view)), true, false) = (author, can_chat, kind == ConnKind::Relay) {
+            let draft = format!("{prompt} When nothing is left to fix, reply LGTM.");
+            let opts = ChatOpts { line: Some(line_id), draft: Some(draft), role: Some(kind.role().to_string()), cwd: Some(cwd), ..Default::default() };
+            self.open_chat_with(harness, opts, window, cx);
+            let reviewer = self.tabs.last().and_then(|t| match &t.kind {
+                TabKind::Chat { view, .. } => Some(view.read(cx).uid.clone()),
+                _ => None,
+            });
+            if let Some(reviewer) = reviewer {
+                self.relays.retain(|r| r.reviewer != reviewer);
+                self.relays.push(Relay {
+                    author: author_uid,
+                    reviewer,
+                    author_label: author_view.read(cx).launch.label.to_string(),
+                    reviewer_label: harness.label().to_string(),
+                    verb: kind.station(),
+                    auto: false,
+                    rounds_left: RELAY_ROUNDS,
+                });
+                self.sync_relay_banners(cx);
+            }
+            return;
+        }
         let opts = SpawnOpts { line: Some(line_id), paste: Some(prompt), role: Some(kind.role().to_string()), ..Default::default() };
         self.spawn_terminal(harness, cwd, None, opts, window, cx);
+    }
+
+    fn chat_view_of(&self, uid: &str, cx: &App) -> Option<Entity<crate::chat_view::ChatView>> {
+        self.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Chat { view, .. } if view.read(cx).uid == uid => Some(view.clone()),
+            _ => None,
+        })
+    }
+
+    /// Muestra en ambos chats con quién están conectados.
+    fn sync_relay_banners(&self, cx: &mut Context<Self>) {
+        for r in &self.relays {
+            let pairs = [
+                (&r.reviewer, format!("{} for {}", r.verb, r.author_label)),
+                (&r.author, format!("{} by {}", r.verb, r.reviewer_label)),
+            ];
+            for (uid, text) in pairs {
+                if let Some(view) = self.chat_view_of(uid, cx) {
+                    let banner = crate::chat_view::RelayBanner { text, auto: r.auto, rounds_left: r.rounds_left };
+                    view.update(cx, |v, cx| {
+                        v.relay = Some(banner);
+                        cx.notify();
+                    });
+                }
+            }
+        }
+    }
+
+    pub(super) fn set_relay_auto(&mut self, uid: &str, on: bool, cx: &mut Context<Self>) {
+        for r in self.relays.iter_mut().filter(|r| r.author == uid || r.reviewer == uid) {
+            r.auto = on;
+            if on && r.rounds_left == 0 {
+                r.rounds_left = RELAY_ROUNDS;
+            }
+        }
+        self.sync_relay_banners(cx);
+    }
+
+    /// Terminó un turno de un chat conectado: con rondas automáticas, su respuesta
+    /// pasa al otro lado (el revisor manda hallazgos; el autor, lo que cambió).
+    pub(super) fn relay_turn_done(&mut self, uid: &str, cx: &mut Context<Self>) {
+        let Some(i) = self.relays.iter().position(|r| r.auto && r.rounds_left > 0 && (r.author == uid || r.reviewer == uid)) else { return };
+        let from_reviewer = self.relays[i].reviewer == uid;
+        let (from, to) = if from_reviewer {
+            (self.relays[i].reviewer.clone(), self.relays[i].author.clone())
+        } else {
+            (self.relays[i].author.clone(), self.relays[i].reviewer.clone())
+        };
+        let (Some(from_view), Some(to_view)) = (self.chat_view_of(&from, cx), self.chat_view_of(&to, cx)) else {
+            self.relays[i].auto = false;
+            self.sync_relay_banners(cx);
+            return;
+        };
+        let Some(answer) = from_view.read(cx).last_answer() else { return };
+        let r = &mut self.relays[i];
+        if from_reviewer && reviewer_is_done(&answer) {
+            r.auto = false;
+            let note = format!("Auto rounds finished: {} has nothing left to fix.", r.reviewer_label);
+            for v in [&from_view, &to_view] {
+                v.update(cx, |v, cx| v.push_notice(note.clone(), cx));
+            }
+            self.sync_relay_banners(cx);
+            return;
+        }
+        let message = if from_reviewer {
+            format!("Feedback from {} (reviewer):\n\n{answer}\n\nPlease address it, then summarize what you changed.", r.reviewer_label)
+        } else {
+            r.rounds_left = r.rounds_left.saturating_sub(1);
+            format!("{} (author) replied:\n\n{answer}\n\nCheck the updated changes. If nothing else needs fixing, reply LGTM.", r.author_label)
+        };
+        let finished = r.rounds_left == 0;
+        if finished {
+            r.auto = false;
+        }
+        to_view.update(cx, |v, cx| v.submit_text(message, cx));
+        if finished {
+            let note = format!("Auto rounds stopped after {RELAY_ROUNDS} rounds. Turn them on again to continue.");
+            to_view.update(cx, |v, cx| v.push_notice(note, cx));
+        }
+        self.sync_relay_banners(cx);
     }
 
     /// Deja escrito en la sesión autora que atienda los hallazgos.
@@ -527,7 +660,8 @@ impl ProjectView {
                 }
             }
         }
-        let rest: Vec<usize> = (0..self.tabs.len()).filter(|i| !used.contains(i)).collect();
+        let rest: Vec<usize> =
+            (0..self.tabs.len()).filter(|i| !used.contains(i) && self.tabs.get(*i).is_some_and(|t| super::is_session(&t.kind))).collect();
         if !rest.is_empty() && !used.is_empty() {
             out.push(div().mt_2().px_1().text_xs().text_color(style::faint()).child("Other").into_any_element());
         }
@@ -1428,7 +1562,7 @@ fn dot(window: &mut Window, center: Point<Pixels>, r: f32, fill: Hsla, border: H
 
 #[cfg(test)]
 mod tests {
-    use super::meaningful_title;
+    use super::{meaningful_title, reviewer_is_done};
     use crate::project::Harness;
 
     #[test]
@@ -1437,5 +1571,14 @@ mod tests {
         assert_eq!(meaningful_title("claude", Harness::Claude), None);
         assert_eq!(meaningful_title("~/Desktop/kuaky", Harness::Antigravity), None);
         assert_eq!(meaningful_title("Fix LSP underline", Harness::Claude).as_deref(), Some("Fix LSP underline"));
+    }
+
+    #[test]
+    fn detects_when_the_reviewer_is_done() {
+        assert!(reviewer_is_done("LGTM"));
+        assert!(reviewer_is_done("Checked again.\nLGTM — nothing else."));
+        assert!(reviewer_is_done("I found no further issues."));
+        assert!(!reviewer_is_done("Two problems: the LGTM check in foo() is wrong."));
+        assert!(!reviewer_is_done("1. src/a.rs:10 leaks the handle"));
     }
 }

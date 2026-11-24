@@ -322,3 +322,13 @@ Cada fase con commit propio, tests con el agente falso y captura de la vista.
 
 Probado con el agente falso (`crates/kuaky-acp/tests/mock_agent.py`) y con el handshake real de
 `claude-agent-acp` y `agy acp` (sin enviar mensajes, para no gastar tokens).
+
+### Actualización (24-nov)
+
+- Nuevo diseño: tus mensajes en burbuja a la derecha (estilo app de Claude), herramientas agrupadas en una línea ("Ran 3 commands, edited a.rs +4 −1 ›") con tarjetas estilo Zed al abrir, caja de texto con los selectores adentro (on/off como interruptor).
+- Línea viva mientras trabaja: qué hace, tiempo del turno y "no output for 40s"; flecha para bajar al final.
+- Imágenes: pegar con ⌘V o adjuntar con +.
+- % de contexto (y costo) desde `usage_update`.
+- Revisión por turno: Keep / Reject por bloque (rechazar revierte ese bloque en disco) y comentarios por línea que se mandan al chat.
+- Las sesiones ya no salen en las pestañas de arriba; viven en la barra izquierda.
+- Pendiente: seguir al agente (follow), Codex.

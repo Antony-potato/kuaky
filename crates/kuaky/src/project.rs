@@ -219,6 +219,7 @@ enum TabKind {
     #[allow(dead_code)]
     Chat { view: Entity<ChatView>, harness: Harness },
     Search(Entity<SearchView>),
+    Review(Entity<crate::review_view::ReviewView>),
 }
 
 struct Tab {
@@ -339,6 +340,8 @@ pub struct ProjectView {
     task_watchers: HashMap<String, TaskWatcher>,
     /// Full-screen board (`None` = closed).
     board: Option<metro::Board>,
+    /// Chats conectados (revisor ↔ autor).
+    relays: Vec<metro::Relay>,
     mini_map_collapsed: bool,
     /// Shown in the window (other projects stay open in the background).
     visible: bool,
@@ -434,6 +437,7 @@ impl ProjectView {
             },
             task_watchers: HashMap::new(),
             board: None,
+            relays: Vec::new(),
             mini_map_collapsed: false,
             visible: true,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
@@ -1170,15 +1174,21 @@ impl ProjectView {
                     let patch = patch.clone();
                     this.open_diff(title.clone(), "proposed agent change".into(), move || Ok(patch), window, cx);
                 }
+                ChatEvent::OpenReview { title, files } => this.open_review(view.clone(), title.clone(), files.clone(), window, cx),
                 ChatEvent::NeedsYou(msg) => {
                     this.notify(format!("{} needs your permission", harness.label()), msg.clone(), is_active_tab, window, cx)
                 }
                 ChatEvent::TurnDone => {
                     let uid = view.read(cx).uid.clone();
                     this.lines.on_turn_done(&uid);
+                    this.relay_turn_done(&uid, cx);
                     this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx)
                 }
                 ChatEvent::Status => {}
+                ChatEvent::RelayAuto(on) => {
+                    let uid = view.read(cx).uid.clone();
+                    this.set_relay_auto(&uid, *on, cx);
+                }
                 ChatEvent::OpenFile { path, line } => this.open_file_at(path.clone(), line.saturating_sub(1), 0, window, cx),
                 ChatEvent::Prompt(text) => {
                     let uid = view.read(cx).uid.clone();
@@ -1313,6 +1323,36 @@ impl ProjectView {
         }
         let view = cx.new(|cx| DiffView::new(title, subtitle, load, cx));
         self.push_tab(TabKind::Diff(view), window, cx);
+    }
+
+    /// Revisión de un turno del chat: bloques para aceptar/rechazar y comentarios.
+    fn open_review(
+        &mut self,
+        chat: Entity<ChatView>,
+        title: String,
+        files: Vec<(PathBuf, Option<String>, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::review_view::{ReviewEvent, ReviewView};
+        if let Some(i) = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Review(r) if r.read(cx).title.as_ref() == title)) {
+            self.tabs.remove(i);
+        }
+        let root = self.root.clone();
+        let view = cx.new(|cx| ReviewView::new(title, root, files, window, cx));
+        let weak_chat = chat.downgrade();
+        let sub = cx.subscribe_in(&view, window, move |this, _, ev: &ReviewEvent, window, cx| match ev {
+            ReviewEvent::SendToAgent(text) => {
+                let Some(chat) = weak_chat.upgrade() else { return };
+                chat.update(cx, |c, cx| c.submit_text(text.clone(), cx));
+                if let Some(i) = this.tabs.iter().position(|t| matches!(&t.kind, TabKind::Chat { view, .. } if *view == chat)) {
+                    this.activate(i, window, cx);
+                }
+            }
+            ReviewEvent::OpenFile { path, line } => this.open_file_at(path.clone(), line.saturating_sub(1), 0, window, cx),
+        });
+        self._subs.push(sub);
+        self.push_tab(TabKind::Review(view), window, cx);
     }
 
     // ── git ─────────────────────────────────────────────────────────────
@@ -2173,6 +2213,14 @@ impl ProjectView {
                     TabKind::Search(_) => {
                         (icons::ui("search", px(14.), style::accent()).into_any_element(), None, "Search".into(), false, None, false)
                     }
+                    TabKind::Review(r) => (
+                        icons::ui("list-checks", px(14.), style::accent()).into_any_element(),
+                        None,
+                        r.read(cx).title.clone(),
+                        false,
+                        None,
+                        false,
+                    ),
                     TabKind::Chat { view, harness } => {
                         let v = view.read(cx);
                         let (_, dot) = chat_status(v);
@@ -2241,6 +2289,7 @@ impl ProjectView {
                 TabKind::Conflicts(v) => v.clone().into_any_element(),
                 TabKind::Chat { view, .. } => view.clone().into_any_element(),
                 TabKind::Search(v) => v.clone().into_any_element(),
+                TabKind::Review(v) => v.clone().into_any_element(),
             },
             None => self.empty_state(cx).into_any_element(),
         };

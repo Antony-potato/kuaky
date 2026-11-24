@@ -61,6 +61,8 @@ pub enum ChatStatus {
 
 pub enum ChatEvent {
     OpenDiff { title: String, patch: String },
+    /// Revisar los cambios de un turno: (ruta, antes, después).
+    OpenReview { title: String, files: Vec<(PathBuf, Option<String>, String)> },
     OpenFile { path: PathBuf, line: u32 },
     /// Cambió el estado (para la barra de sesiones y los avisos).
     Status,
@@ -73,6 +75,17 @@ pub enum ChatEvent {
     /// ID de la sesión del agente (para retomarla después).
     Session(String),
     Title(String),
+    /// Encender/apagar las rondas automáticas con la sesión conectada.
+    RelayAuto(bool),
+}
+
+/// Conexión con otra sesión (revisor ↔ autor), mostrada arriba del chat.
+#[derive(Clone)]
+pub struct RelayBanner {
+    /// "Reviewing for Claude Code chat" / "Reviewed by Antigravity".
+    pub text: String,
+    pub auto: bool,
+    pub rounds_left: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -195,6 +208,7 @@ pub struct ChatView {
     pub uid: String,
     pub session: Option<String>,
     pub title: Option<String>,
+    pub relay: Option<RelayBanner>,
     client: Option<Arc<Client>>,
     turns: Vec<Turn>,
     branches: Vec<Branch>,
@@ -263,6 +277,7 @@ impl ChatView {
             uid: new_uid(),
             session: None,
             title: None,
+            relay: None,
             client: None,
             turns: Vec::new(),
             branches: Vec::new(),
@@ -540,6 +555,13 @@ impl ChatView {
                 }
                 cx.emit(ChatEvent::TurnDone);
                 cx.emit(ChatEvent::Status);
+                #[cfg(feature = "screenshot")]
+                if std::env::var("KUAKY_DEMO_REVIEW").is_ok() {
+                    if let Some(turn) = self.turns.last() {
+                        let files = turn.files.iter().map(|(p, (o, n))| (p.clone(), o.clone(), n.clone())).collect();
+                        cx.emit(ChatEvent::OpenReview { title: "Review · message #1".into(), files });
+                    }
+                }
                 if !self.queue.is_empty() {
                     let next = self.queue.remove(0);
                     self.dispatch(next.text, next.images, cx);
@@ -579,6 +601,28 @@ impl ChatView {
             }
             _ => {}
         }
+    }
+
+    /// Respuesta del agente en el último turno (para pasarla a la sesión conectada).
+    pub fn last_answer(&self) -> Option<String> {
+        let turn = self.turns.iter().rev().find(|t| t.items.iter().any(|i| matches!(i, Item::Agent(_))))?;
+        let text: Vec<&str> = turn.items.iter().filter_map(|i| if let Item::Agent(t) = i { Some(t.as_str()) } else { None }).collect();
+        Some(text.join("\n\n").trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    pub fn push_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.current_turn().items.push(Item::Notice(text));
+        cx.notify();
+    }
+
+    /// Envía un mensaje armado por kuaky (p. ej. comentarios de revisión); en cola si está ocupado.
+    pub fn submit_text(&mut self, text: String, cx: &mut Context<Self>) {
+        match self.status {
+            ChatStatus::Ready => self.dispatch(text, Vec::new(), cx),
+            ChatStatus::Running | ChatStatus::Connecting => self.queue.push(Queued { text, images: Vec::new() }),
+            _ => {}
+        }
+        cx.notify();
     }
 
     /// Imágenes pegadas o elegidas para el próximo mensaje.
@@ -1007,12 +1051,7 @@ impl ChatView {
     fn changes_card(&self, ti: usize, turn: &Turn, live: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (added, removed) = turn.stats();
         let files = turn.files.len();
-        let patch: String = turn
-            .files
-            .iter()
-            .map(|(p, (old, new))| unified_patch(&FileDiff { path: p.to_string_lossy().into_owned(), old_text: old.clone(), new_text: new.clone() }))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let review: Vec<(PathBuf, Option<String>, String)> = turn.files.iter().map(|(p, (old, new))| (p.clone(), old.clone(), new.clone())).collect();
         let n = turn.user.as_ref().map(|u| u.n).unwrap_or(0);
         let open = self.expanded.contains(&(ti, usize::MAX));
         v_flex()
@@ -1053,7 +1092,7 @@ impl ChatView {
                             .child("Review")
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.stop_propagation();
-                                cx.emit(ChatEvent::OpenDiff { title: format!("Changes · message #{n}"), patch: patch.clone() });
+                                cx.emit(ChatEvent::OpenReview { title: format!("Review · message #{n}"), files: review.clone() });
                             })),
                     ),
             )
@@ -1884,7 +1923,49 @@ impl Render for ChatView {
                         .child(div().text_xs().text_color(style::muted()).whitespace_normal().child(e.clone())),
                 )
                 .into_any_element(),
-            _ => div().flex().flex_row().flex_1().min_h_0().child(conversation).child(self.prompt_rail(&refs, cx)).into_any_element(),
+            _ => {
+                let away = !turns.is_empty() && !self.at_bottom();
+                let running = self.status == ChatStatus::Running;
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(conversation)
+                    .child(self.prompt_rail(&refs, cx))
+                    // Flecha para bajar al final (con punto si el agente sigue trabajando).
+                    .when(away, |d| {
+                        d.child(
+                            div().absolute().bottom(px(12.)).left_0().right_0().flex().justify_center().child(
+                                div()
+                                    .id("scroll-to-bottom")
+                                    .relative()
+                                    .size(px(32.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(style::panel_hover())
+                                    .border_1()
+                                    .border_color(style::border())
+                                    .shadow_md()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(style::border()))
+                                    .tooltip(|window, cx| Tooltip::new("Jump to latest").build(window, cx))
+                                    .child(crate::icons::ui("arrow-down", px(16.), style::text()))
+                                    .when(running, |d| {
+                                        d.child(div().absolute().top(px(-2.)).right(px(-2.)).size(px(9.)).rounded_full().bg(style::accent()))
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.scroll.scroll_to_bottom();
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            }
         };
 
         let suggestions = (!self.suggestions.is_empty()).then(|| {
@@ -2176,6 +2257,46 @@ impl Render for ChatView {
             .capture_key_down(cx.listener(Self::on_key))
             .bg(style::bg())
             .child(self.header(cx))
+            .when_some(self.relay.clone(), |d, relay| {
+                d.child(
+                    h_flex()
+                        .px_4()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .border_b_1()
+                        .border_color(style::border())
+                        .bg(style::accent_alpha(0.05))
+                        .child(crate::icons::ui("arrow-left-right", px(12.), style::accent()))
+                        .child(div().text_color(style::muted()).child(relay.text.clone()))
+                        .child(div().flex_1())
+                        .when(relay.auto, |d| d.child(div().text_color(style::faint()).child(format!("{} round{} left", relay.rounds_left, if relay.rounds_left == 1 { "" } else { "s" }))))
+                        .child(
+                            h_flex()
+                                .id("relay-auto")
+                                .gap_1p5()
+                                .items_center()
+                                .cursor_pointer()
+                                .text_color(style::muted())
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Auto rounds: when one side finishes, its answer is sent to the other (up to 3 rounds; stops when the reviewer finds nothing more)")
+                                        .build(window, cx)
+                                })
+                                .child("Auto rounds")
+                                .child(
+                                    div()
+                                        .w(px(24.))
+                                        .h(px(14.))
+                                        .p(px(2.))
+                                        .rounded_full()
+                                        .bg(if relay.auto { style::accent().into() } else { style::border() })
+                                        .child(div().size(px(10.)).rounded_full().bg(style::text()).when(relay.auto, |d| d.ml(px(10.)))),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChatEvent::RelayAuto(!relay.auto)))),
+                        ),
+                )
+            })
             .when(self.viewing.is_some(), |d| {
                 d.child(
                     h_flex()

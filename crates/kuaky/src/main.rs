@@ -14,6 +14,7 @@ mod lines;
 mod lsp;
 mod project;
 mod quick_open;
+mod review_view;
 mod search_view;
 mod settings;
 mod state;
