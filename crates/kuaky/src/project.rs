@@ -443,6 +443,13 @@ impl ProjectView {
         let repo = Repo::discover(&root);
         let graph = cx.new(|cx| GraphView::new(repo.clone(), cx));
         let actions = cx.new(|_| crate::actions_panel::ActionsPanel::new(repo.clone()));
+        let actions_sub = cx.subscribe_in(&actions, window, |this, _, ev: &crate::actions_panel::ActionsEvent, window, cx| match ev {
+            crate::actions_panel::ActionsEvent::Finished { title, message } => {
+                let shown = this.panel == Some(SidePanel::Actions);
+                this.notify(title.clone(), message.clone(), shown, window, cx);
+                cx.notify();
+            }
+        });
         let graph_sub = cx.subscribe_in(&graph, window, |this, _, ev: &GraphEvent, window, cx| match ev {
             GraphEvent::OpenCommit { hash, short_hash, subject } => {
                 let Some(repo) = this.repo.clone() else { return };
@@ -551,6 +558,17 @@ impl ProjectView {
             visible: true,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
         };
+        this._subs.push(actions_sub);
+        let actions_obs = cx.observe(&this.actions, |_, _, cx| cx.notify());
+        this._subs.push(actions_obs);
+        // Actions se sigue en segundo plano si el repo tiene workflows (para avisar al terminar).
+        if this.root.join(".github").join("workflows").is_dir() && kuaky_git::find_program("gh").is_some() {
+            let branch = this.git.branch.clone();
+            this.actions.update(cx, |a, cx| {
+                a.set_branch(branch);
+                a.ensure_started(cx);
+            });
+        }
         this.start_map_refresh(cx);
         this.detect_agents(cx);
         this.start_git_refresh(cx);
@@ -1615,6 +1633,10 @@ impl ProjectView {
                 let alive = this
                     .update(cx, |this, cx| {
                         let branches_changed = this.git.branches != branches || this.git.branch != branch;
+                        if this.git.branch != branch {
+                            let b = branch.clone();
+                            this.actions.update(cx, |a, _| a.set_branch(b));
+                        }
                         this.git.branch = branch;
                         this.git.branches = branches;
                         this.git.worktrees = worktrees;
@@ -2972,6 +2994,7 @@ impl ProjectView {
             (SidePanel::Changes, self.git.changes.len()),
             (SidePanel::Branches, self.git.branches.len()),
             (SidePanel::Prs, self.git.prs.as_ref().and_then(|p| p.as_ref().ok()).map_or(0, |p| p.len())),
+            (SidePanel::Actions, self.actions.read(cx).running_count()),
         ]);
 
         let top_toolbar = h_flex()

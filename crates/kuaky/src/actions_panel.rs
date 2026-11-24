@@ -9,7 +9,13 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kuaky_git::{Repo, Workflow, WorkflowInput, WorkflowRun};
+use std::collections::HashSet;
 use std::time::Duration;
+
+/// Una ejecución terminó y vale la pena avisar.
+pub enum ActionsEvent {
+    Finished { title: String, message: String },
+}
 
 enum Field {
     Text(Entity<InputState>),
@@ -38,7 +44,15 @@ pub struct ActionsPanel {
     branch: Option<String>,
     /// Pedir de nuevo pronto (tras lanzar algo, las ejecuciones tardan en aparecer).
     soon: bool,
+    /// Ejecuciones que vimos corriendo (para notar cuándo terminan).
+    seen_running: HashSet<u64>,
+    /// Lanzadas o re-lanzadas desde kuaky: se avisa siempre al terminar.
+    mine: HashSet<u64>,
+    /// Workflows lanzados a mano desde kuaky y cuándo (su ejecución aparece después).
+    launched: Vec<(u64, jiff::Timestamp)>,
 }
+
+impl EventEmitter<ActionsEvent> for ActionsPanel {}
 
 impl ActionsPanel {
     pub fn new(repo: Option<Repo>) -> ActionsPanel {
@@ -55,6 +69,9 @@ impl ActionsPanel {
             notice: None,
             branch: None,
             soon: false,
+            seen_running: HashSet::new(),
+            mine: HashSet::new(),
+            launched: Vec::new(),
         }
     }
 
@@ -76,6 +93,53 @@ impl ActionsPanel {
             cx.background_executor().timer(Duration::from_secs(if fast { 8 } else { 60 })).await;
         })
         .detach();
+    }
+
+    /// Ejecuciones en curso (para el número de la pestaña).
+    pub fn running_count(&self) -> usize {
+        match &self.runs {
+            Some(Ok(runs)) => runs.iter().filter(|r| r.running()).count(),
+            _ => 0,
+        }
+    }
+
+    /// Compara con la carga anterior: avisa de las que terminaron.
+    fn track(&mut self, runs: &[WorkflowRun], first: bool) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for r in runs {
+            // Ejecución de un workflow que lanzaste tú desde aquí.
+            if r.event == "workflow_dispatch" {
+                if let Ok(created) = r.created_at.parse::<jiff::Timestamp>() {
+                    if let Some(k) = self.launched.iter().position(|(w, at)| *w == r.workflow_database_id && created >= *at - jiff::SignedDuration::from_secs(30)) {
+                        self.launched.remove(k);
+                        self.mine.insert(r.database_id);
+                    }
+                }
+            }
+            if r.running() {
+                self.seen_running.insert(r.database_id);
+                continue;
+            }
+            if first || !self.seen_running.remove(&r.database_id) {
+                continue;
+            }
+            let mine = self.mine.remove(&r.database_id);
+            let failed = matches!(r.conclusion.as_str(), "failure" | "startup_failure" | "timed_out");
+            let on_my_branch = self.branch.as_deref() == Some(r.head_branch.as_str());
+            if !(mine || (failed && on_my_branch)) {
+                continue;
+            }
+            let result = match r.conclusion.as_str() {
+                "success" => "passed",
+                "cancelled" => "was cancelled",
+                "skipped" => "was skipped",
+                _ if failed => "failed",
+                other => other,
+            };
+            out.push((format!("{} {result}", r.workflow_name), format!("#{} · {} · {}", r.number, r.head_branch, r.display_title)));
+        }
+        self.launched.retain(|(_, at)| jiff::Timestamp::now().duration_since(*at).as_secs() < 600);
+        out
     }
 
     fn any_running(&self) -> bool {
@@ -100,6 +164,12 @@ impl ActionsPanel {
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
                 this.workflows = Some(workflows);
+                if let Ok(list) = &runs {
+                    let first = this.runs.is_none();
+                    for (title, message) in this.track(list, first) {
+                        cx.emit(ActionsEvent::Finished { title, message });
+                    }
+                }
                 this.runs = Some(runs);
                 cx.notify();
             });
@@ -159,6 +229,7 @@ impl ActionsPanel {
             }
         }
         let workflow = form.workflow.clone();
+        self.launched.push((workflow.id, jiff::Timestamp::now()));
         self.busy = Some(format!("Starting {}…", workflow.name));
         self.error = None;
         cx.notify();
@@ -187,6 +258,11 @@ impl ActionsPanel {
 
     fn run_action(&mut self, run: u64, what: RunAction, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
+        if !matches!(what, RunAction::Cancel) {
+            self.mine.insert(run);
+            // Un re-run vuelve a la misma ejecución: se la vuelve a ver correr.
+            self.seen_running.remove(&run);
+        }
         self.error = None;
         self.notice = None;
         cx.spawn(async move |this, cx| {
@@ -637,5 +713,37 @@ impl Render for ActionsPanel {
                     .child(runs),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ActionsPanel;
+    use kuaky_git::WorkflowRun;
+
+    fn run(id: u64, status: &str, conclusion: &str, branch: &str, event: &str) -> WorkflowRun {
+        serde_json::from_value(serde_json::json!({
+            "databaseId": id, "number": id, "displayTitle": "t", "workflowName": "CI", "workflowDatabaseId": 7,
+            "status": status, "conclusion": conclusion, "headBranch": branch, "event": event,
+            "createdAt": jiff::Timestamp::now().to_string(), "url": ""
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn announces_only_what_matters() {
+        let mut p = ActionsPanel::new(None);
+        p.set_branch(Some("main".into()));
+        // Primera carga: lo que ya terminó no se anuncia.
+        assert!(p.track(&[run(1, "completed", "failure", "main", "push")], true).is_empty());
+        p.track(&[run(2, "in_progress", "", "main", "push"), run(3, "in_progress", "", "other", "push"), run(4, "in_progress", "", "other", "push")], false);
+        p.mine.insert(4);
+        let done = p.track(&[run(2, "completed", "failure", "main", "push"), run(3, "completed", "failure", "other", "push"), run(4, "completed", "success", "other", "push")], false);
+        // Falló en tu rama → sí; falló en otra rama → no; lanzada por ti → sí aunque pasó.
+        assert_eq!(done.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["CI failed", "CI passed"]);
+        // Lanzada a mano desde kuaky: su ejecución nueva cuenta como tuya.
+        p.launched.push((7, jiff::Timestamp::now()));
+        p.track(&[run(5, "queued", "", "other", "workflow_dispatch")], false);
+        assert_eq!(p.track(&[run(5, "completed", "cancelled", "other", "workflow_dispatch")], false).len(), 1);
     }
 }
