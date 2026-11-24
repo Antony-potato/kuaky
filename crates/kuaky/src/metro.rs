@@ -886,6 +886,8 @@ impl ProjectView {
                     finished: line.is_finished(),
                     needs,
                     depth: *depth,
+                    selected: selected.as_deref() == Some(line.id.as_str()),
+                    dim: selected.as_deref().is_some_and(|s| s != line.id),
                 }
             })
             .collect();
@@ -894,24 +896,39 @@ impl ProjectView {
         let labels = v_flex().w(px(LABEL_W)).flex_none().pt(px(TOP)).children(rows.iter().map(|(line, depth)| {
             let id = line.id.clone();
             let is_sel = selected.as_deref() == Some(line.id.as_str());
+            let dim = selected.is_some() && !is_sel;
             let (state, state_color) = self.line_state(line, &trains);
+            let c = line_color(line.color);
             v_flex()
                 .id(SharedString::from(format!("board-label-{}", line.id)))
-                .h(px(ROW))
+                .h(px(ROW - 8.))
+                .my(px(4.))
+                .ml_1()
                 .justify_center()
                 .pl(px(12. + *depth as f32 * 14.))
                 .pr_2()
                 .cursor_pointer()
-                .rounded_md()
-                .when(is_sel, |d| d.bg(style::panel_hover()))
-                .hover(|d| d.bg(style::panel_hover()))
+                .rounded_l(px(10.))
+                .border_l_4()
+                .border_color(if is_sel { c.into() } else { style::transparent() })
+                .when(is_sel, |d| d.bg(style::soft(c, 0.10)))
+                .when(dim, |d| d.opacity(0.55))
+                .hover(|d| d.bg(style::panel_hover()).opacity(1.))
                 .on_click(cx.listener(move |this, _, window, cx| this.select_line(id.clone(), window, cx)))
                 .child(
                     h_flex()
                         .gap_1p5()
                         .items_center()
-                        .child(div().size(px(9.)).flex_none().rounded_full().bg(line_color(line.color)))
-                        .child(div().flex_1().min_w_0().truncate().text_sm().child(line.name.clone())),
+                        .child(div().size(px(9.)).flex_none().rounded_full().bg(c))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .when(is_sel, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                .child(line.name.clone()),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -969,7 +986,8 @@ impl ProjectView {
                         .text_size(px(10.))
                         .text_center()
                         .truncate()
-                        .text_color(if st.state == StationState::Active { style::text() } else { style::faint() })
+                        .text_color(if st.state == StationState::Active || g.selected { style::text() } else { style::faint() })
+                        .when(g.dim, |d| d.opacity(0.5))
                         .child(st.title.clone())
                         .into_any_element(),
                 );
@@ -1486,6 +1504,9 @@ struct RowGeom {
     finished: bool,
     needs: bool,
     depth: usize,
+    /// Línea elegida (resaltada) y si hay otra elegida (esta se atenúa).
+    selected: bool,
+    dim: bool,
 }
 
 fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
@@ -1504,13 +1525,28 @@ fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
         }
     }
 
+    // Franja detrás de la línea elegida, de lado a lado.
+    for row in rows.iter().filter(|r| r.selected) {
+        window.paint_quad(PaintQuad {
+            bounds: Bounds { origin: pt(0., row.y - ROW * 0.5 + 4.), size: size(bounds.size.width, px(ROW - 8.)) },
+            corner_radii: Corners::all(px(10.)),
+            background: style::soft(line_color(row.color), 0.10).into(),
+            border_widths: Edges::all(px(1.)),
+            border_color: style::soft(line_color(row.color), 0.35),
+            border_style: BorderStyle::Solid,
+        });
+    }
+
     for row in rows {
-        let color: Hsla = if row.finished && !row.merged { style::soft(line_color(row.color), 0.45) } else { line_color(row.color).into() };
+        let base: Hsla = if row.finished && !row.merged { style::soft(line_color(row.color), 0.45) } else { line_color(row.color).into() };
+        // Con una línea elegida, las demás quedan atenuadas.
+        let color = if row.dim { Hsla { a: base.a * 0.35, ..base } } else { base };
+        let width = if row.selected { 6. } else { 4. };
         let n = row.stations.len();
         let last_x = row.start + n.saturating_sub(1) as f32 * SPACING;
 
         // Salida: desde main (raíz) o desde la línea padre (sub-línea).
-        let mut p = PathBuilder::stroke(px(4.));
+        let mut p = PathBuilder::stroke(px(width));
         match row.parent_y {
             Some(py) if row.depth > 0 => {
                 let bx = row.start - 46.;
@@ -1535,7 +1571,7 @@ fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
                 d.move_to(pt(x, row.y));
                 d.line_to(pt(x + 7., row.y));
                 if let Ok(path) = d.build() {
-                    window.paint_path(path, style::soft(line_color(row.color), 0.6));
+                    window.paint_path(path, Hsla { a: color.a * 0.6, ..color });
                 }
                 x += 13.;
             }
