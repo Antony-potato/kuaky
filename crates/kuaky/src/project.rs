@@ -424,6 +424,10 @@ pub struct ProjectView {
     center_split: Entity<ResizableState>,
     /// Left sidebar folded into a thin rail.
     left_collapsed: bool,
+    /// Barra plegada: el cursor está sobre la columna de íconos.
+    rail_hovered: bool,
+    /// Barra plegada abierta encima de todo mientras el cursor está en ella.
+    left_peek: bool,
     layout_collapsed: Entity<ResizableState>,
     /// Sesión (uid) → PR que hizo.
     session_prs: HashMap<String, u64>,
@@ -555,6 +559,8 @@ impl ProjectView {
             doc_hidden: false,
             center_split: cx.new(|_| ResizableState::default()),
             left_collapsed: state::get(cx).left_collapsed || (cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_COLLAPSED").is_ok()),
+            rail_hovered: false,
+            left_peek: cfg!(feature = "screenshot") && std::env::var("KUAKY_DEMO_PEEK").is_ok(),
             layout_collapsed: cx.new(|_| ResizableState::default()),
             session_prs: HashMap::new(),
             subagents_open: saved.subagents_open.iter().cloned().collect(),
@@ -985,6 +991,7 @@ impl ProjectView {
     pub fn launch(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
         self.new_session_menu = false;
         self.new_session_line = None;
+        self.left_peek = false;
         if self.opens_as_chat(harness, cx) {
             let cwd = self.new_worktree(harness, cx).map(|(path, _)| path);
             self.open_chat_with(harness, ChatOpts { cwd, ..Default::default() }, window, cx);
@@ -1102,6 +1109,7 @@ impl ProjectView {
                     this.new_session_menu = false;
                     this.new_session_line = None;
                     this.new_session_closed = Some(Instant::now());
+                    this.left_peek = false;
                     cx.notify();
                 }
             }))
@@ -2395,6 +2403,7 @@ impl ProjectView {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.left_collapsed = !self.left_collapsed;
+        self.left_peek = false;
         let collapsed = self.left_collapsed;
         state::update(cx, |s| s.left_collapsed = collapsed);
         if collapsed {
@@ -2407,6 +2416,23 @@ impl ProjectView {
     fn sidebar_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         v_flex()
+            .id("sidebar-rail")
+            // Al dejar el cursor encima, la barra completa se abre flotando (como en la app de Claude).
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.rail_hovered = *hovered;
+                if *hovered && !this.left_peek {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(Duration::from_millis(150)).await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.rail_hovered && this.left_collapsed && !this.left_peek {
+                                this.left_peek = true;
+                                cx.notify();
+                            }
+                        });
+                    })
+                    .detach();
+                }
+            }))
             .w(px(44.))
             .h_full()
             .flex_none()
@@ -4058,6 +4084,7 @@ impl Render for ProjectView {
                     if self.left_collapsed {
                         h_flex()
                             .size_full()
+                            .relative()
                             .child(self.sidebar_rail(cx))
                             .child(
                                 div().flex_1().min_w_0().h_full().child(
@@ -4067,6 +4094,29 @@ impl Render for ProjectView {
                                         .child(resizable_panel().size(px(right)).size_range(px(220.)..px(560.)).child(self.right_panel(cx))),
                                 ),
                             )
+                            // Barra completa flotando encima mientras el cursor está en ella.
+                            .when(self.left_peek, |d| {
+                                d.child(
+                                    div()
+                                        .id("sidebar-peek")
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left_0()
+                                        .w(px(left))
+                                        .occlude()
+                                        .shadow_lg()
+                                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                            // Con un menú suyo abierto no se pliega (el menú sale fuera de la barra).
+                                            if !*hovered && !this.new_session_menu && this.new_session_line.is_none() {
+                                                this.left_peek = false;
+                                                this.rail_hovered = false;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child(self.left_sidebar(cx)),
+                                )
+                            })
                             .into_any_element()
                     } else {
                         h_resizable("project-layout")

@@ -451,6 +451,7 @@ impl ProjectView {
         self.board = None;
         self.new_session_menu = false;
         self.new_session_line = None;
+        self.left_peek = false;
         if self.opens_as_chat(harness, cx) {
             let opts = ChatOpts { line: Some(line_id), draft: paste, cwd: Some(cwd), ..Default::default() };
             self.open_chat_with(harness, opts, window, cx);
@@ -474,6 +475,7 @@ impl ProjectView {
         self.board = None;
         self.new_session_menu = false;
         self.new_session_line = None;
+        self.left_peek = false;
         if self.opens_as_chat(harness, cx) {
             let opts = ChatOpts { line: Some(sub), draft: paste, cwd: Some(cwd), ..Default::default() };
             self.open_chat_with(harness, opts, window, cx);
