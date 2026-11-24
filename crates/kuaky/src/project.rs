@@ -467,7 +467,18 @@ impl ProjectView {
         let key = root.to_string_lossy().into_owned();
         state::update(cx, |s| state::touch_recent(s, &key));
         let saved = state::get(cx).projects.get(&key).cloned().unwrap_or_default();
-        let previous = with_agent_history(saved.sessions.clone(), &root);
+        // Sessions open when kuaky closed come back by themselves; the rest go to Previous.
+        // (Agent terminals without a conversation ID stay in Previous: `--continue`
+        // would reopen the same latest conversation for all of them.)
+        let capture = std::env::var_os("KUAKY_SCREENSHOT").is_some();
+        let (reopen, closed): (Vec<SavedSession>, Vec<SavedSession>) = saved.sessions.clone().into_iter().partition(|s| {
+            s.open && !capture && (s.chat || s.harness == Harness::Shell.key() || s.conversation.as_deref().is_some_and(|c| !c.is_empty()))
+        });
+        let closed: Vec<SavedSession> = closed.into_iter().map(|mut s| {
+            s.open = false;
+            s
+        }).collect();
+        let previous = with_agent_history(closed, &root);
         let key_path = root.clone();
         let lsp = cx.new(|_| crate::lsp::LspStore::new(root.clone()));
         let lsp_sub = cx.subscribe_in(&lsp, window, |this, _, ev: &crate::lsp::LspStoreEvent, window, cx| match ev {
@@ -541,6 +552,10 @@ impl ProjectView {
         if !saved.files.is_empty() {
             this.active = this.tabs.len().checked_sub(1);
         }
+        for session in reopen {
+            this.previous.insert(0, session);
+            this.resume(0, window, cx);
+        }
         this
     }
 
@@ -601,6 +616,7 @@ impl ProjectView {
                         custom_color: *custom_color,
                         conversation,
                         chat: false,
+                        open: true,
                         from_history: false,
                         updated: None,
                     })
@@ -617,6 +633,7 @@ impl ProjectView {
                         custom_color: None,
                         conversation: v.session.clone(),
                         chat: true,
+                        open: true,
                         from_history: false,
                         updated: None,
                     })
@@ -625,8 +642,10 @@ impl ProjectView {
             })
             .collect();
         for p in self.previous.iter().filter(|p| !p.from_history) {
-            if !sessions.contains(p) {
-                sessions.push(p.clone());
+            let mut p = p.clone();
+            p.open = false;
+            if !sessions.iter().any(|s| s.uid.is_some() && s.uid == p.uid) && !sessions.contains(&p) {
+                sessions.push(p);
             }
         }
         let key = self.root.to_string_lossy().into_owned();
@@ -1016,7 +1035,9 @@ impl ProjectView {
         let view = cx.new(|cx| TerminalView::new(harness.label(), launch, status_file, window, cx));
         let sub = cx.subscribe_in(&view, window, move |this, view, ev: &TerminalViewEvent, window, cx| {
             match ev {
-                TerminalViewEvent::Exited => this.persist(cx),
+                // While kuaky quits, terminals end too: don't save them as gone.
+                TerminalViewEvent::Exited if !crate::app::quitting() => this.persist(cx),
+                TerminalViewEvent::Exited => {}
                 TerminalViewEvent::AgentState => {
                     this.on_agent_state(view, harness, window, cx);
                     let v = view.read(cx);
@@ -4012,6 +4033,7 @@ fn with_agent_history(mut sessions: Vec<SavedSession>, root: &Path) -> Vec<Saved
             custom_color: None,
             conversation: Some(c.id),
             chat: false,
+            open: false,
             from_history: true,
             updated: c.updated,
         });

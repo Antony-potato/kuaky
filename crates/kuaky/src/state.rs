@@ -129,6 +129,9 @@ pub struct SavedSession {
     /// Opened as kuaky's own chat (ACP) instead of a terminal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chat: bool,
+    /// It was open when kuaky closed: reopened automatically on launch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
     /// Listed from the agent's own history (not saved by kuaky).
     #[serde(skip)]
     pub from_history: bool,

@@ -1056,6 +1056,7 @@ impl ProjectView {
             .id("board-overlay")
             .absolute()
             .inset_0()
+            .occlude()
             .bg(style::bg())
             .track_focus(&board.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {

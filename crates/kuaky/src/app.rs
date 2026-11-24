@@ -16,8 +16,23 @@ actions!(kuaky, [Quit, GoHome, OpenFolder, OpenSettings, Hide, HideOthers, ShowA
 
 const REPO_URL: &str = "https://github.com/Antony-potato/kuaky";
 
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// kuaky is closing (sessions ending now must stay saved as open).
+pub fn quitting() -> bool {
+    QUITTING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn init(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| {
+        QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+        cx.quit()
+    });
+    cx.on_app_quit(|_| {
+        QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+        async {}
+    })
+    .detach();
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -361,7 +376,10 @@ impl KuakyApp {
         .detach();
     }
 
-    fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The title bar keeps 80 px for the macOS window buttons, which are hidden
+        // in full screen: there, pull the content back to the left edge.
+        let fullscreen = cfg!(target_os = "macos") && window.is_fullscreen();
         let mac = cfg!(target_os = "macos");
         let home_tip: SharedString = if mac { "Home (⌘⇧H)".into() } else { "Home (Ctrl+Shift+H)".into() };
         let settings_tip: SharedString = if mac { "Settings (⌘,)".into() } else { "Settings (Ctrl+,)".into() };
@@ -386,6 +404,7 @@ impl KuakyApp {
             h_flex()
                 .flex_1()
                 .min_w_0()
+                .when(fullscreen, |d| d.ml(px(-80.)))
                 .gap_1()
                 .items_center()
                 .text_sm()
@@ -541,7 +560,7 @@ fn project_name(root: &std::path::Path) -> String {
 }
 
 impl Render for KuakyApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .relative()
@@ -561,7 +580,7 @@ impl Render for KuakyApp {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings(window, cx)))
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
-            .child(self.title_bar(cx))
+            .child(self.title_bar(window, cx))
             .child(
                 div()
                     .flex_1()
@@ -577,6 +596,9 @@ impl Render for KuakyApp {
                         .id("settings-overlay")
                         .absolute()
                         .inset_0()
+                        // Nothing behind the modal gets the mouse (scrolling here
+                        // used to scroll the chat too).
+                        .occlude()
                         .flex()
                         .items_center()
                         .justify_center()

@@ -43,6 +43,15 @@ impl FileTree {
             changes: HashMap::new(),
         };
         this.children.insert(root.clone(), list_dir(&root));
+        // Capturas: `KUAKY_DEMO_EXPAND=crates,crates/kuaky` abre esas carpetas.
+        #[cfg(feature = "screenshot")]
+        if let Ok(dirs) = std::env::var("KUAKY_DEMO_EXPAND") {
+            for d in dirs.split(',') {
+                let p = root.join(d);
+                this.expanded.insert(p.clone());
+                this.children.insert(p.clone(), list_dir(&p));
+            }
+        }
         this.start_refresh(cx);
         this
     }
@@ -108,19 +117,23 @@ impl FileTree {
         cx.notify();
     }
 
-    fn visible(&self) -> Vec<(usize, Node)> {
+    /// Filas visibles. `last[k]` dice si el nodo (o su ancestro en el nivel `k`)
+    /// es el último de su carpeta: así se dibujan las ramas del árbol.
+    fn visible(&self) -> Vec<(Vec<bool>, Node)> {
         let mut out = Vec::new();
-        self.push_children(&self.root, 0, &mut out);
+        self.push_children(&self.root, &mut Vec::new(), &mut out);
         out
     }
 
-    fn push_children(&self, dir: &Path, depth: usize, out: &mut Vec<(usize, Node)>) {
+    fn push_children(&self, dir: &Path, path: &mut Vec<bool>, out: &mut Vec<(Vec<bool>, Node)>) {
         let Some(nodes) = self.children.get(dir) else { return };
-        for node in nodes {
-            out.push((depth, node.clone()));
+        for (i, node) in nodes.iter().enumerate() {
+            path.push(i + 1 == nodes.len());
+            out.push((path.clone(), node.clone()));
             if node.is_dir && self.expanded.contains(&node.path) {
-                self.push_children(&node.path, depth + 1, out);
+                self.push_children(&node.path, path, out);
             }
+            path.pop();
         }
     }
 
@@ -135,7 +148,7 @@ impl Render for FileTree {
         div().id("file-tree").size_full().overflow_y_scroll().child(
             v_flex()
                 .py_1()
-                .children(rows.into_iter().enumerate().map(|(i, (depth, node))| {
+                .children(rows.into_iter().enumerate().map(|(i, (last, node))| {
                     let selected = self.selected.as_deref() == Some(node.path.as_path());
                     let expanded = self.expanded.contains(&node.path);
                     let change = self.changes.get(&node.path).copied();
@@ -147,23 +160,29 @@ impl Render for FileTree {
                         None if dir_changed => style::soft(style::accent(), 0.8),
                         None => style::text().into(),
                     };
-                    let icon = if node.is_dir {
-                        if expanded { "▾" } else { "▸" }
+                    let (icon, icon_color): (&'static str, Hsla) = if node.is_dir {
+                        (if expanded { "folder-open" } else { "folder" }, style::soft(style::accent(), 0.75))
                     } else {
-                        " "
+                        (file_icon(&node.name), style::muted().into())
                     };
                     let n = node.clone();
                     h_flex()
                         .id(("node", i))
                         .h(px(24.))
-                        .pl(px(10. + depth as f32 * 14.))
+                        .pl(px(6.))
                         .pr_2()
-                        .gap_1p5()
+                        .gap_1()
                         .text_sm()
                         .cursor_pointer()
                         .when(selected, |d| d.bg(style::panel_hover()))
                         .hover(|d| d.bg(style::panel_hover()))
-                        .child(div().w(px(10.)).text_xs().text_color(style::faint()).child(icon))
+                        .children(tree_guides(&last))
+                        .child(
+                            div().w(px(12.)).flex_none().when(node.is_dir, |d| {
+                                d.child(crate::icons::ui(if expanded { "chevron-down" } else { "chevron-right" }, px(12.), style::faint()))
+                            }),
+                        )
+                        .child(crate::icons::ui(icon, px(14.), icon_color))
                         .child(
                             div()
                                 .flex_1()
@@ -178,6 +197,41 @@ impl Render for FileTree {
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle(&n, cx)))
                 })),
         )
+    }
+}
+
+/// Líneas del árbol: una columna por nivel; la última trae el codo (├ o └).
+fn tree_guides(last: &[bool]) -> Vec<AnyElement> {
+    const W: f32 = 14.;
+    const X: f32 = 6.;
+    let line = || style::border();
+    let n = last.len();
+    (0..n)
+        .map(|k| {
+            let col = div().w(px(W)).h_full().flex_none().relative();
+            if k + 1 < n {
+                // Ancestro: sigue la línea si todavía le quedan hermanos abajo.
+                col.when(!last[k], |d| d.child(div().absolute().left(px(X)).top_0().bottom_0().w(px(1.)).bg(line())))
+            } else {
+                // Este nodo: ├ (con más hermanos) o └ (último).
+                col.child(div().absolute().left(px(X)).top_0().when(last[k], |d| d.h(px(12.))).when(!last[k], |d| d.bottom_0()).w(px(1.)).bg(line()))
+                    .child(div().absolute().left(px(X)).top(px(12.)).w(px(W - X)).h(px(1.)).bg(line()))
+            }
+            .into_any_element()
+        })
+        .collect()
+}
+
+/// Ícono según el tipo de archivo.
+fn file_icon(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go" | "java" | "kt" | "swift" | "c" | "h" | "cpp" | "cs" | "rb" | "php"
+        | "sh" | "zsh" | "html" | "css" | "scss" | "vue" | "svelte" | "sql" => "file-code",
+        "md" | "mdx" | "txt" | "rst" => "file-text",
+        "json" | "toml" | "yaml" | "yml" | "lock" | "ini" | "env" | "xml" => "file-cog",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" => "image",
+        _ => "file",
     }
 }
 

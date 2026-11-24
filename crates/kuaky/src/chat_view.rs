@@ -2320,6 +2320,7 @@ impl Render for ChatView {
                 .id("prompt-list-backdrop")
                 .absolute()
                 .inset_0()
+                .occlude()
                 .flex()
                 .justify_center()
                 .pt(px(48.))

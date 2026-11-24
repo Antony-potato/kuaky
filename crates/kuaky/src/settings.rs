@@ -23,7 +23,38 @@ struct AgentRowState {
     args_input: Entity<InputState>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Agents,
+    Panel,
+    Pulls,
+    Worktrees,
+}
+
+impl Section {
+    const ALL: [Section; 4] = [Section::Agents, Section::Panel, Section::Pulls, Section::Worktrees];
+
+    fn label(self) -> &'static str {
+        match self {
+            Section::Agents => "Agents",
+            Section::Panel => "Right panel",
+            Section::Pulls => "Pull requests",
+            Section::Worktrees => "Worktrees",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Section::Agents => "bot",
+            Section::Panel => "panel-right",
+            Section::Pulls => "git-pull-request",
+            Section::Worktrees => "git-branch",
+        }
+    }
+}
+
 pub struct SettingsView {
+    section: Section,
     agents: Vec<AgentRowState>,
     detected: HashMap<Harness, PathBuf>,
     worktrees_input: Entity<InputState>,
@@ -85,6 +116,7 @@ impl SettingsView {
         }));
 
         let this = Self {
+            section: Section::Agents,
             agents,
             detected: HashMap::new(),
             worktrees_input,
@@ -145,6 +177,39 @@ impl SettingsView {
             s.settings.pr_merge_method = method;
         });
         cx.emit(SettingsEvent::Changed);
+    }
+
+    /// Pestañas de Settings (izquierda).
+    fn nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(px(180.))
+            .h_full()
+            .flex_none()
+            .p_2()
+            .gap_0p5()
+            .border_r_1()
+            .border_color(style::border())
+            .children(Section::ALL.into_iter().map(|sec| {
+                let selected = self.section == sec;
+                h_flex()
+                    .id(SharedString::from(format!("settings-nav-{}", sec.label())))
+                    .px_2()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                    .when(!selected, |d| d.text_color(style::muted()))
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .child(icons::ui(sec.icon(), px(14.), if selected { style::accent() } else { style::muted() }))
+                    .child(sec.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.section = sec;
+                        cx.notify();
+                    }))
+            }))
     }
 
     fn toggle_panel(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -240,8 +305,8 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .w(px(640.))
-            .max_h(px(620.))
+            .w(px(760.))
+            .h(px(560.))
             .rounded_xl()
             .border_1()
             .border_color(style::border())
@@ -274,15 +339,21 @@ impl Render for SettingsView {
                     ),
             )
             .child(
-                div()
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_start()
+                    .child(self.nav(cx))
+                    .child(div()
                     .id("settings-scroll")
+                    .min_w_0()
                     .flex_1()
                     .overflow_y_scroll()
                     .child(
                         v_flex()
                             .p_4()
                             .gap_5()
-                            .child(
+                            .when(self.section == Section::Agents, |d| d.child(
                                 v_flex()
                                     .gap_3()
                                     .child(div().text_xs().text_color(style::muted()).child("AGENTS"))
@@ -363,10 +434,10 @@ impl Render for SettingsView {
                                                     ),
                                             )
                                     })),
-                            )
-                            .child(self.panels_section(cx))
-                            .child(self.merge_section(cx))
-                            .child(
+                            ))
+                            .when(self.section == Section::Panel, |d| d.child(self.panels_section(cx)))
+                            .when(self.section == Section::Pulls, |d| d.child(self.merge_section(cx)))
+                            .when(self.section == Section::Worktrees, |d| d.child(
                                 v_flex()
                                     .gap_2()
                                     .child(div().text_xs().text_color(style::muted()).child("GIT WORKTREES"))
@@ -387,8 +458,9 @@ impl Render for SettingsView {
                                                     .child("Separate branch copies are created inside <folder>/<repo>/<name>."),
                                             ),
                                     ),
-                            ),
-                    ),
+                            )),
+                    )
+                    .h_full()),
             )
             .child(
                 h_flex()
