@@ -1,11 +1,13 @@
 //! Información de git y GitHub de un proyecto, usando las CLIs `git` y `gh`
 //! (así se reusan tu configuración y tu sesión de GitHub).
 
+pub mod actions;
 pub mod conflicts;
 mod env;
 pub mod graph;
 mod parse;
 
+pub use actions::{Workflow, WorkflowInput, WorkflowRun};
 pub use conflicts::{ConflictBlock, ConflictChoice, ConflictFile};
 pub use env::{command, find_agent, find_program, login_path, shell_command};
 pub use graph::{GraphCommit, GraphRow, LaneEdge, RefBadge, RefKind};

@@ -1,3 +1,4 @@
+mod actions_panel;
 mod agent_history;
 mod agent_status;
 mod agent_tasks;

@@ -282,11 +282,13 @@ pub(crate) enum SidePanel {
     Changes,
     Branches,
     Prs,
+    Actions,
     Graph,
 }
 
 impl SidePanel {
-    pub(crate) const ALL: [SidePanel; 5] = [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs, SidePanel::Graph];
+    pub(crate) const ALL: [SidePanel; 6] =
+        [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs, SidePanel::Actions, SidePanel::Graph];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -294,6 +296,7 @@ impl SidePanel {
             SidePanel::Changes => "Changes",
             SidePanel::Branches => "Branches",
             SidePanel::Prs => "Pull Requests",
+            SidePanel::Actions => "Actions",
             SidePanel::Graph => "Graph",
         }
     }
@@ -304,6 +307,7 @@ impl SidePanel {
             SidePanel::Changes => "changes",
             SidePanel::Branches => "branches",
             SidePanel::Prs => "prs",
+            SidePanel::Actions => "actions",
             SidePanel::Graph => "graph",
         }
     }
@@ -315,6 +319,7 @@ impl SidePanel {
             SidePanel::Changes => "Uncommitted changes in this folder.",
             SidePanel::Branches => "Branches and worktrees (separate folders where an agent works on its own branch without touching yours).",
             SidePanel::Prs => "Open pull requests: merge, resolve conflicts, see which session made each one.",
+            SidePanel::Actions => "GitHub Actions: launch a workflow by hand (branch and inputs), follow its runs, re-run or cancel.",
             SidePanel::Graph => "Commit history as a graph, like VS Code.",
         }
     }
@@ -325,6 +330,7 @@ impl SidePanel {
             SidePanel::Changes => "git-compare",
             SidePanel::Branches => "git-branch",
             SidePanel::Prs => "git-pull-request",
+            SidePanel::Actions => "circle-play",
             SidePanel::Graph => "git-graph",
         }
     }
@@ -361,6 +367,7 @@ pub struct ProjectView {
     next_id: usize,
     tree: Entity<FileTree>,
     graph: Entity<GraphView>,
+    actions: Entity<crate::actions_panel::ActionsPanel>,
     /// Active top-right panel (`None` when hidden).
     panel: Option<SidePanel>,
     /// Embedded terminals in the bottom-right zone.
@@ -435,6 +442,7 @@ impl ProjectView {
         });
         let repo = Repo::discover(&root);
         let graph = cx.new(|cx| GraphView::new(repo.clone(), cx));
+        let actions = cx.new(|_| crate::actions_panel::ActionsPanel::new(repo.clone()));
         let graph_sub = cx.subscribe_in(&graph, window, |this, _, ev: &GraphEvent, window, cx| match ev {
             GraphEvent::OpenCommit { hash, short_hash, subject } => {
                 let Some(repo) = this.repo.clone() else { return };
@@ -498,6 +506,7 @@ impl ProjectView {
             next_id: 0,
             tree,
             graph,
+            actions,
             panel: Some(SidePanel::Files),
             right_terminals: Vec::new(),
             active_right_terminal: None,
@@ -805,6 +814,7 @@ impl ProjectView {
                 "changes" => Some(SidePanel::Changes),
                 "branches" => Some(SidePanel::Branches),
                 "prs" => Some(SidePanel::Prs),
+                "actions" => Some(SidePanel::Actions),
                 "graph" => Some(SidePanel::Graph),
                 "none" => None,
                 _ => Some(SidePanel::Files),
@@ -812,6 +822,13 @@ impl ProjectView {
             self.panel = p;
             if p == Some(SidePanel::Prs) && self.git.prs.is_none() {
                 self.load_prs(cx);
+            }
+            if p == Some(SidePanel::Actions) {
+                let branch = self.git.branch.clone();
+                self.actions.update(cx, |a, cx| {
+                    a.set_branch(branch);
+                    a.ensure_started(cx);
+                });
             }
         }
         if std::env::var("KUAKY_DEMO_NEW_SESSION").is_ok() {
@@ -1662,6 +1679,13 @@ impl ProjectView {
             }
             if panel == SidePanel::Graph {
                 self.graph.update(cx, |g, cx| g.refresh(cx));
+            }
+            if panel == SidePanel::Actions {
+                let branch = self.git.branch.clone();
+                self.actions.update(cx, |a, cx| {
+                    a.set_branch(branch);
+                    a.ensure_started(cx);
+                });
             }
         }
         cx.notify();
@@ -2781,9 +2805,9 @@ impl ProjectView {
             if is_session(&tab.kind) {
                 self.shown_session = Some(tab.id);
             } else {
-                if self.shown_doc != Some(tab.id) {
-                    self.doc_hidden = false;
-                }
+                // Hiding the side makes the session active, so a document being
+                // active again means you opened it: show the side (even the same tab).
+                self.doc_hidden = false;
                 self.shown_doc = Some(tab.id);
             }
         }
@@ -3002,6 +3026,7 @@ impl ProjectView {
                     SidePanel::Changes => self.changes_panel(cx).into_any_element(),
                     SidePanel::Branches => self.branches_panel(cx).into_any_element(),
                     SidePanel::Prs => self.prs_panel(cx).into_any_element(),
+                    SidePanel::Actions => self.actions.clone().into_any_element(),
                     SidePanel::Graph => self.graph_panel(cx).into_any_element(),
                 }))
         });
