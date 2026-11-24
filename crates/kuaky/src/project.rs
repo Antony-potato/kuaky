@@ -38,6 +38,7 @@ actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, Searc
 
 #[path = "metro.rs"]
 mod metro;
+pub use metro::LiveSummary;
 
 /// How to open an agent chat (ACP).
 #[derive(Default)]
@@ -146,7 +147,7 @@ impl Harness {
         self.command().unwrap_or("shell")
     }
 
-    fn from_key(key: &str) -> Option<Harness> {
+    pub(crate) fn from_key(key: &str) -> Option<Harness> {
         Harness::AGENTS.into_iter().chain([Harness::Shell]).find(|h| h.key() == key)
     }
 
@@ -223,6 +224,11 @@ enum TabKind {
 struct Tab {
     id: usize,
     kind: TabKind,
+}
+
+/// Terminals and chats: shown in the left sidebar instead of the tab strip.
+fn is_session(kind: &TabKind) -> bool {
+    matches!(kind, TabKind::Terminal { .. } | TabKind::Chat { .. })
 }
 
 struct RightTerminal {
@@ -334,6 +340,8 @@ pub struct ProjectView {
     /// Full-screen board (`None` = closed).
     board: Option<metro::Board>,
     mini_map_collapsed: bool,
+    /// Shown in the window (other projects stay open in the background).
+    visible: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -427,6 +435,7 @@ impl ProjectView {
             task_watchers: HashMap::new(),
             board: None,
             mini_map_collapsed: false,
+            visible: true,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
         };
         this.start_map_refresh(cx);
@@ -443,6 +452,21 @@ impl ProjectView {
             this.active = this.tabs.len().checked_sub(1);
         }
         this
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+
+    /// Focuses the active tab (when switching back to this project).
+    pub fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        match self.active.and_then(|i| self.tabs.get(i)).map(|t| &t.kind) {
+            Some(TabKind::Terminal { view, .. }) => {
+                let handle = view.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            _ => window.focus(&self.focus, cx),
+        }
     }
 
     pub fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
@@ -991,7 +1015,7 @@ impl ProjectView {
     fn notify(&mut self, title: String, message: String, is_active_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let window_active = window.is_window_active();
-        if !is_active_tab || !window_active {
+        if !is_active_tab || !self.visible || !window_active {
             use gpui_kit::component::WindowExt as _;
             window.push_notification(
                 gpui_kit::component::notification::Notification::new()
@@ -2104,7 +2128,8 @@ impl ProjectView {
             .border_b_1()
             .border_color(style::border())
             .bg(style::panel())
-            .children(self.tabs.iter().enumerate().map(|(i, tab)| {
+            // Sessions (terminals and chats) live in the left sidebar, not here.
+            .children(self.tabs.iter().enumerate().filter(|(_, t)| !is_session(&t.kind)).map(|(i, tab)| {
                 let active = self.active == Some(i);
                 let tab_id = tab.id;
                 let (icon, status, title, dirty, accent_color, can_rename): (
@@ -2222,7 +2247,7 @@ impl ProjectView {
         v_flex()
             .size_full()
             .min_w_0()
-            .when(!self.tabs.is_empty(), |d| d.child(self.tab_bar(cx)))
+            .when(self.tabs.iter().any(|t| !is_session(&t.kind)), |d| d.child(self.tab_bar(cx)))
             .when(self.merge_approval_ready, |d| {
                 d.child(
                     h_flex()

@@ -41,7 +41,8 @@ fn full_turn_with_permission_and_diff() {
         }
         seen.push(ev);
     }
-    assert_eq!(message, "Hola mundo");
+    assert!(message.starts_with("Hola mundo"), "{message}");
+    assert!(seen.iter().any(|e| matches!(e, Event::Usage { used: 52000, size: 200000, .. })));
     assert!(seen.iter().any(|e| matches!(e, Event::ThoughtChunk(_))));
     assert!(seen.iter().any(|e| matches!(e, Event::ToolCall(c) if c.kind.as_deref() == Some("edit"))));
     assert!(seen.iter().any(|e| matches!(e, Event::Plan(p) if p.len() == 1)));
@@ -87,7 +88,7 @@ fn file_writes_and_commands_are_reported() {
                 wrote = true;
             }
             Event::Commands(c) => commands = c.iter().any(|c| c.name == "review"),
-            Event::ToolCall(c) => located = c.locations.first().is_some_and(|l| l.line == Some(3)),
+            Event::ToolCall(c) => located |= c.locations.first().is_some_and(|l| l.line == Some(3)),
             Event::Permission(req) => client.answer_permission(&req.request_id, Some("allow")).unwrap(),
             Event::TurnEnded(_) => break,
             Event::Error(e) => panic!("{e}"),

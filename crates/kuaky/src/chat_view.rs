@@ -1,8 +1,9 @@
 //! Chat propio con agentes por ACP (Claude Code, Antigravity, Codex…).
 //!
 //! Pensado para conversaciones largas:
-//! - tus mensajes se distinguen a primera vista (tarjeta con barra de color,
-//!   número `#n` y hora);
+//! - tus mensajes van en burbuja a la derecha (como la app de Claude) y las
+//!   herramientas se agrupan en una línea ("Ran 5 commands ›");
+//! - mientras el agente trabaja, una línea viva al final dice qué hace y cuánto lleva;
 //! - el prompt del turno que estás leyendo queda fijo arriba;
 //! - un riel a la derecha marca cada mensaje tuyo y salta a él;
 //! - `⌥↑` / `⌥↓` saltan entre tus mensajes y `⌘⇧J` los lista;
@@ -107,9 +108,36 @@ enum Item {
     Notice(String),
 }
 
+/// Imagen adjunta a un mensaje (pegada o elegida).
+#[derive(Clone)]
+struct Attachment {
+    data: String,
+    mime: String,
+    image: Arc<Image>,
+}
+
+impl Attachment {
+    fn new(format: ImageFormat, bytes: Vec<u8>) -> Attachment {
+        use base64::Engine as _;
+        Attachment {
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime: format.mime_type().to_string(),
+            image: Arc::new(Image::from_bytes(format, bytes)),
+        }
+    }
+}
+
+/// Mensaje en cola mientras el agente trabaja.
+#[derive(Clone)]
+struct Queued {
+    text: String,
+    images: Vec<Attachment>,
+}
+
 #[derive(Clone)]
 struct UserMsg {
     text: String,
+    images: Vec<Arc<Image>>,
     n: usize,
     at: jiff::Timestamp,
     /// Punto de restauración del código antes de este mensaje.
@@ -177,7 +205,13 @@ pub struct ChatView {
     config: Vec<ConfigOption>,
     open_config: Option<String>,
     commands: Vec<SlashCommand>,
-    queue: Vec<String>,
+    queue: Vec<Queued>,
+    /// Imágenes para el próximo mensaje.
+    attachments: Vec<Attachment>,
+    /// Contexto usado: (tokens, ventana, costo acumulado).
+    usage: Option<(u64, u64, Option<f64>)>,
+    /// Último evento del agente (para "no output for 40s").
+    last_event: Instant,
     detail: Detail,
     expanded: HashSet<(usize, usize)>,
     editing: Option<usize>,
@@ -206,7 +240,7 @@ impl ChatView {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
                 .submit_on_enter(true)
-                .placeholder(format!("Message {label}…  @ files · / commands · Enter sends · ⇧Enter new line"))
+                .placeholder(format!("Message {label}…  (@ files, / commands)"))
         });
         let sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| match ev {
             InputEvent::PressEnter { shift: false, .. } => {
@@ -239,6 +273,9 @@ impl ChatView {
             open_config: None,
             commands: Vec::new(),
             queue: Vec::new(),
+            attachments: Vec::new(),
+            usage: None,
+            last_event: Instant::now(),
             detail: Detail::Normal,
             expanded: HashSet::new(),
             editing: None,
@@ -313,7 +350,7 @@ impl ChatView {
                     cx.emit(ChatEvent::Status);
                     #[cfg(feature = "screenshot")]
                     if let Ok(prompt) = std::env::var("KUAKY_DEMO_CHAT_PROMPT") {
-                        this.dispatch(prompt, cx);
+                        this.dispatch(prompt, Vec::new(), cx);
                     }
                     cx.notify();
                 })
@@ -385,7 +422,13 @@ impl ChatView {
     }
 
     fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
+        self.last_event = Instant::now();
         match ev {
+            Event::Usage { used, size, cost } => {
+                if size > 0 {
+                    self.usage = Some((used, size, cost.or(self.usage.and_then(|u| u.2))));
+                }
+            }
             Event::UserMessageChunk(t) => match self.turns.last_mut() {
                 // Al retomar, los mensajes llegan en trozos: se juntan.
                 Some(turn) if turn.user.is_some() && turn.items.is_empty() => {
@@ -395,7 +438,7 @@ impl ChatView {
                 }
                 _ => {
                     let n = self.turns.iter().filter(|t| t.user.is_some()).count() + 1;
-                    let mut turn = Turn::new(Some(UserMsg { text: t, n, at: jiff::Timestamp::now(), checkpoint: None }));
+                    let mut turn = Turn::new(Some(UserMsg { text: t, images: Vec::new(), n, at: jiff::Timestamp::now(), checkpoint: None }));
                     turn.started = None;
                     self.turns.push(turn);
                 }
@@ -455,7 +498,14 @@ impl ChatView {
             }
             Event::Permission(req) => {
                 cx.emit(ChatEvent::NeedsYou(req.title.clone()));
+                #[cfg(feature = "screenshot")]
+                let auto = std::env::var("KUAKY_DEMO_ALLOW").is_ok().then(|| req.options.first().map(|o| (o.id.clone(), o.name.clone()))).flatten();
                 self.current_turn().items.push(Item::Permission { req, answer: None });
+                #[cfg(feature = "screenshot")]
+                if let Some(choice) = auto {
+                    let (ti, ii) = (self.turns.len() - 1, self.turns.last().map(|t| t.items.len() - 1).unwrap_or(0));
+                    self.answer(ti, ii, Some(choice), cx);
+                }
                 cx.emit(ChatEvent::Status);
             }
             Event::Commands(c) => self.commands = c,
@@ -492,7 +542,7 @@ impl ChatView {
                 cx.emit(ChatEvent::Status);
                 if !self.queue.is_empty() {
                     let next = self.queue.remove(0);
-                    self.dispatch(next, cx);
+                    self.dispatch(next.text, next.images, cx);
                 }
             }
             Event::Error(e) => {
@@ -511,34 +561,76 @@ impl ChatView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
         self.suggestions.clear();
+        let images = std::mem::take(&mut self.attachments);
         if let Some(at) = self.editing.take() {
             self.fork_at(at, text, cx);
             return;
         }
         match self.status {
-            ChatStatus::Ready => self.dispatch(text, cx),
+            ChatStatus::Ready => self.dispatch(text, images, cx),
             ChatStatus::Running | ChatStatus::Connecting => {
-                self.queue.push(text);
+                self.queue.push(Queued { text, images });
                 cx.notify();
             }
             _ => {}
         }
     }
 
+    /// Imágenes pegadas o elegidas para el próximo mensaje.
+    fn add_images(&mut self, images: Vec<(ImageFormat, Vec<u8>)>, cx: &mut Context<Self>) {
+        let supported = self.client.as_ref().is_none_or(|c| c.capabilities.image);
+        if !supported {
+            let msg = format!("{} doesn't accept images in chat.", self.launch.label);
+            self.current_turn().items.push(Item::Notice(msg));
+        } else {
+            self.attachments.extend(images.into_iter().map(|(f, b)| Attachment::new(f, b)));
+        }
+        cx.notify();
+    }
+
+    fn pick_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let images: Vec<(ImageFormat, Vec<u8>)> = paths
+                .iter()
+                .filter_map(|p| {
+                    let ext = p.extension()?.to_string_lossy().to_lowercase();
+                    let format = match ext.as_str() {
+                        "png" => ImageFormat::Png,
+                        "jpg" | "jpeg" => ImageFormat::Jpeg,
+                        "gif" => ImageFormat::Gif,
+                        "webp" => ImageFormat::Webp,
+                        _ => return None,
+                    };
+                    Some((format, std::fs::read(p).ok()?))
+                })
+                .collect();
+            let _ = this.update(cx, |this, cx| this.add_images(images, cx));
+        })
+        .detach();
+    }
+
     /// Envía un mensaje: guarda un punto de restauración y arma los bloques
     /// (texto + archivos mencionados con `@`).
-    fn dispatch(&mut self, text: String, cx: &mut Context<Self>) {
+    fn dispatch(&mut self, text: String, images: Vec<Attachment>, cx: &mut Context<Self>) {
         let (Some(client), Some(session)) = (self.client.clone(), self.session.clone()) else {
-            self.queue.insert(0, text);
+            self.queue.insert(0, Queued { text, images });
             return;
         };
         let n = self.turns.iter().filter(|t| t.user.is_some()).count() + 1;
-        let mut blocks = vec![PromptBlock::Text(text.clone())];
+        let mut blocks = Vec::new();
+        if !text.is_empty() {
+            blocks.push(PromptBlock::Text(text.clone()));
+        }
+        for img in &images {
+            blocks.push(PromptBlock::Image { data: img.data.clone(), mime: img.mime.clone() });
+        }
         for mention in mentions(&text) {
             let path = self.launch.cwd.join(&mention);
             if path.is_file() {
@@ -549,7 +641,9 @@ impl ChatView {
         let checkpoint_name = format!("{}/{n}", self.uid);
         let checkpoint = kuaky_git::Repo::discover(&cwd).and_then(|repo| repo.checkpoint(&checkpoint_name).ok());
         self.viewing = None;
-        self.turns.push(Turn::new(Some(UserMsg { text: text.clone(), n, at: jiff::Timestamp::now(), checkpoint })));
+        let shown_images = images.iter().map(|i| i.image.clone()).collect();
+        self.turns.push(Turn::new(Some(UserMsg { text: text.clone(), images: shown_images, n, at: jiff::Timestamp::now(), checkpoint })));
+        self.last_event = Instant::now();
         if let Err(err) = client.prompt_blocks(&session, &blocks) {
             self.current_turn().items.push(Item::Notice(format!("Failed to send: {err:#}")));
             cx.notify();
@@ -569,7 +663,7 @@ impl ChatView {
     /// versión anterior y se sigue en una sesión nueva con el contexto previo.
     fn fork_at(&mut self, at: usize, text: String, cx: &mut Context<Self>) {
         let Some(pos) = self.turns.iter().position(|t| t.user.as_ref().is_some_and(|u| u.n == at)) else {
-            self.dispatch(text, cx);
+            self.dispatch(text, Vec::new(), cx);
             return;
         };
         let tail: Vec<Turn> = self.turns.drain(pos..).collect();
@@ -609,7 +703,7 @@ impl ChatView {
 
     /// Envía `full` al agente mostrando `shown` como mensaje `#at`.
     fn dispatch_as(&mut self, at: usize, full: String, shown: String, cx: &mut Context<Self>) {
-        self.dispatch(full, cx);
+        self.dispatch(full, Vec::new(), cx);
         if let Some(turn) = self.turns.last_mut() {
             if let Some(u) = &mut turn.user {
                 u.n = at;
@@ -820,7 +914,7 @@ impl ChatView {
         }
         // ↑ con la caja vacía recupera tu último mensaje.
         if key == "up" && plain && self.input.read(cx).value().is_empty() {
-            let last = self.queue.pop().or_else(|| self.turns.iter().rev().find_map(|t| t.user.as_ref()).map(|u| u.text.clone()));
+            let last = self.queue.pop().map(|q| q.text).or_else(|| self.turns.iter().rev().find_map(|t| t.user.as_ref()).map(|u| u.text.clone()));
             if let Some(text) = last {
                 self.input.update(cx, |s, cx| s.set_value(text, window, cx));
                 cx.stop_propagation();
@@ -830,92 +924,169 @@ impl ChatView {
 
     // ── Render ─────────────────────────────────────────────────────────
 
-    fn render_turn(&self, ti: usize, turn: &Turn, live: bool, cx: &mut Context<Self>) -> AnyElement {
-        let mut col = v_flex().gap_2().pb_4();
+    /// Ancho máximo de la conversación (columna centrada, como la app de Claude).
+    const COLUMN: f32 = 820.;
+
+    fn render_turn(&self, ti: usize, turn: &Turn, live: bool, last: bool, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = v_flex().w_full().max_w(px(Self::COLUMN)).mx_auto().gap_3().pb_6();
         if let Some(user) = &turn.user {
-            col = col.child(self.user_card(user, live, cx));
+            col = col.child(self.user_bubble(user, live, cx));
         }
-        let mut agent_started = false;
-        for (ii, item) in turn.items.iter().enumerate() {
-            let first_agent = !agent_started && matches!(item, Item::Agent(_) | Item::Tool(_) | Item::Thought(_));
-            if first_agent {
-                agent_started = true;
-                col = col.child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .text_xs()
-                        .text_color(style::muted())
-                        .child(div().size(px(8.)).rounded_full().bg(style::output()))
-                        .child(self.launch.label),
-                );
+        // Herramientas seguidas (y permisos ya contestados) van en un grupo plegable.
+        let mut group: Vec<usize> = Vec::new();
+        let flush = |col: Div, group: &mut Vec<usize>, this: &Self, cx: &mut Context<Self>| -> Div {
+            if group.is_empty() {
+                return col;
             }
+            let ids = std::mem::take(group);
+            col.child(this.tool_group(ti, turn, &ids, live && last, cx))
+        };
+        for (ii, item) in turn.items.iter().enumerate() {
+            // En detalle normal el razonamiento no corta el grupo (queda oculto).
+            let groupable = matches!(item, Item::Tool(_))
+                || matches!(item, Item::Permission { answer: Some(_), .. })
+                || (matches!(item, Item::Thought(_)) && self.detail == Detail::Normal && !group.is_empty());
+            if groupable {
+                group.push(ii);
+                continue;
+            }
+            col = flush(col, &mut group, self, cx);
             col = col.child(self.render_item(ti, ii, item, live, cx));
         }
-        if turn.duration.is_some() || !turn.files.is_empty() {
-            let (added, removed) = turn.stats();
-            let files = turn.files.len();
-            let patch: String = turn
-                .files
-                .iter()
-                .map(|(p, (old, new))| unified_patch(&FileDiff { path: p.to_string_lossy().into_owned(), old_text: old.clone(), new_text: new.clone() }))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let n = turn.user.as_ref().map(|u| u.n).unwrap_or(0);
-            col = col.child(
-                h_flex()
-                    .pt_1()
-                    .gap_2()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(style::border())
-                    .text_xs()
-                    .text_color(style::faint())
-                    .when_some(turn.duration, |d, dur| d.child(format!("Turn · {}", fmt_duration(dur))))
-                    .when(files > 0, |d| {
-                        d.child(format!("· {files} file{}", if files == 1 { "" } else { "s" }))
-                            .child(div().text_color(style::good()).child(format!("+{added}")))
-                            .child(div().text_color(style::bad()).child(format!("−{removed}")))
-                    })
-                    .child(div().flex_1())
-                    .when(files > 0, |d| {
-                        d.child(
-                            div()
-                                .id(("review-turn", ti))
-                                .text_color(style::accent())
-                                .cursor_pointer()
-                                .hover(|d| d.text_color(style::text()))
-                                .child("Review changes")
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(ChatEvent::OpenDiff { title: format!("Changes · message #{n}"), patch: patch.clone() });
-                                })),
-                        )
-                    }),
-            );
+        col = flush(col, &mut group, self, cx);
+        if last && self.status == ChatStatus::Running {
+            col = col.child(self.activity_line(turn));
         }
-        if live && !turn.files.is_empty() && turn.duration.is_some() {
-            col = col.children(turn.files.iter().enumerate().map(|(fi, (path, (old, _)))| {
-                let name = path.strip_prefix(&self.launch.cwd).unwrap_or(path).to_string_lossy().into_owned();
-                let (path, old) = (path.clone(), old.clone());
-                h_flex()
-                    .pl_3()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(style::faint())
-                    .child(crate::icons::ui("file", px(11.), style::faint()))
-                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
-                    .child(
-                        div()
-                            .id(("revert-file", ti * 1000 + fi))
-                            .cursor_pointer()
-                            .hover(|d| d.text_color(style::bad()))
-                            .tooltip(|window, cx| Tooltip::new("Undo this turn's change to the file").build(window, cx))
-                            .child("Revert")
-                            .on_click(cx.listener(move |this, _, _, cx| this.revert_file(path.clone(), old.clone(), name.clone(), cx))),
-                    )
-            }));
+        if !turn.files.is_empty() && turn.duration.is_some() {
+            col = col.child(self.changes_card(ti, turn, live, cx));
         }
         col.into_any_element()
+    }
+
+    /// Línea viva mientras el agente trabaja: qué hace, cuánto lleva y si está callado.
+    fn activity_line(&self, turn: &Turn) -> impl IntoElement {
+        let waiting = self.is_waiting_permission();
+        let doing = match turn.items.last() {
+            _ if waiting => "Waiting for your answer".to_string(),
+            Some(Item::Tool(c)) if matches!(c.status.as_deref(), Some("in_progress") | Some("pending") | None) => {
+                match c.kind.as_deref() {
+                    Some("execute") => "Running a command".into(),
+                    Some("edit") => "Editing".into(),
+                    Some("read") => "Reading".into(),
+                    Some("search") => "Searching".into(),
+                    Some("fetch") => "Fetching".into(),
+                    _ => "Using a tool".into(),
+                }
+            }
+            Some(Item::Thought(_)) => "Thinking".into(),
+            Some(Item::Agent(_)) => "Writing".into(),
+            _ => "Working".into(),
+        };
+        let elapsed = turn.started.map(|s| s.elapsed()).unwrap_or_default();
+        let quiet = self.last_event.elapsed();
+        let color: Hsla = if waiting { rgb(0xfbbf24).into() } else { style::accent().into() };
+        h_flex()
+            .gap_2()
+            .items_center()
+            .text_sm()
+            .child(
+                crate::icons::ui("loader-circle", px(14.), color)
+                    .with_animation("chat-working", Animation::new(Duration::from_millis(1100)).repeat(), |svg, delta| {
+                        svg.with_transformation(Transformation::rotate(percentage(delta)))
+                    }),
+            )
+            .child(div().text_color(color).child(format!("{doing}…")))
+            .child(div().text_xs().text_color(style::faint()).child(fmt_duration(elapsed)))
+            .when(quiet > Duration::from_secs(30) && !waiting, |d| {
+                d.child(div().text_xs().text_color(style::faint()).child(format!("· no output for {}", fmt_duration(quiet))))
+            })
+            .child(div().text_xs().text_color(style::faint()).child("· Esc to stop"))
+    }
+
+    /// Resumen de archivos cambiados en el turno, con revisar y deshacer por archivo.
+    fn changes_card(&self, ti: usize, turn: &Turn, live: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let (added, removed) = turn.stats();
+        let files = turn.files.len();
+        let patch: String = turn
+            .files
+            .iter()
+            .map(|(p, (old, new))| unified_patch(&FileDiff { path: p.to_string_lossy().into_owned(), old_text: old.clone(), new_text: new.clone() }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let n = turn.user.as_ref().map(|u| u.n).unwrap_or(0);
+        let open = self.expanded.contains(&(ti, usize::MAX));
+        v_flex()
+            .rounded_lg()
+            .border_1()
+            .border_color(style::border())
+            .child(
+                h_flex()
+                    .id(("changes", ti))
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.expanded.remove(&(ti, usize::MAX)) {
+                            this.expanded.insert((ti, usize::MAX));
+                        }
+                        cx.notify();
+                    }))
+                    .child(crate::icons::ui(if open { "chevron-down" } else { "chevron-right" }, px(12.), style::muted()))
+                    .child(div().text_color(style::muted()).child(format!("{files} file{} changed", if files == 1 { "" } else { "s" })))
+                    .child(div().text_color(style::good()).child(format!("+{added}")))
+                    .child(div().text_color(style::bad()).child(format!("−{removed}")))
+                    .when_some(turn.duration, |d, dur| d.child(div().text_color(style::faint()).child(format!("· {}", fmt_duration(dur)))))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id(("review-turn", ti))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(style::border())
+                            .text_color(style::text())
+                            .hover(|d| d.bg(style::panel_hover()))
+                            .child("Review")
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(ChatEvent::OpenDiff { title: format!("Changes · message #{n}"), patch: patch.clone() });
+                            })),
+                    ),
+            )
+            .when(open, |d| {
+                d.children(turn.files.iter().enumerate().map(|(fi, (path, (old, new)))| {
+                    let name = path.strip_prefix(&self.launch.cwd).unwrap_or(path).to_string_lossy().into_owned();
+                    let (a, r) = count_changes(&FileDiff { path: name.clone(), old_text: old.clone(), new_text: new.clone() });
+                    let (path, old) = (path.clone(), old.clone());
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(style::border())
+                        .text_xs()
+                        .child(crate::icons::ui("file", px(11.), style::faint()))
+                        .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(name.clone()))
+                        .child(div().text_color(style::good()).child(format!("+{a}")))
+                        .child(div().text_color(style::bad()).child(format!("−{r}")))
+                        .when(live, |d| {
+                            d.child(
+                                div()
+                                    .id(("revert-file", ti * 1000 + fi))
+                                    .text_color(style::faint())
+                                    .cursor_pointer()
+                                    .hover(|d| d.text_color(style::bad()))
+                                    .tooltip(|window, cx| Tooltip::new("Undo this turn's change to the file").build(window, cx))
+                                    .child("Revert")
+                                    .on_click(cx.listener(move |this, _, _, cx| this.revert_file(path.clone(), old.clone(), name.clone(), cx))),
+                            )
+                        })
+                }))
+            })
     }
 
     /// Deshace el cambio de un turno a un archivo (o lo borra si era nuevo).
@@ -932,45 +1103,58 @@ impl ChatView {
         cx.notify();
     }
 
-    fn user_card(&self, user: &UserMsg, live: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// Tu mensaje: burbuja a la derecha; hora y acciones debajo al pasar el mouse.
+    fn user_bubble(&self, user: &UserMsg, live: bool, cx: &mut Context<Self>) -> AnyElement {
         let n = user.n;
         let time = jiff::Zoned::new(user.at, jiff::tz::TimeZone::system()).strftime("%H:%M").to_string();
         let versions = self.versions_of(n);
         let checkpoint = user.checkpoint.clone();
-        let text = user.text.clone();
         let copy_text = user.text.clone();
+        let group: SharedString = format!("user-{n}").into();
         let small_button = |id: SharedString, icon: &'static str, tip: &'static str| {
             div()
                 .id(id)
-                .p_0p5()
-                .rounded_sm()
+                .p_1()
+                .rounded_md()
                 .cursor_pointer()
                 .hover(|d| d.bg(style::panel_hover()))
                 .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-                .child(crate::icons::ui(icon, px(12.), style::muted()))
+                .child(crate::icons::ui(icon, px(13.), style::muted()))
         };
         v_flex()
             .id(("user-card", n))
-            .px_3()
-            .py_2()
+            .group(group.clone())
+            .w_full()
+            .items_end()
             .gap_1()
-            .bg(style::accent_alpha(0.07))
-            .border_1()
-            .border_l_4()
-            .border_color(style::accent_alpha(0.45))
+            .pt_2()
+            .child(
+                v_flex()
+                    .max_w(relative(0.82))
+                    .px_4()
+                    .py_2p5()
+                    .gap_2()
+                    .rounded(px(16.))
+                    .bg(style::panel_hover())
+                    .when(!user.images.is_empty(), |d| {
+                        d.child(h_flex().gap_2().flex_wrap().children(user.images.iter().map(|img| {
+                            img_el(img.clone()).max_h(px(160.)).max_w(px(240.)).rounded_md()
+                        })))
+                    })
+                    .when(!user.text.is_empty(), |d| d.child(div().text_sm().whitespace_normal().child(user.text.clone()))),
+            )
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_0p5()
                     .items_center()
                     .text_xs()
-                    .child(div().text_color(style::accent()).font_weight(FontWeight::MEDIUM).child("You"))
-                    .child(div().text_color(style::muted()).child(format!("#{n} · {time}")))
-                    .child(div().flex_1())
+                    .text_color(style::faint())
                     .when_some(versions, |d, (cur, total)| {
                         d.child(
                             h_flex()
                                 .gap_1()
                                 .items_center()
+                                .mr_1()
                                 .text_color(style::muted())
                                 .child(
                                     div()
@@ -993,44 +1177,51 @@ impl ChatView {
                                 ),
                         )
                     })
-                    .child(small_button(SharedString::from(format!("copy-{n}")), "copy", "Copy message").on_click(cx.listener(
-                        move |_, _, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone())),
-                    )))
-                    .when(live, |d| {
-                        d.child(
-                            small_button(SharedString::from(format!("edit-{n}")), "pencil", "Edit and resend (keeps this version)")
-                                .on_click(cx.listener(move |this, _, window, cx| this.edit(n, window, cx))),
-                        )
-                    })
-                    .when_some(checkpoint.filter(|_| live), |d, sha| {
-                        d.child(
-                            small_button(SharedString::from(format!("restore-{n}")), "rotate-ccw", "Restore files to before this message")
-                                .on_click(cx.listener(move |this, _, _, cx| this.restore(sha.clone(), n, cx))),
-                        )
-                    }),
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .items_center()
+                            .invisible()
+                            .group_hover(group, |s| s.visible())
+                            .child(div().mr_1().child(format!("#{n} · {time}")))
+                            .when_some(checkpoint.filter(|_| live), |d, sha| {
+                                d.child(
+                                    small_button(SharedString::from(format!("restore-{n}")), "rotate-ccw", "Restore files to before this message")
+                                        .on_click(cx.listener(move |this, _, _, cx| this.restore(sha.clone(), n, cx))),
+                                )
+                            })
+                            .when(live, |d| {
+                                d.child(
+                                    small_button(SharedString::from(format!("edit-{n}")), "pencil", "Edit and resend (keeps this version)")
+                                        .on_click(cx.listener(move |this, _, window, cx| this.edit(n, window, cx))),
+                                )
+                            })
+                            .child(small_button(SharedString::from(format!("copy-{n}")), "copy", "Copy message").on_click(cx.listener(
+                                move |_, _, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone())),
+                            ))),
+                    ),
             )
-            .child(div().text_sm().whitespace_normal().child(text))
             .into_any_element()
     }
 
     fn render_item(&self, ti: usize, ii: usize, item: &Item, live: bool, cx: &mut Context<Self>) -> AnyElement {
         let key = ti * 10_000 + ii;
         match item {
-            Item::Agent(text) => div().pl_3().text_sm().child(TextView::markdown(("agent-msg", key), text.clone())).into_any_element(),
+            Item::Agent(text) => div().text_sm().child(TextView::markdown(("agent-msg", key), text.clone())).into_any_element(),
             Item::Thought(text) => {
                 let open = self.detail != Detail::Normal || self.expanded.contains(&(ti, ii));
                 v_flex()
-                    .pl_3()
                     .child(
                         h_flex()
                             .id(("thought", key))
                             .gap_1()
                             .items_center()
-                            .text_xs()
+                            .text_sm()
                             .text_color(style::faint())
                             .cursor_pointer()
-                            .child(crate::icons::ui(if open { "chevron-down" } else { "chevron-right" }, px(11.), style::faint()))
-                            .child("Thinking")
+                            .hover(|d| d.text_color(style::muted()))
+                            .child("Thought")
+                            .child(crate::icons::ui(if open { "chevron-down" } else { "chevron-right" }, px(13.), style::faint()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.expanded.remove(&(ti, ii)) {
                                     this.expanded.insert((ti, ii));
@@ -1039,17 +1230,16 @@ impl ChatView {
                             })),
                     )
                     .when(open, |d| {
-                        d.child(div().pl_4().border_l_1().border_color(style::border()).text_xs().italic().text_color(style::muted()).child(text.clone()))
+                        d.child(div().mt_1().pl_3().border_l_2().border_color(style::border()).text_xs().text_color(style::muted()).child(text.clone()))
                     })
                     .into_any_element()
             }
-            Item::Notice(text) => div().pl_3().text_xs().italic().text_color(style::muted()).child(text.clone()).into_any_element(),
-            Item::Tool(call) => self.render_tool(key, call, cx),
+            Item::Notice(text) => div().text_xs().italic().text_color(style::muted()).child(text.clone()).into_any_element(),
+            Item::Tool(call) => self.tool_card(key, call, cx),
             Item::Permission { req, answer } => {
                 let pending = answer.is_none() && live;
                 match answer {
                     Some(a) => h_flex()
-                        .pl_3()
                         .gap_2()
                         .text_xs()
                         .text_color(style::muted())
@@ -1094,51 +1284,181 @@ impl ChatView {
         }
     }
 
-    fn render_tool(&self, key: usize, call: &ToolCall, cx: &mut Context<Self>) -> AnyElement {
+    /// Herramientas seguidas como una línea ("Ran 3 commands, edited a.rs +4 −1 ›").
+    /// Se abre con clic; mientras corre, se ve la herramienta en curso.
+    fn tool_group(&self, ti: usize, turn: &Turn, ids: &[usize], running_turn: bool, cx: &mut Context<Self>) -> AnyElement {
+        let first = ids[0];
+        let calls: Vec<&ToolCall> = ids
+            .iter()
+            .filter_map(|&i| match turn.items.get(i) {
+                Some(Item::Tool(c)) => Some(c),
+                _ => None,
+            })
+            .collect();
+        let open = self.detail == Detail::Verbose || self.expanded.contains(&(ti, first));
+        let in_flight = |c: &&&ToolCall| matches!(c.status.as_deref(), Some("in_progress") | Some("pending") | None);
+        let current: Option<&ToolCall> = if running_turn { calls.iter().rev().find(in_flight).copied() } else { None };
+
+        // Partes del resumen.
+        let count = |kind: &str| calls.iter().filter(|c| c.kind.as_deref() == Some(kind)).count();
+        let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{n} {many}") };
+        let mut parts: Vec<AnyElement> = Vec::new();
+        let mut words: Vec<String> = Vec::new();
+        let ran = count("execute");
+        if ran > 0 {
+            words.push(format!("ran {}", plural(ran, "a command", "commands")));
+        }
+        let read = count("read");
+        if read > 0 {
+            words.push(format!("read {}", plural(read, "a file", "files")));
+        }
+        let searched = count("search");
+        if searched > 0 {
+            words.push(if searched == 1 { "searched".into() } else { format!("searched {searched} times") });
+        }
+        let fetched = count("fetch");
+        if fetched > 0 {
+            words.push(format!("fetched {}", plural(fetched, "a page", "pages")));
+        }
+        let other = calls.iter().filter(|c| !matches!(c.kind.as_deref(), Some("execute" | "read" | "search" | "fetch" | "edit" | "delete" | "move"))).count();
+        if other > 0 {
+            words.push(format!("used {}", plural(other, "a tool", "tools")));
+        }
+        // Ediciones: archivo y +/−, como "creó agent_history.rs +166".
+        let mut edits: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for c in calls.iter().filter(|c| matches!(c.kind.as_deref(), Some("edit" | "delete" | "move"))) {
+            if c.diffs.is_empty() {
+                let name = c.locations.first().map(|l| l.path.rsplit('/').next().unwrap_or(&l.path).to_string()).unwrap_or_else(|| "a file".into());
+                edits.entry(name).or_default();
+            }
+            for d in &c.diffs {
+                let (a, r) = count_changes(d);
+                let e = edits.entry(d.path.rsplit('/').next().unwrap_or(&d.path).to_string()).or_default();
+                e.0 += a;
+                e.1 += r;
+            }
+        }
+        let failed = calls.iter().filter(|c| c.status.as_deref() == Some("failed")).count();
+        let mut lead = words.join(", ");
+        if !edits.is_empty() {
+            if !lead.is_empty() {
+                lead.push_str(", ");
+            }
+            lead.push_str("edited ");
+        }
+        let mut chars = lead.chars();
+        let lead = chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default();
+        parts.push(div().child(lead).into_any_element());
+        let edit_count = edits.len();
+        for (i, (name, (a, r))) in edits.into_iter().enumerate() {
+            if i > 0 {
+                parts.push(div().child(",").into_any_element());
+            }
+            parts.push(div().text_color(style::text()).child(name).into_any_element());
+            if a > 0 {
+                parts.push(div().text_color(style::good()).child(format!("+{a}")).into_any_element());
+            }
+            if r > 0 {
+                parts.push(div().text_color(style::bad()).child(format!("−{r}")).into_any_element());
+            }
+            if i >= 2 && edit_count > 3 {
+                parts.push(div().child(format!("and {} more", edit_count - 3)).into_any_element());
+                break;
+            }
+        }
+        if failed > 0 {
+            parts.push(div().text_color(style::bad()).child(format!("({failed} failed)")).into_any_element());
+        }
+        let answered: Vec<(usize, &Item)> = ids.iter().filter_map(|&i| turn.items.get(i).map(|it| (i, it))).filter(|(_, it)| matches!(it, Item::Permission { .. })).collect();
+
+        v_flex()
+            .gap_1p5()
+            .child(
+                h_flex()
+                    .id(("tools", ti * 10_000 + first))
+                    .gap_1()
+                    .items_center()
+                    .flex_wrap()
+                    .text_sm()
+                    .text_color(style::faint())
+                    .cursor_pointer()
+                    .hover(|d| d.text_color(style::muted()))
+                    .children(parts)
+                    .child(crate::icons::ui(if open { "chevron-down" } else { "chevron-right" }, px(13.), style::faint()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.expanded.remove(&(ti, first)) {
+                            this.expanded.insert((ti, first));
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(open, |d| {
+                d.child(
+                    v_flex()
+                        .gap_1p5()
+                        .children(ids.iter().filter_map(|&i| match turn.items.get(i) {
+                            Some(Item::Tool(c)) => Some(self.tool_card(ti * 10_000 + i, c, cx)),
+                            Some(it @ Item::Permission { .. }) => Some(self.render_item(ti, i, it, false, cx)),
+                            _ => None,
+                        })),
+                )
+            })
+            .when(!open, |d| {
+                d.when_some(current, |d, c| d.child(self.tool_card(ti * 10_000 + 9_999, c, cx)))
+                    .when(answered.is_empty(), |d| d)
+            })
+            .into_any_element()
+    }
+
+    /// Una herramienta, estilo Zed: etiqueta arriba y el comando o título en monoespaciado.
+    fn tool_card(&self, key: usize, call: &ToolCall, cx: &mut Context<Self>) -> AnyElement {
         let status = call.status.as_deref().unwrap_or("pending");
         let (status_icon, color): (&'static str, Hsla) = match status {
             "completed" => ("check", style::good().into()),
             "failed" => ("x", style::bad().into()),
-            "in_progress" => ("loader", style::accent().into()),
+            "in_progress" => ("loader-circle", style::accent().into()),
             _ => ("circle-dashed", style::faint().into()),
         };
-        let icon = match call.kind.as_deref() {
-            Some("edit") => "pencil",
-            Some("read") => "file-text",
-            Some("execute") => "square-terminal",
-            Some("search") => "search",
-            Some("fetch") => "globe",
-            Some("think") => "brain",
-            Some("delete") => "trash",
-            Some("move") => "folder-input",
-            _ => "wrench",
+        let label = match call.kind.as_deref() {
+            Some("edit") => "Edit",
+            Some("read") => "Read",
+            Some("execute") => "Command",
+            Some("search") => "Search",
+            Some("fetch") => "Fetch",
+            Some("think") => "Think",
+            Some("delete") => "Delete",
+            Some("move") => "Move",
+            _ => "Tool",
         };
         let location = call.locations.first().cloned();
         let verbose = self.detail == Detail::Verbose;
+        let title = call.title.clone().unwrap_or_else(|| "Tool".into());
+        let title: String = title.lines().take(6).collect::<Vec<_>>().join("\n");
         v_flex()
-            .pl_3()
-            .gap_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(style::border())
+            .bg(style::panel())
             .child(
                 h_flex()
-                    .id(("tool", key))
+                    .px_3()
+                    .pt_1p5()
                     .gap_2()
-                    .px_2()
-                    .py_1()
                     .items_center()
-                    .rounded_md()
-                    .bg(style::panel())
                     .text_xs()
-                    .text_color(style::muted())
-                    .child(crate::icons::ui(icon, px(12.), style::muted()))
-                    .child(div().flex_1().min_w_0().truncate().child(call.title.clone().unwrap_or_else(|| "Tool".into())))
-                    .when_some(location.clone(), |d, loc| {
+                    .text_color(style::faint())
+                    .child(label)
+                    .when_some(location, |d, loc| {
                         let path = PathBuf::from(&loc.path);
                         let line = loc.line.unwrap_or(1);
-                        let label = format!("{}{}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), loc.line.map(|l| format!(":{l}")).unwrap_or_default());
+                        let label = format!(
+                            "{}{}",
+                            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                            loc.line.map(|l| format!(":{l}")).unwrap_or_default()
+                        );
                         d.child(
                             div()
                                 .id(("tool-loc", key))
-                                .flex_none()
                                 .text_color(style::accent())
                                 .cursor_pointer()
                                 .hover(|d| d.text_color(style::text()))
@@ -1146,18 +1466,36 @@ impl ChatView {
                                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChatEvent::OpenFile { path: path.clone(), line }))),
                         )
                     })
+                    .child(div().flex_1())
                     .children(call.diffs.iter().take(1).map(|d| {
                         let (added, removed) = count_changes(d);
-                        h_flex().flex_none().gap_1().child(div().text_color(style::good()).child(format!("+{added}"))).child(div().text_color(style::bad()).child(format!("−{removed}")))
+                        h_flex()
+                            .gap_1()
+                            .child(div().text_color(style::good()).child(format!("+{added}")))
+                            .child(div().text_color(style::bad()).child(format!("−{removed}")))
                     }))
                     .child(crate::icons::ui(status_icon, px(12.), color)),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .pt_0p5()
+                    .pb_2()
+                    .text_xs()
+                    .font_family(crate::style::mono_font())
+                    .text_color(style::muted())
+                    .whitespace_normal()
+                    .child(title),
             )
             .children(call.diffs.iter().enumerate().map(|(di, d)| {
                 let diff = d.clone();
                 let file = d.path.rsplit('/').next().unwrap_or(&d.path).to_string();
                 div()
                     .id(("tool-diff", key * 32 + di))
-                    .pl_6()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(style::border())
                     .text_xs()
                     .text_color(style::accent())
                     .cursor_pointer()
@@ -1171,10 +1509,10 @@ impl ChatView {
                 let short: String = t.lines().take(20).collect::<Vec<_>>().join("\n");
                 d.child(
                     div()
-                        .ml_6()
-                        .p_2()
-                        .rounded_md()
-                        .bg(style::bg())
+                        .px_3()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(style::border())
                         .text_xs()
                         .font_family(crate::style::mono_font())
                         .text_color(style::faint())
@@ -1189,100 +1527,35 @@ impl ChatView {
             _ if self.is_waiting_permission() => ("needs you".into(), rgb(0xfbbf24).into()),
             ChatStatus::Connecting => ("connecting…".into(), style::faint().into()),
             ChatStatus::Ready => ("ready".into(), style::good().into()),
-            ChatStatus::Running => ("working…".into(), style::accent().into()),
+            ChatStatus::Running => ("working".into(), style::accent().into()),
             ChatStatus::Error(_) => ("error".into(), style::bad().into()),
             ChatStatus::Exited => ("closed".into(), style::faint().into()),
         };
-        let order = |c: &str| match c {
-            "mode" => 0,
-            "model" => 1,
-            "thought_level" => 2,
-            _ => 3,
-        };
-        let mut config: Vec<&ConfigOption> = self.config.iter().filter(|o| !o.options.is_empty()).collect();
-        config.sort_by_key(|o| order(&o.category));
         let title = self.title.clone().or_else(|| self.first_prompt().map(|p| crate::lines::short(p, 60))).unwrap_or_else(|| format!("New {} chat", self.launch.label));
-        v_flex()
+        let list_tip: SharedString = if cfg!(target_os = "macos") { "Your messages (⌘⇧J) · ⌥↑ ⌥↓ jump".into() } else { "Your messages (Ctrl+Shift+J) · Alt+↑ Alt+↓ jump".into() };
+        h_flex()
+            .px_4()
+            .py_2()
+            .gap_2()
+            .items_center()
             .border_b_1()
             .border_color(style::border())
+            .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+            .child(h_flex().gap_1().items_center().text_xs().text_color(status_color).child(div().size(px(6.)).rounded_full().bg(status_color)).child(status_label))
             .child(
-                h_flex()
-                    .px_4()
-                    .py_2()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-                    .child(h_flex().gap_1().items_center().text_xs().text_color(status_color).child(div().size(px(6.)).rounded_full().bg(status_color)).child(status_label))
-                    .children(config.into_iter().take(4).map(|opt| {
-                        let value = opt.options.iter().find(|v| v.value == opt.current).map(|v| v.name.clone()).unwrap_or_else(|| opt.current.clone());
-                        let current = if opt.category == "model" || opt.category == "mode" { value } else { format!("{}: {value}", opt.name) };
-                        let id = opt.id.clone();
-                        let open = self.open_config.as_deref() == Some(opt.id.as_str());
-                        let name: SharedString = opt.name.clone().into();
-                        div()
-                            .id(SharedString::from(format!("cfg-{}", opt.id)))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if open { style::accent().into() } else { style::border() })
-                            .text_xs()
-                            .text_color(style::muted())
-                            .cursor_pointer()
-                            .hover(|d| d.bg(style::panel_hover()))
-                            .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
-                            .child(format!("{current} ▾"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_config = if this.open_config.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
-                                cx.notify();
-                            }))
-                    }))
-                    .child(
-                        div()
-                            .id("detail-level")
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(style::border())
-                            .text_xs()
-                            .text_color(style::muted())
-                            .cursor_pointer()
-                            .hover(|d| d.bg(style::panel_hover()))
-                            .tooltip(|window, cx| Tooltip::new("Detail: Normal → Thinking → Verbose").build(window, cx))
-                            .child(self.detail.label())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.detail = this.detail.next();
-                                cx.notify();
-                            })),
-                    ),
+                div()
+                    .id("prompt-list-button")
+                    .p_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(move |window, cx| Tooltip::new(list_tip.clone()).build(window, cx))
+                    .child(crate::icons::ui("list", px(14.), style::muted()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.prompt_list = !this.prompt_list;
+                        cx.notify();
+                    })),
             )
-            .when_some(self.open_config.as_ref().and_then(|id| self.config.iter().find(|o| &o.id == id)).cloned(), |d, opt| {
-                d.child(
-                    h_flex()
-                        .px_4()
-                        .pb_2()
-                        .gap_1()
-                        .flex_wrap()
-                        .children(opt.options.iter().map(|v| {
-                            let selected = v.value == opt.current;
-                            let (id, value) = (opt.id.clone(), v.value.clone());
-                            let tip: SharedString = v.description.clone().unwrap_or_else(|| v.name.clone()).into();
-                            div()
-                                .id(SharedString::from(format!("cfgv-{}-{}", opt.id, v.value)))
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .text_xs()
-                                .cursor_pointer()
-                                .when(selected, |d| d.bg(style::accent_alpha(0.18)).text_color(style::accent()))
-                                .when(!selected, |d| d.text_color(style::muted()).hover(|d| d.bg(style::panel_hover())))
-                                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-                                .child(v.name.clone())
-                                .on_click(cx.listener(move |this, _, _, cx| this.set_config(id.clone(), value.clone(), cx)))
-                        })),
-                )
-            })
     }
 
     fn plan_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1293,7 +1566,9 @@ impl ChatView {
         let open = self.plan_open;
         Some(
             v_flex()
-                .mx_4()
+                .w_full()
+                .max_w(px(Self::COLUMN))
+                .mx_auto()
                 .mt_2()
                 .px_3()
                 .py_2()
@@ -1321,7 +1596,7 @@ impl ChatView {
                     d.children(self.plan.iter().map(|e| {
                         let (icon, color): (&'static str, Hsla) = match e.status.as_str() {
                             "completed" => ("circle-check", style::good().into()),
-                            "in_progress" => ("loader", style::accent().into()),
+                            "in_progress" => ("loader-circle", style::accent().into()),
                             _ => ("circle", style::faint().into()),
                         };
                         h_flex()
@@ -1377,6 +1652,186 @@ impl ChatView {
             )
         }))
     }
+
+    /// Selectores del agente dentro de la caja (estilo Zed): listas y on/off.
+    fn config_controls(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let order = |c: &str| match c {
+            "mode" => 0,
+            "model" => 1,
+            "thought_level" => 2,
+            _ => 3,
+        };
+        let mut config: Vec<&ConfigOption> = self.config.iter().filter(|o| !o.options.is_empty()).collect();
+        config.sort_by_key(|o| order(&o.category));
+        config
+            .into_iter()
+            .take(5)
+            .map(|opt| {
+                let id = opt.id.clone();
+                let name: SharedString = opt.name.clone().into();
+                // Opción de dos valores tipo on/off → interruptor.
+                let toggle = (opt.options.len() == 2).then(|| {
+                    let on = opt.options.iter().find(|v| matches!(v.value.to_lowercase().as_str(), "on" | "true" | "enabled" | "yes"))?;
+                    let off = opt.options.iter().find(|v| v.value != on.value)?;
+                    Some((on.value.clone(), off.value.clone()))
+                });
+                if let Some(Some((on, off))) = toggle {
+                    let is_on = opt.current == on;
+                    let next = if is_on { off } else { on };
+                    return h_flex()
+                        .id(SharedString::from(format!("cfg-{}", opt.id)))
+                        .gap_1p5()
+                        .px_1p5()
+                        .py_0p5()
+                        .items_center()
+                        .rounded_md()
+                        .text_xs()
+                        .text_color(style::muted())
+                        .cursor_pointer()
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .child(opt.name.clone())
+                        .child(
+                            div()
+                                .w(px(24.))
+                                .h(px(14.))
+                                .p(px(2.))
+                                .rounded_full()
+                                .bg(if is_on { style::accent().into() } else { style::border() })
+                                .child(div().size(px(10.)).rounded_full().bg(style::text()).when(is_on, |d| d.ml(px(10.)))),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_config(id.clone(), next.clone(), cx)))
+                        .into_any_element();
+                }
+                let value = opt.options.iter().find(|v| v.value == opt.current).map(|v| v.name.clone()).unwrap_or_else(|| opt.current.clone());
+                let open = self.open_config.as_deref() == Some(opt.id.as_str());
+                h_flex()
+                    .id(SharedString::from(format!("cfg-{}", opt.id)))
+                    .gap_0p5()
+                    .px_1p5()
+                    .py_0p5()
+                    .items_center()
+                    .rounded_md()
+                    .text_xs()
+                    .text_color(if open { style::text() } else { style::muted() })
+                    .when(open, |d| d.bg(style::panel_hover()))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+                    .child(value)
+                    .child(crate::icons::ui("chevron-down", px(11.), style::faint()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_config = if this.open_config.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) };
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Lista de valores de la opción abierta (sale encima de la caja).
+    fn config_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let opt = self.open_config.as_ref().and_then(|id| self.config.iter().find(|o| &o.id == id))?.clone();
+        Some(
+            v_flex()
+                .w(px(300.))
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(style::border())
+                .bg(style::panel())
+                .child(div().px_2().py_1().text_xs().text_color(style::faint()).child(opt.name.clone()))
+                .children(opt.options.iter().map(|v| {
+                    let selected = v.value == opt.current;
+                    let (id, value) = (opt.id.clone(), v.value.clone());
+                    h_flex()
+                        .id(SharedString::from(format!("cfgv-{}-{}", opt.id, v.value)))
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .items_start()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .child(div().w(px(14.)).pt_0p5().when(selected, |d| d.child(crate::icons::ui("check", px(12.), style::accent()))))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_sm().child(v.name.clone()))
+                                .when_some(v.description.clone(), |d, desc| d.child(div().text_xs().text_color(style::faint()).whitespace_normal().child(desc))),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_config(id.clone(), value.clone(), cx)))
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Contexto usado: anillo y porcentaje (y costo, si el agente lo manda).
+    fn context_meter(&self) -> Option<AnyElement> {
+        let (used, size, cost) = self.usage?;
+        let pct = (used as f64 / size as f64 * 100.).clamp(0., 100.);
+        let color: Hsla = if pct >= 85. {
+            style::bad().into()
+        } else if pct >= 65. {
+            rgb(0xfbbf24).into()
+        } else {
+            style::muted().into()
+        };
+        let tip: SharedString = format!(
+            "Context: {} of {} tokens ({pct:.0}%){}",
+            human(used),
+            human(size),
+            cost.map(|c| format!(" · session cost {}", crate::style::money(c))).unwrap_or_default()
+        )
+        .into();
+        let frac = (pct / 100.) as f32;
+        Some(
+            h_flex()
+                .id("context-meter")
+                .gap_1()
+                .px_1p5()
+                .items_center()
+                .text_xs()
+                .text_color(color)
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let c = bounds.center();
+                            let r = px(5.5);
+                            let ring = |from: f32, to: f32, color: Hsla, window: &mut Window| {
+                                let steps = 32;
+                                let mut b = PathBuilder::stroke(px(2.));
+                                for i in 0..=steps {
+                                    let a = (from + (to - from) * i as f32 / steps as f32) * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                                    let p = point(c.x + r * a.cos(), c.y + r * a.sin());
+                                    if i == 0 {
+                                        b.move_to(p);
+                                    } else {
+                                        b.line_to(p);
+                                    }
+                                }
+                                if let Ok(path) = b.build() {
+                                    window.paint_path(path, color);
+                                }
+                            };
+                            ring(0., 1., style::border().into(), window);
+                            if frac > 0.005 {
+                                ring(0., frac, color, window);
+                            }
+                        },
+                    )
+                    .size(px(14.)),
+                )
+                .child(format!("{pct:.0}%"))
+                .into_any_element(),
+        )
+    }
+}
+
+fn human(n: u64) -> String {
+    crate::style::human(n)
 }
 
 impl Render for ChatView {
@@ -1385,12 +1840,13 @@ impl Render for ChatView {
         let live_upto = if self.viewing.is_some() { 0 } else { usize::MAX };
         let refs: Vec<&Turn> = turns.iter().collect();
 
-        // Prompt fijo: el del turno que estás leyendo, si su tarjeta ya pasó.
+        // Prompt fijo: el del turno que estás leyendo, si su burbuja ya pasó.
         let (top, offset) = self.scroll.logical_scroll_top();
         let sticky = (offset < px(-36.))
             .then(|| (0..=top.min(turns.len().saturating_sub(1))).rev().find_map(|i| turns.get(i)?.user.as_ref().map(|u| (i, u.clone()))))
             .flatten();
 
+        let count = turns.len();
         let conversation = div()
             .id("chat-scroll")
             .flex_1()
@@ -1398,20 +1854,20 @@ impl Render for ChatView {
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
-            .px_4()
-            .pt_3()
+            .px_6()
+            .pt_4()
             .when(turns.is_empty() && matches!(self.status, ChatStatus::Ready | ChatStatus::Connecting), |d| {
                 d.child(
                     v_flex()
-                        .pt_8()
+                        .pt_16()
                         .gap_1()
                         .items_center()
                         .text_color(style::faint())
-                        .child(div().text_sm().child(format!("Start a conversation with {}", self.launch.label)))
-                        .child(div().text_xs().child("Mention files with @, run agent commands with /, and pick mode or model above.")),
+                        .child(div().text_base().text_color(style::muted()).child(format!("Start a conversation with {}", self.launch.label)))
+                        .child(div().text_xs().child("Mention files with @, run agent commands with /, paste images with ⌘V.")),
                 )
             })
-            .children(turns.iter().enumerate().map(|(i, t)| self.render_turn(i, t, i < live_upto, cx)));
+            .children(turns.iter().enumerate().map(|(i, t)| self.render_turn(i, t, i < live_upto, i + 1 == count, cx)));
 
         let body = match &self.status {
             ChatStatus::Error(e) if turns.is_empty() => div()
@@ -1433,7 +1889,9 @@ impl Render for ChatView {
 
         let suggestions = (!self.suggestions.is_empty()).then(|| {
             v_flex()
-                .mx_4()
+                .w_full()
+                .max_w(px(Self::COLUMN))
+                .mx_auto()
                 .mb_1()
                 .p_1()
                 .rounded_lg()
@@ -1465,7 +1923,8 @@ impl Render for ChatView {
         });
 
         let queue = (!self.queue.is_empty()).then(|| {
-            v_flex().mx_4().mb_1().gap_0p5().children(self.queue.iter().enumerate().map(|(i, q)| {
+            v_flex().w_full().max_w(px(Self::COLUMN)).mx_auto().mb_1().gap_0p5().children(self.queue.iter().enumerate().map(|(i, q)| {
+                let shown = if q.images.is_empty() { q.text.clone() } else { format!("{} [+{} image]", q.text, q.images.len()) };
                 h_flex()
                     .gap_2()
                     .px_2()
@@ -1475,7 +1934,7 @@ impl Render for ChatView {
                     .bg(style::panel())
                     .text_xs()
                     .child(crate::icons::ui("clock", px(12.), style::muted()))
-                    .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(format!("Queued: {q}")))
+                    .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(format!("Queued: {shown}")))
                     .child(
                         div()
                             .id(("queue-now", i))
@@ -1483,8 +1942,8 @@ impl Render for ChatView {
                             .cursor_pointer()
                             .child("Send now")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let text = this.queue.remove(i);
-                                this.queue.insert(0, text);
+                                let q = this.queue.remove(i);
+                                this.queue.insert(0, q);
                                 this.stop(cx);
                             })),
                     )
@@ -1495,8 +1954,9 @@ impl Render for ChatView {
                             .cursor_pointer()
                             .child("Edit")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                let text = this.queue.remove(i);
-                                this.input.update(cx, |s, cx| s.set_value(text, window, cx));
+                                let q = this.queue.remove(i);
+                                this.attachments.extend(q.images);
+                                this.input.update(cx, |s, cx| s.set_value(q.text, window, cx));
                                 cx.notify();
                             })),
                     )
@@ -1514,53 +1974,149 @@ impl Render for ChatView {
         });
 
         let running = self.status == ChatStatus::Running;
+        let has_text = !self.input.read(cx).value().trim().is_empty() || !self.attachments.is_empty();
+        let weak = cx.entity().downgrade();
+        let textarea = Textarea::new(&self.input).appearance(false).on_paste(move |item, _, cx| {
+            let images: Vec<(ImageFormat, Vec<u8>)> = item
+                .entries()
+                .iter()
+                .filter_map(|e| match e {
+                    ClipboardEntry::Image(img) => Some((img.format, img.bytes.clone())),
+                    _ => None,
+                })
+                .collect();
+            if images.is_empty() {
+                return false;
+            }
+            let _ = weak.update(cx, |this, cx| this.add_images(images, cx));
+            true
+        });
+        let controls = self.config_controls(cx);
+        let detail_tip: SharedString = format!("Detail: {} (Normal → Thinking → Verbose)", self.detail.label()).into();
         let composer = v_flex()
-            .px_4()
+            .px_6()
             .pb_3()
             .pt_1()
             .gap_1()
             .when_some(self.editing, |d, n| {
                 d.child(
                     h_flex()
+                        .w_full()
+                        .max_w(px(Self::COLUMN))
+                        .mx_auto()
                         .gap_2()
                         .text_xs()
                         .text_color(style::accent())
                         .child(crate::icons::ui("pencil", px(11.), style::accent()))
-                        .child(format!("Editing message #{n} — sending starts a new version (the current one is kept). Esc cancels."))
+                        .child(format!("Editing message #{n} — sending starts a new version (the current one is kept). Esc cancels.")),
                 )
             })
+            .when_some(self.config_menu(cx), |d, menu| d.child(div().w_full().max_w(px(Self::COLUMN)).mx_auto().child(menu)))
             .child(
-                h_flex()
-                    .gap_2()
-                    .items_end()
-                    .p_2()
-                    .rounded_lg()
+                v_flex()
+                    .w_full()
+                    .max_w(px(Self::COLUMN))
+                    .mx_auto()
+                    .rounded_xl()
                     .border_1()
                     .border_color(style::border())
                     .bg(style::panel())
-                    .child(div().flex_1().child(Textarea::new(&self.input)))
+                    .when(!self.attachments.is_empty(), |d| {
+                        d.child(h_flex().px_3().pt_3().gap_2().flex_wrap().children(self.attachments.iter().enumerate().map(|(i, a)| {
+                            div()
+                                .relative()
+                                .child(img_el(a.image.clone()).h(px(56.)).max_w(px(96.)).rounded_md())
+                                .child(
+                                    div()
+                                        .id(("drop-image", i))
+                                        .absolute()
+                                        .top(px(-6.))
+                                        .right(px(-6.))
+                                        .p_0p5()
+                                        .rounded_full()
+                                        .bg(style::panel_hover())
+                                        .border_1()
+                                        .border_color(style::border())
+                                        .cursor_pointer()
+                                        .child(crate::icons::ui("x", px(10.), style::muted()))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.attachments.remove(i);
+                                            cx.notify();
+                                        })),
+                                )
+                        })))
+                    })
+                    .child(div().px_3().pt_2().child(textarea))
                     .child(
-                        div()
-                            .id("chat-send")
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .text_sm()
-                            .cursor_pointer()
-                            .when(running, |d| d.border_1().border_color(style::border()).child("Stop").on_click(cx.listener(|this, _, _, cx| this.stop(cx))))
-                            .when(!running, |d| d.bg(style::accent()).text_color(style::bg()).child("Send").on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))),
+                        h_flex()
+                            .px_2()
+                            .pb_2()
+                            .gap_0p5()
+                            .items_center()
+                            .child(
+                                div()
+                                    .id("attach-image")
+                                    .p_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .tooltip(|window, cx| Tooltip::new("Attach images (or paste with ⌘V)").build(window, cx))
+                                    .child(crate::icons::ui("plus", px(14.), style::muted()))
+                                    .on_click(cx.listener(|this, _, window, cx| this.pick_images(window, cx))),
+                            )
+                            .children(controls)
+                            .child(
+                                div()
+                                    .id("detail-level")
+                                    .p_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .tooltip(move |window, cx| Tooltip::new(detail_tip.clone()).build(window, cx))
+                                    .child(crate::icons::ui(
+                                        match self.detail {
+                                            Detail::Normal => "eye-off",
+                                            Detail::Thinking => "eye",
+                                            Detail::Verbose => "scan-eye",
+                                        },
+                                        px(14.),
+                                        if self.detail == Detail::Normal { style::faint() } else { style::accent() },
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.detail = this.detail.next();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .when_some(self.context_meter(), |d, m| d.child(m))
+                            .child(
+                                div()
+                                    .id("chat-send")
+                                    .ml_1()
+                                    .size(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .map(|d| {
+                                        if running && !has_text {
+                                            d.bg(style::text())
+                                                .tooltip(|window, cx| Tooltip::new("Stop (Esc)").build(window, cx))
+                                                .child(div().size(px(9.)).rounded_sm().bg(style::bg()))
+                                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                                        } else {
+                                            d.when(has_text, |d| d.bg(style::accent()))
+                                                .when(!has_text, |d| d.bg(style::panel_hover()))
+                                                .tooltip(move |window, cx| {
+                                                    Tooltip::new(if running { "Queue message (sent when the agent finishes)" } else { "Send (Enter)" }).build(window, cx)
+                                                })
+                                                .child(crate::icons::ui("arrow-up", px(15.), if has_text { style::bg() } else { style::faint() }))
+                                                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+                                        }
+                                    }),
+                            ),
                     ),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(style::faint())
-                    .child("⌥↑ ⌥↓ your messages")
-                    .child("⌘⇧J list")
-                    .child("↑ last message")
-                    .child(div().flex_1())
-                    .child(if running { "Esc stops · new messages queue" } else { "Enter sends" }),
             );
 
         let prompt_list = self.prompt_list.then(|| {
@@ -1644,34 +2200,41 @@ impl Render for ChatView {
                         ),
                 )
             })
-            .when_some(self.plan_panel(cx), |d, p| d.child(p))
+            .when_some(self.plan_panel(cx), |d, p| d.child(div().px_6().child(p)))
             .when_some(sticky, |d, (i, user)| {
                 d.child(
-                    h_flex()
-                        .id("sticky-prompt")
-                        .mx_4()
-                        .mt_1()
-                        .px_3()
-                        .py_1()
-                        .gap_2()
-                        .items_center()
-                        .border_l_4()
-                        .border_color(style::accent_alpha(0.45))
-                        .bg(style::panel())
-                        .text_xs()
-                        .cursor_pointer()
-                        .child(div().text_color(style::accent()).child(format!("#{}", user.n)))
-                        .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(crate::lines::short(&user.text, 160)))
-                        .child(crate::icons::ui("arrow-up", px(11.), style::faint()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.go_to(i, cx))),
+                    div().px_6().pt_1().child(
+                        h_flex()
+                            .id("sticky-prompt")
+                            .w_full()
+                            .max_w(px(Self::COLUMN))
+                            .mx_auto()
+                            .px_3()
+                            .py_1()
+                            .gap_2()
+                            .items_center()
+                            .rounded_lg()
+                            .bg(style::panel_hover())
+                            .text_xs()
+                            .cursor_pointer()
+                            .child(div().text_color(style::faint()).child(format!("#{}", user.n)))
+                            .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(crate::lines::short(&user.text, 160)))
+                            .child(crate::icons::ui("arrow-up", px(11.), style::faint()))
+                            .on_click(cx.listener(move |this, _, _, cx| this.go_to(i, cx))),
+                    ),
                 )
             })
             .child(body)
-            .when_some(queue, |d, q| d.child(q))
-            .when_some(suggestions, |d, s| d.child(s))
+            .when_some(queue, |d, q| d.child(div().px_6().child(q)))
+            .when_some(suggestions, |d, s| d.child(div().px_6().child(s)))
             .child(composer)
             .when_some(prompt_list, |d, l| d.child(l))
     }
+}
+
+/// `img()` de gpui para una imagen en memoria.
+fn img_el(image: Arc<Image>) -> Img {
+    img(image)
 }
 
 /// Archivos mencionados con `@` en un mensaje.

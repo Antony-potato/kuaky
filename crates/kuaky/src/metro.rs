@@ -126,7 +126,30 @@ fn meaningful_title(title: &str, harness: Harness) -> Option<String> {
     Some(t.to_string())
 }
 
+/// Agentes vivos de un proyecto (para las pestañas de proyectos e Inicio).
+#[derive(Clone, Default)]
+pub struct LiveSummary {
+    pub working: usize,
+    pub needs_you: usize,
+    /// `uid` → (trabajando, te necesita).
+    pub sessions: HashMap<String, (bool, bool)>,
+}
+
 impl ProjectView {
+    pub fn live_summary(&self, cx: &App) -> LiveSummary {
+        let trains = self.trains(cx);
+        LiveSummary {
+            working: trains.values().filter(|t| t.working && !t.needs_you).count(),
+            needs_you: trains.values().filter(|t| t.needs_you).count(),
+            sessions: trains.into_iter().map(|(uid, t)| (uid, (t.working, t.needs_you))).collect(),
+        }
+    }
+
+    /// Abre el board con una línea elegida (desde Inicio).
+    pub fn show_line(&mut self, line: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_board(Some(line), window, cx);
+    }
+
     /// Sesiones vivas por `uid`.
     fn trains(&self, cx: &App) -> HashMap<String, Train> {
         let mut out = HashMap::new();

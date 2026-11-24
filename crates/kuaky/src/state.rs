@@ -31,6 +31,9 @@ pub struct State {
     /// Project open when kuaky was closed; reopened on launch (`None` = Home).
     #[serde(default)]
     pub last_open: Option<String>,
+    /// Projects open as tabs when kuaky was closed (in tab order).
+    #[serde(default)]
+    pub open: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]

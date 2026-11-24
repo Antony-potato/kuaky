@@ -12,7 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 
-actions!(kuaky, [Quit, GoHome, OpenFolder, OpenSettings, Hide, HideOthers, ShowAll, Minimize, Zoom, OpenRepo]);
+actions!(kuaky, [Quit, GoHome, OpenFolder, OpenSettings, Hide, HideOthers, ShowAll, Minimize, Zoom, OpenRepo, NextProject, PrevProject, CloseProject]);
 
 const REPO_URL: &str = "https://github.com/Antony-potato/kuaky";
 
@@ -31,12 +31,17 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-shift-h", GoHome, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-alt-right", NextProject, None),
+        KeyBinding::new("cmd-alt-left", PrevProject, None),
+        KeyBinding::new("cmd-shift-w", CloseProject, None),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
         KeyBinding::new("ctrl-o", OpenFolder, Some("!Terminal")),
         KeyBinding::new("ctrl-shift-h", GoHome, Some("!Terminal")),
         KeyBinding::new("ctrl-,", OpenSettings, Some("!Terminal")),
+        KeyBinding::new("ctrl-alt-right", NextProject, None),
+        KeyBinding::new("ctrl-alt-left", PrevProject, None),
     ]);
     set_menus(cx);
 }
@@ -62,6 +67,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("New Terminal", NewTerminal),
             MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Close Project", CloseProject),
             MenuItem::separator(),
             MenuItem::action("Home", GoHome),
         ]),
@@ -79,6 +85,9 @@ fn set_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Next Tab", NextTab),
             MenuItem::action("Previous Tab", PrevTab),
+            MenuItem::separator(),
+            MenuItem::action("Next Project", NextProject),
+            MenuItem::action("Previous Project", PrevProject),
         ]),
         Menu::new("Window").items([
             MenuItem::action("Minimize", Minimize),
@@ -90,7 +99,12 @@ fn set_menus(cx: &mut App) {
 
 pub struct KuakyApp {
     home: Entity<HomeView>,
-    project: Option<Entity<ProjectView>>,
+    /// Open projects, as tabs in the title bar. They keep running when hidden.
+    projects: Vec<Entity<ProjectView>>,
+    /// Shown project (`None` = Home).
+    active: Option<usize>,
+    /// Observer of each open project (same order as `projects`).
+    project_subs: Vec<Subscription>,
     settings: Option<Entity<SettingsView>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -100,24 +114,54 @@ impl KuakyApp {
         let home = cx.new(HomeView::new);
         let sub = cx.subscribe_in(&home, window, |this, _, event: &HomeEvent, window, cx| match event {
             HomeEvent::OpenProject(path) => this.open_project(path.clone(), window, cx),
+            HomeEvent::OpenLine(path, line) => {
+                this.open_project(path.clone(), window, cx);
+                if let Some(project) = this.current() {
+                    project.update(cx, |p, cx| p.show_line(line.clone(), window, cx));
+                }
+            }
             HomeEvent::PickFolder => this.pick_folder(window, cx),
         });
         let obs = cx.observe(&home, |this, home, cx| {
-            if let (Some(project), Some(events)) = (&this.project, home.read(cx).events()) {
-                project.update(cx, |p, cx| p.set_usage(&events, cx));
+            if let Some(events) = home.read(cx).events() {
+                for project in &this.projects {
+                    project.update(cx, |p, cx| p.set_usage(&events, cx));
+                }
             }
         });
-        let mut this = Self { home, project: None, settings: None, _subscriptions: vec![sub, obs] };
+        let mut this = Self { home, projects: Vec::new(), active: None, project_subs: Vec::new(), settings: None, _subscriptions: vec![sub, obs] };
         let capture = std::env::var_os("KUAKY_SCREENSHOT").is_some();
-        let start = std::env::args().nth(1).map(PathBuf::from).or_else(|| {
-            // Reopen the project that was open when kuaky was closed.
-            (!capture).then(|| state::get(cx).last_open.clone().map(PathBuf::from)).flatten()
-        });
-        if let Some(path) = start.filter(|p| p.is_dir()) {
+        if let Some(path) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir()) {
             this.open_project(path, window, cx);
+        } else if !capture {
+            // Reopen the projects that were open when kuaky was closed.
+            let saved = state::get(cx).clone();
+            let mut open = saved.open.clone();
+            if open.is_empty() {
+                open.extend(saved.last_open.clone());
+            }
+            for path in open.iter().map(PathBuf::from).filter(|p| p.is_dir()) {
+                this.open_project(path, window, cx);
+            }
+            match saved.last_open.as_deref().and_then(|l| this.index_of(std::path::Path::new(l), cx)) {
+                Some(i) => this.activate(Some(i), window, cx),
+                None => this.activate(None, window, cx),
+            }
         }
         #[cfg(feature = "screenshot")]
         {
+            // `KUAKY_DEMO_PROJECTS=a,b` opens more project tabs; `KUAKY_DEMO_HOME` ends on Home.
+            if let Ok(more) = std::env::var("KUAKY_DEMO_PROJECTS") {
+                for p in more.split(',').map(PathBuf::from).filter(|p| p.is_dir()) {
+                    this.open_project(p, window, cx);
+                }
+                if this.projects.len() > 1 {
+                    this.activate(Some(0), window, cx);
+                }
+            }
+            if std::env::var("KUAKY_DEMO_HOME").is_ok() {
+                this.activate(None, window, cx);
+            }
             if std::env::var("KUAKY_DEMO_SETTINGS").is_ok() {
                 this.toggle_settings(window, cx);
             }
@@ -157,28 +201,125 @@ impl KuakyApp {
         .detach();
     }
 
-    fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
-        let usage = self.home.read(cx).events();
-        let key = path.to_string_lossy().into_owned();
-        state::update(cx, |s| s.last_open = Some(key));
-        let project = cx.new(|cx| ProjectView::new(path, usage, window, cx));
-        #[cfg(feature = "screenshot")]
-        if let Ok(which) = std::env::var("KUAKY_DEMO_TERMINAL") {
-            let harness = if which == "claude" { crate::project::Harness::Claude } else { crate::project::Harness::Shell };
-            project.update(cx, |p, cx| p.open_terminal(harness, window, cx));
+    fn current(&self) -> Option<&Entity<ProjectView>> {
+        self.active.and_then(|i| self.projects.get(i))
+    }
+
+    fn index_of(&self, path: &std::path::Path, cx: &App) -> Option<usize> {
+        self.projects.iter().position(|p| p.read(cx).root() == path)
+    }
+
+    /// Shows project `i` (or Home) and saves which projects are open.
+    fn activate(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = index.filter(|i| *i < self.projects.len());
+        for (i, project) in self.projects.iter().enumerate() {
+            let visible = Some(i) == self.active;
+            project.update(cx, |p, _| p.set_visible(visible));
         }
-        #[cfg(feature = "screenshot")]
-        project.update(cx, |p, cx| p.demo(window, cx));
-        self.project = Some(project);
+        // Screenshot runs must not replace the user's open projects.
+        if std::env::var_os("KUAKY_SCREENSHOT").is_none() {
+            let open: Vec<String> = self.projects.iter().map(|p| p.read(cx).root().to_string_lossy().into_owned()).collect();
+            let last = self.current().map(|p| p.read(cx).root().to_string_lossy().into_owned());
+            state::update(cx, |s| {
+                s.open = open;
+                s.last_open = last;
+            });
+        }
+        match self.current().cloned() {
+            Some(project) => project.update(cx, |p, cx| p.focus_active(window, cx)),
+            None => {
+                self.home.update(cx, |home, cx| home.reload(cx));
+                self.push_live(cx);
+            }
+        }
         cx.notify();
     }
 
-    fn go_home(&mut self, cx: &mut Context<Self>) {
-        self.project = None;
-        state::update(cx, |s| s.last_open = None);
-        self.home.update(cx, |home, cx| home.reload(cx));
-        cx.notify();
+    fn cycle(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.projects.len() as isize + 1; // + Home
+        let pos = self.active.map(|i| i as isize + 1).unwrap_or(0);
+        let next = (pos + delta).rem_euclid(n);
+        self.activate((next > 0).then(|| next as usize - 1), window, cx);
+    }
+
+    /// Closes a project tab. Asks first if agents are still working in it.
+    fn close_project(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.get(index) else { return };
+        let live = project.read(cx).live_summary(cx);
+        let busy = live.working + live.needs_you;
+        if busy == 0 {
+            self.remove_project(index, window, cx);
+            return;
+        }
+        let name = project_name(project.read(cx).root());
+        let detail = format!(
+            "{busy} agent session{} still running. They stop now; you can resume them later from Previous.",
+            if busy == 1 { " is" } else { "s are" }
+        );
+        let answer = window.prompt(PromptLevel::Warning, &format!("Close {name}?"), Some(&detail), &["Close", "Cancel"], cx);
+        let target = project.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await.ok() == Some(0) {
+                this.update_in(cx, |this, window, cx| {
+                    if let Some(i) = this.projects.iter().position(|p| *p == target) {
+                        this.remove_project(i, window, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn remove_project(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.projects.remove(index);
+        drop(self.project_subs.remove(index));
+        let next = match self.active {
+            Some(a) if a == index => index.checked_sub(1).or((!self.projects.is_empty()).then_some(0)),
+            Some(a) if a > index => Some(a - 1),
+            other => other,
+        };
+        self.activate(next, window, cx);
+    }
+
+    /// Live agent state of every open project, for Home's map.
+    fn push_live(&self, cx: &mut Context<Self>) {
+        let live: Vec<(PathBuf, crate::project::LiveSummary)> =
+            self.projects.iter().map(|p| (p.read(cx).root().to_path_buf(), p.read(cx).live_summary(cx))).collect();
+        self.home.update(cx, |home, cx| home.set_live(live, cx));
+    }
+
+    fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = path.canonicalize().unwrap_or(path);
+        if let Some(i) = self.index_of(&path, cx) {
+            self.activate(Some(i), window, cx);
+            return;
+        }
+        let usage = self.home.read(cx).events();
+        let project = cx.new(|cx| ProjectView::new(path, usage, window, cx));
+        let obs = cx.observe(&project, |this, _, cx| {
+            if this.active.is_none() {
+                this.push_live(cx);
+            }
+            cx.notify();
+        });
+        self.project_subs.push(obs);
+        // Demo data (screenshots) only goes into the first project: the one on the
+        // command line. Others opened with `KUAKY_DEMO_PROJECTS` keep their real map.
+        #[cfg(feature = "screenshot")]
+        if self.projects.is_empty() {
+            if let Ok(which) = std::env::var("KUAKY_DEMO_TERMINAL") {
+                let harness = if which == "claude" { crate::project::Harness::Claude } else { crate::project::Harness::Shell };
+                project.update(cx, |p, cx| p.open_terminal(harness, window, cx));
+            }
+            project.update(cx, |p, cx| p.demo(window, cx));
+        }
+        self.projects.push(project);
+        self.activate(Some(self.projects.len() - 1), window, cx);
+    }
+
+    fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate(None, window, cx);
     }
 
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -193,7 +334,7 @@ impl KuakyApp {
                 cx.notify();
             }
             SettingsEvent::Changed => {
-                if let Some(project) = &this.project {
+                for project in &this.projects {
                     project.update(cx, |p, cx| p.on_settings_changed(cx));
                 }
             }
@@ -221,31 +362,80 @@ impl KuakyApp {
     }
 
     fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let location = self.project.as_ref().map(|p| tilde(p.read(cx).root()));
-        let home_tip: SharedString = if cfg!(target_os = "macos") { "Home (⌘⇧H)".into() } else { "Home (Ctrl+Shift+H)".into() };
-        let settings_tip: SharedString = if cfg!(target_os = "macos") { "Settings (⌘,)".into() } else { "Settings (Ctrl+,)".into() };
-        let search_tip: SharedString = if cfg!(target_os = "macos") { "Search in project (⌘⇧F)".into() } else { "Search in project (Ctrl+Shift+F)".into() };
-        let has_project = self.project.is_some();
+        let mac = cfg!(target_os = "macos");
+        let home_tip: SharedString = if mac { "Home (⌘⇧H)".into() } else { "Home (Ctrl+Shift+H)".into() };
+        let settings_tip: SharedString = if mac { "Settings (⌘,)".into() } else { "Settings (Ctrl+,)".into() };
+        let search_tip: SharedString = if mac { "Search in project (⌘⇧F)".into() } else { "Search in project (Ctrl+Shift+F)".into() };
+        let open_tip: SharedString = if mac { "Open folder (⌘O)".into() } else { "Open folder (Ctrl+O)".into() };
+        let has_project = self.active.is_some();
+        let on_home = self.active.is_none();
+
+        let tabs: Vec<AnyElement> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(i, project)| {
+                let p = project.read(cx);
+                let root = p.root().to_path_buf();
+                let live = p.live_summary(cx);
+                self.project_tab(i, &root, &live, cx).into_any_element()
+            })
+            .collect();
 
         TitleBar::new().child(
             h_flex()
                 .flex_1()
-                .gap_2()
+                .min_w_0()
+                .gap_1()
                 .items_center()
                 .text_sm()
                 .child(
                     div()
                         .id("brand")
                         .cursor_pointer()
+                        .mr_1()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(style::accent())
                         .child("kuaky")
-                        .on_click(cx.listener(|this, _, _, cx| this.go_home(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
                 )
-                .when_some(location, |d, loc| {
-                    d.child(div().text_color(style::faint()).child("/"))
-                        .child(div().text_color(style::muted()).truncate().child(loc))
-                })
+                .child(
+                    h_flex()
+                        .id("go-home")
+                        .gap_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(on_home, |d| d.bg(style::panel_hover()))
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .tooltip(move |window, cx| Tooltip::new(home_tip.clone()).build(window, cx))
+                        .child(icons::ui("house", px(14.), if on_home { style::text() } else { style::muted() }))
+                        .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
+                )
+                .when(!tabs.is_empty(), |d| d.child(div().w(px(1.)).h(px(14.)).mx_1().bg(style::border())))
+                .child(
+                    div()
+                        .id("project-tabs")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .min_w_0()
+                        .overflow_x_scroll()
+                        .children(tabs),
+                )
+                .child(
+                    div()
+                        .id("open-project")
+                        .p_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(style::panel_hover()))
+                        .tooltip(move |window, cx| Tooltip::new(open_tip.clone()).build(window, cx))
+                        .child(icons::ui("plus", px(14.), style::muted()))
+                        .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
+                )
                 .child(div().flex_1())
                 .when(has_project, |d| {
                     d.child(
@@ -258,21 +448,10 @@ impl KuakyApp {
                             .tooltip(move |window, cx| Tooltip::new(search_tip.clone()).build(window, cx))
                             .child(icons::ui("search", px(15.), style::muted()))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(project) = &this.project {
+                                if let Some(project) = this.current() {
                                     project.update(cx, |p, cx| p.open_search_tab(window, cx));
                                 }
                             })),
-                    )
-                    .child(
-                        div()
-                            .id("go-home")
-                            .p_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(style::panel_hover()))
-                            .tooltip(move |window, cx| Tooltip::new(home_tip.clone()).build(window, cx))
-                            .child(icons::ui("house", px(15.), style::muted()))
-                            .on_click(cx.listener(|this, _, _, cx| this.go_home(cx))),
                     )
                 })
                 .child(
@@ -288,6 +467,77 @@ impl KuakyApp {
                 ),
         )
     }
+
+    /// One project in the title bar: name, live agent state and close button.
+    fn project_tab(&self, i: usize, root: &std::path::Path, live: &crate::project::LiveSummary, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active == Some(i);
+        let name = project_name(root);
+        let group: SharedString = format!("ptab-{i}").into();
+        let path_tip: SharedString = {
+            let mut t = tilde(root);
+            if live.needs_you > 0 {
+                t.push_str(&format!(" · {} need{} you", live.needs_you, if live.needs_you == 1 { "s" } else { "" }));
+            }
+            if live.working > 0 {
+                t.push_str(&format!(" · {} working", live.working));
+            }
+            t.into()
+        };
+        let dot = if live.needs_you > 0 {
+            Some(style::bad())
+        } else if live.working > 0 {
+            Some(style::accent())
+        } else {
+            None
+        };
+        h_flex()
+            .id(("project-tab", i))
+            .group(group.clone())
+            .flex_none()
+            .gap_1p5()
+            .pl_2()
+            .pr_1()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .border_1()
+            .border_color(if active { style::border().into() } else { gpui_kit::transparent_black() })
+            .when(active, |d| d.bg(style::panel_hover()))
+            .hover(|d| d.bg(style::panel_hover()))
+            .tooltip(move |window, cx| Tooltip::new(path_tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| this.activate(Some(i), window, cx)))
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| this.close_project(i, window, cx)),
+            )
+            .child(icons::ui("folder", px(13.), if active { style::accent() } else { style::faint() }))
+            .child(
+                div()
+                    .max_w(px(160.))
+                    .truncate()
+                    .text_color(if active { style::text() } else { style::muted() })
+                    .child(name),
+            )
+            .when_some(dot, |d, c| d.child(div().size(px(6.)).rounded_full().bg(c)))
+            .when(live.needs_you > 1, |d| d.child(div().text_xs().text_color(style::bad()).child(live.needs_you.to_string())))
+            .child(
+                div()
+                    .id(("close-project", i))
+                    .p_0p5()
+                    .rounded_sm()
+                    .when(!active, |d| d.invisible().group_hover(group, |s| s.visible()))
+                    .hover(|d| d.bg(style::border()))
+                    .child(icons::ui("x", px(11.), style::faint()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_project(i, window, cx);
+                    })),
+            )
+    }
+}
+
+fn project_name(root: &std::path::Path) -> String {
+    root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| tilde(root))
 }
 
 impl Render for KuakyApp {
@@ -299,7 +549,14 @@ impl Render for KuakyApp {
             .flex_col()
             .bg(style::bg())
             .text_color(style::text())
-            .on_action(cx.listener(|this, _: &GoHome, _, cx| this.go_home(cx)))
+            .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
+            .on_action(cx.listener(|this, _: &NextProject, window, cx| this.cycle(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PrevProject, window, cx| this.cycle(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &CloseProject, window, cx| {
+                if let Some(i) = this.active {
+                    this.close_project(i, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.pick_folder(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings(window, cx)))
             .on_action(|_: &Minimize, window, _| window.minimize_window())
@@ -309,7 +566,7 @@ impl Render for KuakyApp {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .map(|d| match &self.project {
+                    .map(|d| match self.current() {
                         Some(project) => d.child(project.clone()),
                         None => d.child(self.home.clone()),
                     }),

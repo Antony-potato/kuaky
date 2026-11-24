@@ -45,6 +45,8 @@ pub enum Event {
     ConfigOptions(Vec<ConfigOption>),
     /// Título de la sesión que puso el agente.
     Title(String),
+    /// Contexto usado (`usage_update`): tokens usados, tamaño de la ventana y costo acumulado.
+    Usage { used: u64, size: u64, cost: Option<f64> },
     /// El agente escribió un archivo a través de kuaky (`fs/write_text_file`).
     FileWritten { path: PathBuf, old_text: Option<String>, new_text: String },
     Error(String),
@@ -559,6 +561,11 @@ pub fn parse_update(update: &Value) -> Option<Event> {
         "current_mode_update" => update.get("currentModeId").and_then(Value::as_str).map(|m| Event::ModeChanged(m.to_string())),
         "config_option_update" | "config_options_update" => Some(Event::ConfigOptions(parse_config_options(update.get("configOptions")?))),
         "session_info_update" => update.get("title").and_then(Value::as_str).map(|t| Event::Title(t.to_string())),
+        "usage_update" => Some(Event::Usage {
+            used: update.get("used").and_then(Value::as_u64).unwrap_or(0),
+            size: update.get("size").and_then(Value::as_u64).unwrap_or(0),
+            cost: update.pointer("/cost/amount").and_then(Value::as_f64),
+        }),
         "agent_thought_chunk" => text_of(update.get("content")?).map(Event::ThoughtChunk),
         "tool_call" => Some(Event::ToolCall(parse_tool_call(update))),
         "tool_call_update" => Some(Event::ToolCallUpdate(parse_tool_call(update))),
@@ -751,6 +758,12 @@ mod unit {
             "models": { "currentModelId": "m1", "availableModels": [{ "modelId": "m1", "name": "M1" }] } });
         let c = parse_session_config(&legacy);
         assert_eq!(c.iter().map(|o| o.category.as_str()).collect::<Vec<_>>(), ["model", "mode"]);
+    }
+
+    #[test]
+    fn parses_usage_update() {
+        let e = parse_update(&json!({ "sessionUpdate": "usage_update", "used": 1200, "size": 200000, "cost": { "amount": 0.5, "currency": "USD" } }));
+        assert_eq!(e, Some(Event::Usage { used: 1200, size: 200000, cost: Some(0.5) }));
     }
 
     #[test]

@@ -8,10 +8,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use kuaky_usage::{Agent, AgentLimits, Pricing, Range, Report, UsageEvent};
-use std::{path::PathBuf, sync::Arc};
+use crate::lines::{Line, LineStore};
+use crate::project::LiveSummary;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 pub enum HomeEvent {
     OpenProject(PathBuf),
+    /// Open a project and show one of its lines on the board.
+    OpenLine(PathBuf, String),
     PickFolder,
 }
 
@@ -24,6 +28,38 @@ pub struct HomeView {
     tz: TimeZone,
     now: Timestamp,
     pricing: Arc<Pricing>,
+    /// Lines in progress per project (from the metro map files).
+    work: Vec<ProjectWork>,
+    /// Live agents of the projects open in kuaky.
+    live: HashMap<PathBuf, LiveSummary>,
+}
+
+struct ProjectWork {
+    root: PathBuf,
+    lines: Vec<(Line, usize)>,
+}
+
+/// Projects with recent activity on their map, newest first.
+fn load_work(roots: Vec<PathBuf>, now: Timestamp) -> Vec<ProjectWork> {
+    let recent = now - jiff::SignedDuration::from_hours(24 * 21);
+    let mut out: Vec<ProjectWork> = roots
+        .into_iter()
+        .filter(|r| r.is_dir())
+        .filter_map(|root| {
+            let store = LineStore::load(&root);
+            let lines: Vec<(Line, usize)> = store
+                .ordered(false)
+                .into_iter()
+                .filter(|(l, _)| !l.archived && l.updated >= recent && !l.stations.is_empty())
+                .take(8)
+                .map(|(l, d)| (l.clone(), d))
+                .collect();
+            (!lines.is_empty()).then_some(ProjectWork { root, lines })
+        })
+        .collect();
+    out.sort_by_key(|w| std::cmp::Reverse(w.lines.iter().map(|(l, _)| l.updated).max()));
+    out.truncate(6);
+    out
 }
 
 impl EventEmitter<HomeEvent> for HomeView {}
@@ -39,6 +75,8 @@ impl HomeView {
             tz: TimeZone::system(),
             now: Timestamp::now(),
             pricing: Arc::new(Pricing::embedded()),
+            work: Vec::new(),
+            live: HashMap::new(),
         };
         this.reload(cx);
         this.refresh_prices(cx);
@@ -77,16 +115,27 @@ impl HomeView {
 
     /// Vuelve a leer los logs en segundo plano.
     pub fn reload(&self, cx: &mut Context<Self>) {
+        let state = crate::state::get(cx);
+        let mut roots: Vec<PathBuf> = state.open.iter().map(PathBuf::from).collect();
+        for r in &state.recent {
+            let p = PathBuf::from(&r.path);
+            if !roots.contains(&p) {
+                roots.push(p);
+            }
+        }
+        let now = Timestamp::now();
         cx.spawn(async move |this, cx| {
-            let (events, limits) = cx
+            let (events, limits, work) = cx
                 .background_executor()
-                .spawn(async {
+                .spawn(async move {
+                    let work = load_work(roots, now);
                     let events = kuaky_usage::load_all();
                     let limits = kuaky_usage::load_all_limits();
-                    (events, limits)
+                    (events, limits, work)
                 })
                 .await;
             this.update(cx, |this, cx| {
+                this.work = work;
                 this.events = Some(Arc::new(events));
                 this.limits = limits;
                 #[cfg(feature = "screenshot")]
@@ -99,6 +148,140 @@ impl HomeView {
             .ok();
         })
         .detach();
+    }
+
+    /// Live agent state of the open projects (sent by the app while Home is shown).
+    pub fn set_live(&mut self, live: Vec<(PathBuf, LiveSummary)>, cx: &mut Context<Self>) {
+        let live: HashMap<PathBuf, LiveSummary> = live.into_iter().collect();
+        let changed = live.len() != self.live.len()
+            || live.iter().any(|(k, v)| self.live.get(k).is_none_or(|o| o.sessions != v.sessions));
+        if changed {
+            self.live = live;
+            cx.notify();
+        }
+    }
+
+    /// "Work in progress": the metro lines of every project, to pick up where you left off.
+    fn work_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = self.now;
+        let total: usize = self.work.iter().map(|w| w.lines.len()).sum();
+        section(
+            "Work in progress",
+            Some(format!("{total} line{} · click to open", if total == 1 { "" } else { "s" })),
+            v_flex().gap_4().children(self.work.iter().enumerate().map(|(pi, w)| {
+                let name = w.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let live = self.live.get(&w.root);
+                let open = live.is_some();
+                let root = w.root.clone();
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .id(("work-project", pi))
+                            .gap_2()
+                            .px_2()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(style::muted())
+                            .hover(|d| d.text_color(style::text()))
+                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(HomeEvent::OpenProject(root.clone()))))
+                            .child(icons::ui("folder", px(12.), style::faint()))
+                            .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                            .child(div().text_color(style::faint()).child(tilde(w.root.parent().unwrap_or(&w.root))))
+                            .when(open, |d| d.child(pill("open".into(), style::accent()))),
+                    )
+                    .children(w.lines.iter().enumerate().map(|(li, (line, depth))| {
+                        self.work_row(pi * 100 + li, &w.root, line, *depth, live, now, cx).into_any_element()
+                    }))
+            })),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn work_row(
+        &self,
+        id: usize,
+        root: &std::path::Path,
+        line: &Line,
+        depth: usize,
+        live: Option<&LiveSummary>,
+        now: Timestamp,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let color = rgb(line.color);
+        let total = line.stations.len();
+        let done = line.done_count();
+        let trains: Vec<(Option<Agent>, bool, bool)> = line
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                let (working, needs) = live?.sessions.get(&s.uid).copied()?;
+                Some((crate::project::Harness::from_key(&s.harness).and_then(|h| h.agent()), working, needs))
+            })
+            .collect();
+        let needs_you = trains.iter().any(|t| t.2);
+        let working = trains.iter().any(|t| t.1);
+        let (where_label, where_text) = match (line.current(), line.last_done(), line.next_pending()) {
+            (Some(c), _, _) => ("now", c.title.clone()),
+            (None, Some(d), _) => ("last", d.title.clone()),
+            (None, None, Some(n)) => ("next", n.title.clone()),
+            _ => ("", String::new()),
+        };
+        let shown: Vec<&crate::lines::Station> = line.stations.iter().skip(total.saturating_sub(10)).collect();
+        let (path, line_id) = (root.to_path_buf(), line.id.clone());
+        h_flex()
+            .id(("work-line", id))
+            .gap_3()
+            .pl(px(8. + depth as f32 * 18.))
+            .pr_2()
+            .py_1p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|d| d.bg(style::panel_hover()))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(HomeEvent::OpenLine(path.clone(), line_id.clone()))))
+            .child(div().w(px(3.)).h(px(30.)).rounded_full().bg(color))
+            .child(
+                v_flex()
+                    .w(px(260.))
+                    .flex_none()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).truncate().child(line.name.clone()))
+                            .child(div().text_xs().text_color(style::faint()).child(line.kind.label())),
+                    )
+                    .when(!where_text.is_empty(), |d| {
+                        d.child(
+                            h_flex()
+                                .gap_1()
+                                .text_xs()
+                                .child(div().text_color(style::faint()).child(where_label))
+                                .child(div().text_color(style::muted()).truncate().child(where_text)),
+                        )
+                    }),
+            )
+            .child(station_chain(&shown, color, total > shown.len()))
+            .child(div().flex_1())
+            .when(needs_you, |d| d.child(pill("needs you".into(), style::bad())))
+            .when(working && !needs_you, |d| d.child(pill("working".into(), style::accent())))
+            .child(h_flex().gap_1().children(trains.iter().filter_map(|t| t.0).map(agent_badge)))
+            .child(
+                div()
+                    .w(px(48.))
+                    .text_right()
+                    .text_xs()
+                    .text_color(style::muted())
+                    .child(format!("{done}/{total}")),
+            )
+            .child(
+                div()
+                    .w(px(80.))
+                    .text_right()
+                    .text_xs()
+                    .text_color(style::faint())
+                    .child(ago(line.updated, now)),
+            )
     }
 
     fn rebuild(&mut self) {
@@ -658,6 +841,7 @@ impl Render for HomeView {
                     .p_8()
                     .gap_8()
                     .child(self.header(cx))
+                    .when(!self.work.is_empty(), |d| d.child(self.work_section(cx)))
                     .when(loading, |d| d.child(placeholder("Reading your agent logs…")))
                     .when(empty, |d| d.child(placeholder("No agent activity in this period.")))
                     .when(!loading && !empty, |d| {
@@ -743,6 +927,33 @@ fn delta_pill(delta: f64) -> impl IntoElement {
         .bg(style::soft(color, 0.12))
         .text_color(color)
         .child(text)
+}
+
+/// Stations of a line as dots on a track (done = filled, now = ring, next = hollow).
+fn station_chain(stations: &[&crate::lines::Station], color: Rgba, more: bool) -> impl IntoElement {
+    use crate::lines::StationState;
+    h_flex()
+        .items_center()
+        .when(more, |d| d.child(div().w(px(10.)).h(px(2.)).bg(style::soft(color, 0.35))))
+        .children(stations.iter().enumerate().map(|(i, st)| {
+            let dot = div().size(px(9.)).rounded_full().flex_none();
+            let dot = match st.state {
+                StationState::Done => dot.bg(color),
+                StationState::Active => dot.border_2().border_color(color).bg(style::bg()),
+                StationState::Pending => dot.border_1().border_color(style::faint()),
+            };
+            h_flex()
+                .items_center()
+                .when(i > 0, |d| {
+                    let solid = st.state == StationState::Done || st.state == StationState::Active;
+                    d.child(div().w(px(10.)).h(px(2.)).bg(if solid { style::soft(color, 0.7) } else { style::border().into() }))
+                })
+                .child(dot)
+        }))
+}
+
+fn pill(text: String, color: Rgba) -> impl IntoElement {
+    div().px_1p5().rounded_full().text_xs().bg(style::soft(color, 0.14)).text_color(color).child(text)
 }
 
 fn section(title: &'static str, right: Option<String>, body: impl IntoElement) -> impl IntoElement {

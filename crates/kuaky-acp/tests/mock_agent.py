@@ -79,4 +79,8 @@ while True:
             {"type": "diff", "path": "/tmp/a.txt", "oldText": "a\n", "newText": "b\n"},
         ]})
         update(s, {"sessionUpdate": "plan", "entries": [{"content": "Paso 1", "priority": "high", "status": "completed"}]})
+        for i, cmd in enumerate(["git status --short", "cargo test -p kuaky"]):
+            update(s, {"sessionUpdate": "tool_call", "toolCallId": f"c{i}", "title": cmd, "kind": "execute", "status": "completed"})
+        update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "\n\nListo: el archivo quedó editado y los tests pasan."}})
+        update(s, {"sessionUpdate": "usage_update", "used": 52000, "size": 200000, "cost": {"amount": 0.42, "currency": "USD"}})
         send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
