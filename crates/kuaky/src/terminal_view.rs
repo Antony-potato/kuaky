@@ -272,6 +272,16 @@ impl Render for TerminalView {
             .text_color(style::text())
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Copy, _, cx| {
+                if let Some(text) = this.term.as_ref().and_then(|t| t.selected_text()) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &gpui_kit::component::input::Paste, _, cx| {
+                if let (Some(term), Some(text)) = (&this.term, cx.read_from_clipboard().and_then(|c| c.text())) {
+                    term.paste(&text);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {

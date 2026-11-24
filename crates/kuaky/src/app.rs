@@ -8,16 +8,69 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::path::PathBuf;
 
-actions!(kuaky, [Quit, GoHome, OpenFolder]);
+actions!(kuaky, [Quit, GoHome, OpenFolder, Hide, HideOthers, ShowAll, Minimize, Zoom, OpenRepo]);
+
+const REPO_URL: &str = "https://github.com/Antony-potato/kuaky";
 
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Hide, cx| cx.hide());
+    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &OpenRepo, cx| cx.open_url(REPO_URL));
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("cmd-alt-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("ctrl-o", OpenFolder, None),
         KeyBinding::new("cmd-shift-h", GoHome, None),
         KeyBinding::new("ctrl-shift-h", GoHome, None),
+    ]);
+    set_menus(cx);
+}
+
+/// Barra de menús nativa (en macOS arriba de la pantalla).
+fn set_menus(cx: &mut App) {
+    use crate::project::{CloseTab, NewTerminal, NextTab, PrevTab};
+    use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+    cx.set_menus([
+        Menu::new("kuaky").items([
+            MenuItem::action("Ocultar kuaky", Hide),
+            MenuItem::action("Ocultar otros", HideOthers),
+            MenuItem::action("Mostrar todo", ShowAll),
+            MenuItem::separator(),
+            MenuItem::action("Salir de kuaky", Quit),
+        ]),
+        Menu::new("Archivo").items([
+            MenuItem::action("Abrir carpeta…", OpenFolder),
+            MenuItem::separator(),
+            MenuItem::action("Nueva terminal", NewTerminal),
+            MenuItem::action("Cerrar pestaña", CloseTab),
+            MenuItem::separator(),
+            MenuItem::action("Ir al inicio", GoHome),
+        ]),
+        Menu::new("Edición").items([
+            MenuItem::os_action("Deshacer", Undo, OsAction::Undo),
+            MenuItem::os_action("Rehacer", Redo, OsAction::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action("Cortar", Cut, OsAction::Cut),
+            MenuItem::os_action("Copiar", Copy, OsAction::Copy),
+            MenuItem::os_action("Pegar", Paste, OsAction::Paste),
+            MenuItem::os_action("Seleccionar todo", SelectAll, OsAction::SelectAll),
+        ]),
+        Menu::new("Ver").items([
+            MenuItem::action("Inicio", GoHome),
+            MenuItem::separator(),
+            MenuItem::action("Pestaña siguiente", NextTab),
+            MenuItem::action("Pestaña anterior", PrevTab),
+        ]),
+        Menu::new("Ventana").items([
+            MenuItem::action("Minimizar", Minimize),
+            MenuItem::action("Zoom", Zoom),
+        ]),
+        Menu::new("Ayuda").items([MenuItem::action("Repositorio de kuaky", OpenRepo)]),
     ]);
 }
 
@@ -143,6 +196,22 @@ impl KuakyApp {
                 .when_some(location, |d, loc| {
                     d.child(div().text_color(style::faint()).child("/"))
                         .child(div().text_color(style::muted()).child(loc))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("go-home")
+                                .px_2()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(style::border())
+                                .text_color(style::muted())
+                                .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                                .child("← Inicio")
+                                .on_click(cx.listener(|this, _, _, cx| this.go_home(cx))),
+                        )
                 }),
         )
     }
@@ -158,6 +227,8 @@ impl Render for KuakyApp {
             .text_color(style::text())
             .on_action(cx.listener(|this, _: &GoHome, _, cx| this.go_home(cx)))
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.pick_folder(window, cx)))
+            .on_action(|_: &Minimize, window, _| window.minimize_window())
+            .on_action(|_: &Zoom, window, _| window.zoom_window())
             .child(self.title_bar(cx))
             .child(
                 div()
