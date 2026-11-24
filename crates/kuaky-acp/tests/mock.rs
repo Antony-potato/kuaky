@@ -43,6 +43,7 @@ fn full_turn_with_permission_and_diff() {
     }
     assert!(message.starts_with("Hola mundo"), "{message}");
     assert!(seen.iter().any(|e| matches!(e, Event::Usage { used: 52000, size: 200000, .. })));
+    assert!(seen.iter().any(|e| matches!(e, Event::Usage { rate_limit: Some(r), .. } if r.pointer("/unifiedWindows/five_hour").is_some())));
     assert!(seen.iter().any(|e| matches!(e, Event::ThoughtChunk(_))));
     assert!(seen.iter().any(|e| matches!(e, Event::ToolCall(c) if c.kind.as_deref() == Some("edit"))));
     assert!(seen.iter().any(|e| matches!(e, Event::Plan(p) if p.len() == 1)));

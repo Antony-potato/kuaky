@@ -46,7 +46,8 @@ pub enum Event {
     /// Título de la sesión que puso el agente.
     Title(String),
     /// Contexto usado (`usage_update`): tokens usados, tamaño de la ventana y costo acumulado.
-    Usage { used: u64, size: u64, cost: Option<f64> },
+    /// `rate_limit`: límites del plan que Claude manda tal cual (`_meta["_claude/rateLimit"]`).
+    Usage { used: u64, size: u64, cost: Option<f64>, rate_limit: Option<Value> },
     /// El agente escribió un archivo a través de kuaky (`fs/write_text_file`).
     FileWritten { path: PathBuf, old_text: Option<String>, new_text: String },
     Error(String),
@@ -600,6 +601,7 @@ pub fn parse_update(update: &Value) -> Option<Event> {
             used: update.get("used").and_then(Value::as_u64).unwrap_or(0),
             size: update.get("size").and_then(Value::as_u64).unwrap_or(0),
             cost: update.pointer("/cost/amount").and_then(Value::as_f64),
+            rate_limit: update.pointer("/_meta/_claude~1rateLimit").cloned(),
         }),
         "agent_thought_chunk" => text_of(update.get("content")?).map(Event::ThoughtChunk),
         "tool_call" => Some(Event::ToolCall(parse_tool_call(update))),
@@ -831,7 +833,10 @@ mod unit {
     #[test]
     fn parses_usage_update() {
         let e = parse_update(&json!({ "sessionUpdate": "usage_update", "used": 1200, "size": 200000, "cost": { "amount": 0.5, "currency": "USD" } }));
-        assert_eq!(e, Some(Event::Usage { used: 1200, size: 200000, cost: Some(0.5) }));
+        assert_eq!(e, Some(Event::Usage { used: 1200, size: 200000, cost: Some(0.5), rate_limit: None }));
+        let limit = json!({ "status": "allowed", "unifiedWindows": { "five_hour": { "utilization": 0.2, "resetsAt": 1 } } });
+        let e = parse_update(&json!({ "sessionUpdate": "usage_update", "used": 1300, "size": 200000, "_meta": { "_claude/rateLimit": limit.clone() } }));
+        assert_eq!(e, Some(Event::Usage { used: 1300, size: 200000, cost: None, rate_limit: Some(limit) }));
     }
 
     #[test]

@@ -1106,7 +1106,7 @@ fn short_date(d: Date) -> String {
     format!("{} {}", MONTHS[(d.month() - 1) as usize], d.day())
 }
 
-fn ago(ts: Timestamp, now: Timestamp) -> String {
+pub(crate) fn ago(ts: Timestamp, now: Timestamp) -> String {
     let secs = (now.as_second() - ts.as_second()).max(0);
     match secs {
         s if s < 60 => "just now".into(),
@@ -1144,12 +1144,14 @@ pub fn demo_limits() -> Vec<AgentLimits> {
             agent: Agent::ClaudeCode,
             primary: Some(kuaky_usage::RateWindow::from_used("5h", 42.0, five_h)),
             secondary: Some(kuaky_usage::RateWindow::from_used("week", 18.0, week)),
+            model_week: Some(kuaky_usage::RateWindow::from_used("Fable", 7.0, week)),
             updated_at: Some(now),
         },
         AgentLimits {
             agent: Agent::Codex,
             primary: Some(kuaky_usage::RateWindow::from_used("5h", 28.0, five_h)),
             secondary: Some(kuaky_usage::RateWindow::from_used("week", 11.0, week)),
+            model_week: None,
             updated_at: Some(now),
         },
     ]

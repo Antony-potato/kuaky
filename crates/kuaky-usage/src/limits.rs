@@ -1,13 +1,14 @@
 //! Remaining rate-limit quotas for supported agents.
 //!
-//! - **Claude Code:** captured by kuaky's statusline wrapper into
-//!   `<config>/kuaky/claude-rate-limits.json` (`rate_limits.five_hour` / `seven_day`).
+//! - **Claude Code:** `<config>/kuaky/claude-rate-limits.json`, written by kuaky's statusline
+//!   wrapper (`rate_limits.five_hour` / `seven_day`) and by the chat, which also saves the
+//!   Fable weekly window it reads from each reply ([`parse_claude_rate_info`]).
 //! - **Codex:** read from the latest `token_count` event in `~/.codex/sessions/**/rollout-*.jsonl`
 //!   (`rate_limits.primary` / `secondary`).
 
 use crate::Agent;
 use jiff::{Timestamp, tz::TimeZone};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -42,16 +43,18 @@ pub struct AgentLimits {
     pub agent: Agent,
     pub primary: Option<RateWindow>,
     pub secondary: Option<RateWindow>,
+    /// Weekly window of a model with its own quota (Claude: Fable).
+    pub model_week: Option<RateWindow>,
     pub updated_at: Option<Timestamp>,
 }
 
 impl AgentLimits {
     pub fn windows(&self) -> impl Iterator<Item = &RateWindow> {
-        self.primary.iter().chain(self.secondary.iter())
+        self.primary.iter().chain(self.secondary.iter()).chain(self.model_week.iter())
     }
 
     pub fn has_any(&self) -> bool {
-        self.primary.is_some() || self.secondary.is_some()
+        self.windows().next().is_some()
     }
 }
 
@@ -84,14 +87,65 @@ pub fn load_claude_limits() -> Option<AgentLimits> {
     parse_claude_statusline(&text, updated_at)
 }
 
-/// Parses Claude Code's statusline JSON (`rate_limits.five_hour` / `seven_day`).
+/// Claude's per-model weekly window. Claude Code calls it the "Fable limit".
+const FABLE_KEY: &str = "seven_day_overage_included";
+
+/// Parses Claude Code's statusline JSON (`rate_limits.five_hour` / `seven_day`, plus the
+/// Fable window when the chat saved it).
 pub fn parse_claude_statusline(json_text: &str, updated_at: Option<Timestamp>) -> Option<AgentLimits> {
     let root: Value = serde_json::from_str(json_text).ok()?;
     let rl = root.get("rate_limits")?;
-    let primary = rl.get("five_hour").and_then(|w| parse_claude_window("5h", w));
-    let secondary = rl.get("seven_day").and_then(|w| parse_claude_window("week", w));
-    let limits = AgentLimits { agent: Agent::ClaudeCode, primary, secondary, updated_at };
+    let window = |key: &str, label: &str| rl.get(key).and_then(|w| parse_claude_window(label, w));
+    let limits = AgentLimits {
+        agent: Agent::ClaudeCode,
+        primary: window("five_hour", "5h"),
+        secondary: window("seven_day", "week"),
+        model_week: window(FABLE_KEY, "Fable"),
+        updated_at,
+    };
     limits.has_any().then_some(limits)
+}
+
+/// Parses the `rate_limit_info` Claude Code sends after each reply (in ACP, the
+/// `_meta["_claude/rateLimit"]` of `usage_update`). Its `unifiedWindows` hold every
+/// window, with `utilization` as a fraction of the limit.
+pub fn parse_claude_rate_info(info: &Value, updated_at: Option<Timestamp>) -> Option<AgentLimits> {
+    let windows = info.get("unifiedWindows")?;
+    let window = |key: &str, label: &str| {
+        let w = windows.get(key)?;
+        let used = w.get("utilization")?.as_f64()? * 100.0;
+        Some(RateWindow::from_used(label, used, w.get("resetsAt").and_then(parse_timestamp)))
+    };
+    let limits = AgentLimits {
+        agent: Agent::ClaudeCode,
+        primary: window("five_hour", "5h"),
+        secondary: window("seven_day", "week"),
+        model_week: window(FABLE_KEY, "Fable"),
+        updated_at,
+    };
+    limits.has_any().then_some(limits)
+}
+
+/// Claude limits in the statusline file format (what [`parse_claude_statusline`] reads).
+pub fn claude_limits_json(limits: &AgentLimits) -> String {
+    let mut rl = serde_json::Map::new();
+    for (key, w) in [("five_hour", &limits.primary), ("seven_day", &limits.secondary), (FABLE_KEY, &limits.model_week)] {
+        if let Some(w) = w {
+            rl.insert(key.into(), json!({ "used_percentage": w.used_pct, "resets_at": w.resets_at.map(|t| t.as_second()) }));
+        }
+    }
+    json!({ "rate_limits": rl }).to_string()
+}
+
+/// Saves Claude limits where every view reads them (replacing the file in one step).
+pub fn save_claude_limits(limits: &AgentLimits) -> std::io::Result<()> {
+    let path = claude_limits_path().ok_or_else(|| std::io::Error::other("no config folder"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&tmp, claude_limits_json(limits))?;
+    std::fs::rename(&tmp, &path)
 }
 
 fn parse_claude_window(label: &str, v: &Value) -> Option<RateWindow> {
@@ -179,7 +233,7 @@ pub fn parse_codex_line(line: &str) -> Option<AgentLimits> {
     let event_ts = root.get("timestamp").and_then(parse_timestamp);
     let primary = rl.get("primary").and_then(|w| parse_codex_window(w, event_ts, "5h"));
     let secondary = rl.get("secondary").and_then(|w| parse_codex_window(w, event_ts, "week"));
-    let limits = AgentLimits { agent: Agent::Codex, primary, secondary, updated_at: event_ts };
+    let limits = AgentLimits { agent: Agent::Codex, primary, secondary, model_week: None, updated_at: event_ts };
     limits.has_any().then_some(limits)
 }
 
@@ -282,6 +336,41 @@ mod tests {
         let s = limits.secondary.unwrap();
         assert_eq!(s.label, "week");
         assert_eq!(s.used_pct, 18.0);
+    }
+
+    #[test]
+    fn parses_claude_rate_info_with_fable_window() {
+        let info = serde_json::json!({
+            "status": "allowed",
+            "rateLimitType": "five_hour",
+            "utilization": 0.42,
+            "unifiedWindows": {
+                "five_hour": { "utilization": 0.42, "resetsAt": 1795500000, "status": "allowed" },
+                "seven_day": { "utilization": 0.18, "resetsAt": 1796000000 },
+                "seven_day_overage_included": { "utilization": 0.065, "resetsAt": 1796000000 }
+            }
+        });
+        let limits = parse_claude_rate_info(&info, None).unwrap();
+        assert!((limits.primary.as_ref().unwrap().used_pct - 42.0).abs() < 0.01);
+        assert!((limits.secondary.as_ref().unwrap().used_pct - 18.0).abs() < 0.01);
+        let fable = limits.model_week.as_ref().unwrap();
+        assert_eq!(fable.label, "Fable");
+        assert!((fable.used_pct - 6.5).abs() < 0.01);
+        assert_eq!(limits.windows().count(), 3);
+        // Without the per-window detail there's nothing to show.
+        assert_eq!(parse_claude_rate_info(&serde_json::json!({ "status": "allowed" }), None), None);
+    }
+
+    #[test]
+    fn saved_claude_limits_read_back_the_same() {
+        let info = serde_json::json!({ "unifiedWindows": {
+            "five_hour": { "utilization": 0.3, "resetsAt": 1795500000 },
+            "seven_day_overage_included": { "utilization": 0.5, "resetsAt": 1796000000 }
+        } });
+        let limits = parse_claude_rate_info(&info, None).unwrap();
+        let back = parse_claude_statusline(&claude_limits_json(&limits), None).unwrap();
+        assert_eq!(back, limits);
+        assert!(back.secondary.is_none());
     }
 
     #[test]

@@ -46,7 +46,8 @@ while True:
         update(s, {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "pensando"}})
         update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hola "}})
         update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "mundo"}})
-        update(s, {"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "review", "description": "Review changes"}]})
+        update(s, {"sessionUpdate": "available_commands_update", "availableCommands": [{"name": "review", "description": "Review changes"},
+                                                                                     {"name": "compact", "description": "Summarize the conversation"}]})
         update(s, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Editar a.txt", "kind": "edit", "status": "pending",
                    "locations": [{"path": "/tmp/a.txt", "line": 3}]})
         # Archivos a través del cliente: leer, escribir dentro y fuera de la carpeta permitida.
@@ -101,4 +102,12 @@ while True:
             update(s, {"sessionUpdate": "tool_call", "toolCallId": f"sa2-{i}", "title": title, "kind": kind, "status": status,
                        "_meta": {"claudeCode": {"toolName": "Read" if kind == "read" else "Bash", "parentToolUseId": "sa2"}}})
         update(s, {"sessionUpdate": "usage_update", "used": 52000, "size": 200000, "cost": {"amount": 0.42, "currency": "USD"}})
+        # Límites del plan como los manda claude-agent-acp tras cada respuesta.
+        import time
+        now = int(time.time())
+        update(s, {"sessionUpdate": "usage_update", "used": 52000, "size": 200000, "_meta": {"_claude/rateLimit": {
+            "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.42, "unifiedWindows": {
+                "five_hour": {"utilization": 0.42, "resetsAt": now + 2 * 3600 + 40 * 60},
+                "seven_day": {"utilization": 0.18, "resetsAt": now + 4 * 86400},
+                "seven_day_overage_included": {"utilization": 0.07, "resetsAt": now + 4 * 86400}}}}})
         send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})

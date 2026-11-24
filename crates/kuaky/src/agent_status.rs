@@ -72,15 +72,16 @@ pub fn claude_settings() -> Option<&'static PathBuf> {
 }
 
 /// Writes a wrapper script for Claude Code's `statusLine` hook: saves the incoming
-/// JSON payload (including `rate_limits`) to `<config>/kuaky/claude-rate-limits.json`,
-/// then forwards stdin to the user's original `~/.claude/settings.json` statusLine
-/// command if one is configured.
+/// JSON payload (including `rate_limits`) to `<config>/kuaky/claude-rate-limits.json`
+/// (or `$KUAKY_CLAUDE_LIMITS_FILE`, as `kuaky_usage::limits` reads it), then forwards
+/// stdin to the user's original `~/.claude/settings.json` statusLine command if one is configured.
 fn write_claude_statusline_script(dir: &std::path::Path) -> Option<PathBuf> {
     let script_path = dir.join("claude-statusline.sh");
     let limits_path = dir.join("claude-rate-limits.json");
     let script = format!(
         r#"#!/bin/sh
 OUT='{limits}'
+[ -n "$KUAKY_CLAUDE_LIMITS_FILE" ] && OUT="$KUAKY_CLAUDE_LIMITS_FILE"
 TMP="$OUT.tmp.$$"
 cat > "$TMP"
 if [ -s "$TMP" ]; then
@@ -243,8 +244,11 @@ mod tests {
         let settings_path = claude_settings().unwrap();
         let settings: Value = serde_json::from_str(&std::fs::read_to_string(settings_path).unwrap()).unwrap();
         let script = settings["statusLine"]["command"].as_str().unwrap();
+        // A file of its own: the real one holds the user's limits.
+        let saved_path = std::env::temp_dir().join(format!("kuaky-limits-test-{}.json", std::process::id()));
         let mut child = std::process::Command::new("sh")
             .arg(script)
+            .env("KUAKY_CLAUDE_LIMITS_FILE", &saved_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -253,8 +257,8 @@ mod tests {
         let payload = r#"{"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1795500000},"seven_day":{"used_percentage":18}}}"#;
         child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
         assert!(child.wait().unwrap().success());
-        let saved_path = settings_path.parent().unwrap().join("claude-rate-limits.json");
         let saved = std::fs::read_to_string(&saved_path).unwrap();
+        std::fs::remove_file(&saved_path).ok();
         let limits = kuaky_usage::limits::parse_claude_statusline(&saved, None).unwrap();
         assert_eq!(limits.primary.unwrap().used_pct, 42.0);
         assert_eq!(limits.secondary.unwrap().used_pct, 18.0);

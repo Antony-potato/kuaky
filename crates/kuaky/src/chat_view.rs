@@ -19,6 +19,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kuaky_acp::{Client, ConfigOption, Event, FileDiff, PermissionRequest, PlanEntry, PromptBlock, SlashCommand, ToolCall};
+use kuaky_usage::{Agent, AgentLimits, RateWindow};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
@@ -264,6 +265,12 @@ pub struct ChatView {
     attachments: Vec<Attachment>,
     /// Contexto usado: (tokens, ventana, costo acumulado).
     usage: Option<(u64, u64, Option<f64>)>,
+    /// Límites del plan (5 h, semana, Fable): lo último que llegó o se leyó de disco.
+    limits: Option<AgentLimits>,
+    /// Panel de uso abierto (se abre al pulsar el anillo de contexto).
+    usage_open: bool,
+    /// Panel cerrado al pulsar fuera (para que pulsar el anillo no lo reabra).
+    usage_closed: Option<Instant>,
     /// Último evento del agente (para "no output for 40s").
     last_event: Instant,
     detail: Detail,
@@ -350,6 +357,9 @@ impl ChatView {
             queue: Vec::new(),
             attachments: Vec::new(),
             usage: None,
+            limits: None,
+            usage_open: false,
+            usage_closed: None,
             last_event: Instant::now(),
             detail: Detail::Normal,
             expanded: HashSet::new(),
@@ -371,6 +381,7 @@ impl ChatView {
         #[cfg(feature = "screenshot")]
         {
             this.follow = std::env::var("KUAKY_DEMO_FOLLOW").is_ok();
+            this.usage_open = std::env::var("KUAKY_DEMO_USAGE").is_ok();
         }
         this.connect(cx);
         this.load_files(cx);
@@ -646,9 +657,13 @@ impl ChatView {
     fn on_event(&mut self, ev: Event, cx: &mut Context<Self>) {
         self.last_event = Instant::now();
         match ev {
-            Event::Usage { used, size, cost } => {
+            Event::Usage { used, size, cost, rate_limit } => {
                 if size > 0 {
                     self.usage = Some((used, size, cost.or(self.usage.and_then(|u| u.2))));
+                }
+                let now = Some(jiff::Timestamp::now());
+                if let Some(limits) = rate_limit.and_then(|v| kuaky_usage::limits::parse_claude_rate_info(&v, now)) {
+                    self.keep_limits(limits, cx);
                 }
             }
             Event::UserMessageChunk(t) => match self.turns.last_mut() {
@@ -2416,34 +2431,76 @@ impl ChatView {
         )
     }
 
-    /// Contexto usado: anillo y porcentaje (y costo, si el agente lo manda).
-    fn context_meter(&self) -> Option<AnyElement> {
-        let (used, size, cost) = self.usage?;
-        let pct = (used as f64 / size as f64 * 100.).clamp(0., 100.);
-        let color: Hsla = if pct >= 85. {
-            style::bad().into()
-        } else if pct >= 65. {
-            style::warn().into()
-        } else {
-            style::muted().into()
+    /// Agente de este chat, si es uno cuyos límites de plan conoce kuaky.
+    fn plan_agent(&self) -> Option<Agent> {
+        Agent::ALL.into_iter().find(|a| a.name() == self.launch.label && matches!(a, Agent::ClaudeCode | Agent::Codex))
+    }
+
+    /// Límites que trajo una respuesta. Se guardan en disco para el inicio, la barra
+    /// de estado y los demás chats (son de la cuenta, no de esta sesión).
+    fn keep_limits(&mut self, limits: AgentLimits, cx: &mut Context<Self>) {
+        self.limits = Some(limits.clone());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = kuaky_usage::limits::save_claude_limits(&limits) {
+                    tracing::warn!(%err, "no se pudieron guardar los límites");
+                }
+            })
+            .detach();
+    }
+
+    fn toggle_usage(&mut self, cx: &mut Context<Self>) {
+        let just_closed = self.usage_closed.take().is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+        self.usage_open = !self.usage_open && !just_closed;
+        if self.usage_open {
+            self.load_limits(cx);
+        }
+        cx.notify();
+    }
+
+    /// Lee los límites guardados (terminales y otros chats): sirven si este chat
+    /// aún no recibió ninguno o si son más nuevos.
+    fn load_limits(&self, cx: &mut Context<Self>) {
+        let load = match self.plan_agent() {
+            Some(Agent::ClaudeCode) => kuaky_usage::limits::load_claude_limits,
+            Some(Agent::Codex) => kuaky_usage::limits::load_codex_limits,
+            _ => return,
         };
-        let tip: SharedString = format!(
-            "Context: {} of {} tokens ({pct:.0}%){}",
-            human(used),
-            human(size),
-            cost.map(|c| format!(" · session cost {}", style::money(c))).unwrap_or_default()
-        )
-        .into();
+        cx.spawn(async move |this, cx| {
+            let Some(found) = cx.background_executor().spawn(async move { load() }).await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.limits.as_ref().is_none_or(|l| l.updated_at < found.updated_at) {
+                    this.limits = Some(found);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Contexto usado: anillo y porcentaje. Al pulsarlo abre el panel de uso.
+    fn context_meter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (used, size, _) = self.usage?;
+        let pct = (used as f64 / size as f64 * 100.).clamp(0., 100.);
+        let color = level_color(pct, 65., 85.);
         let frac = (pct / 100.) as f32;
+        let open = self.usage_open;
         Some(
             h_flex()
                 .id("context-meter")
+                .relative()
                 .gap_1()
                 .px_1p5()
+                .py_0p5()
                 .items_center()
+                .rounded_md()
                 .text_xs()
                 .text_color(color)
-                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .cursor_pointer()
+                .hover(|d| d.bg(style::panel_hover()))
+                .when(open, |d| d.bg(style::panel_hover()))
+                .when(!open, |d| d.tooltip(|window, cx| Tooltip::new("Context and plan limits").build(window, cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_usage(cx)))
                 .child(
                     canvas(
                         |_, _, _| {},
@@ -2475,8 +2532,185 @@ impl ChatView {
                     .size(px(14.)),
                 )
                 .child(format!("{pct:.0}%"))
+                // Sale encima del anillo, alineado a su derecha (el anillo está al borde de la caja).
+                .when(open, |d| {
+                    d.child(deferred(div().absolute().bottom_full().right_0().mb_2().child(self.usage_panel(cx))).with_priority(1))
+                })
                 .into_any_element(),
         )
+    }
+
+    /// Panel del anillo: contexto de esta sesión (con compactar) y límites del plan.
+    fn usage_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .id("usage-panel")
+            .occlude()
+            .w(px(300.))
+            .p_3()
+            .gap_3()
+            .shadow_lg()
+            .rounded_lg()
+            .border_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .when_some(self.context_section(cx), |d, s| d.child(s))
+            .when(self.plan_agent().is_some(), |d| d.child(div().h(px(1.)).bg(style::border())).child(self.limits_section()))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.usage_open = false;
+                this.usage_closed = Some(Instant::now());
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Tokens usados de la ventana, costo y el botón para compactar.
+    fn context_section(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (used, size, cost) = self.usage?;
+        let pct = (used as f64 / size as f64 * 100.).clamp(0., 100.);
+        let color = level_color(pct, 65., 85.);
+        let can_compact = self.commands.iter().any(|c| c.name == "compact");
+        Some(
+            v_flex()
+                .gap_1p5()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .child(eyebrow("CONTEXT · THIS SESSION"))
+                        .child(div().flex_1())
+                        .child(div().text_xs().text_color(color).child(format!("{pct:.0}%"))),
+                )
+                .child(meter_bar(pct, color))
+                .child(
+                    h_flex()
+                        .text_xs()
+                        .text_color(style::muted())
+                        .child(format!("{} of {} tokens", human(used), human(size)))
+                        .child(div().flex_1())
+                        .when_some(cost, |d, c| d.child(format!("cost {}", style::money(c)))),
+                )
+                .when(can_compact, |d| d.child(self.compact_row(pct, cx))),
+        )
+    }
+
+    /// Aviso según lo lleno y botón que manda `/compact` (en cola si el agente trabaja).
+    fn compact_row(&self, pct: f64, cx: &mut Context<Self>) -> impl IntoElement {
+        let (hint, hint_color) = if pct >= 85. {
+            ("Almost full. Compact now to keep working without losing the thread.", style::bad())
+        } else if pct >= 65. {
+            ("Filling up. Compacting summarizes the conversation to free space.", style::warn())
+        } else {
+            ("Compacting summarizes the conversation to free space.", style::faint())
+        };
+        let urgent = pct >= 85.;
+        let tip = if self.status == ChatStatus::Running { "Runs when the agent finishes this turn" } else { "Sends /compact" };
+        h_flex()
+            .gap_2()
+            .pt_1()
+            .items_center()
+            .child(div().flex_1().min_w_0().text_xs().text_color(hint_color).whitespace_normal().child(hint))
+            .child(
+                div()
+                    .id("compact-now")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .map(|d| {
+                        if urgent {
+                            d.border_color(style::accent()).bg(style::accent()).text_color(style::on_accent())
+                        } else {
+                            d.border_color(style::border()).text_color(style::text()).hover(|d| d.bg(style::panel_hover()))
+                        }
+                    })
+                    .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                    .child("Compact")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.usage_open = false;
+                        this.submit_text("/compact".into(), cx);
+                    })),
+            )
+    }
+
+    /// Ventanas del plan (5 h, semana, Fable) con cuándo se reinician.
+    fn limits_section(&self) -> Div {
+        let now = jiff::Timestamp::now();
+        let tz = jiff::tz::TimeZone::system();
+        let limits = self.limits.as_ref().filter(|l| l.has_any());
+        let updated = limits.and_then(|l| l.updated_at).map(|ts| crate::home::ago(ts, now));
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .child(eyebrow("PLAN LIMITS"))
+                    .child(div().flex_1())
+                    .when_some(updated, |d, u| d.child(div().text_xs().text_color(style::faint()).child(u))),
+            )
+            .map(|d| match limits {
+                Some(l) => d.children(l.windows().map(|w| limit_row(w, now, &tz))),
+                None => d.child(div().text_xs().text_color(style::faint()).whitespace_normal().child("They show up after the agent's next reply.")),
+            })
+    }
+}
+
+/// Una ventana del plan: nombre, % usado, cuándo se reinicia y su barra.
+fn limit_row(w: &RateWindow, now: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Div {
+    let label = match w.label.as_str() {
+        "5h" => "5-hour",
+        "week" => "Weekly",
+        "Fable" => "Fable · weekly",
+        other => other,
+    };
+    // Si ya pasó su reinicio, la ventana empezó de cero (se actualiza con la próxima respuesta).
+    let reset_passed = w.resets_at.is_some_and(|t| t <= now);
+    let used = if reset_passed { 0. } else { w.used_pct };
+    let note = if reset_passed {
+        Some("reset".to_string())
+    } else {
+        w.resets_at.and_then(|t| kuaky_usage::limits::format_reset(t, now, tz)).map(|r| format!("resets {r}"))
+    };
+    let color = level_color(used, 75., 90.);
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .text_xs()
+                .child(div().text_color(style::text()).child(label.to_string()))
+                .child(div().text_color(color).child(format!("{used:.0}%")))
+                .child(div().flex_1())
+                .when_some(note, |d, n| d.child(div().text_color(style::faint()).child(n))),
+        )
+        .child(meter_bar(used, color))
+}
+
+/// Etiqueta de sección: mono, mayúsculas y tenue (como en una etiqueta industrial).
+fn eyebrow(text: &'static str) -> Div {
+    div().text_xs().font_family(style::mono_font()).text_color(style::faint()).child(text)
+}
+
+/// Barra fina de 0 a 100 %.
+fn meter_bar(pct: f64, color: Hsla) -> Div {
+    let frac = (pct / 100.).clamp(0., 1.) as f32;
+    div()
+        .h(px(4.))
+        .w_full()
+        .rounded_full()
+        .bg(style::border())
+        .overflow_hidden()
+        .child(div().h_full().rounded_full().bg(color).w(relative(frac)))
+}
+
+/// Color según lo lleno: normal, aviso a partir de `warn` y alerta a partir de `bad`.
+fn level_color(pct: f64, warn: f64, bad: f64) -> Hsla {
+    if pct >= bad {
+        style::bad().into()
+    } else if pct >= warn {
+        style::warn().into()
+    } else {
+        style::muted().into()
     }
 }
 
@@ -2898,7 +3132,7 @@ impl Render for ChatView {
                                     })),
                             )
                             .child(div().flex_1())
-                            .when_some(self.context_meter(), |d, m| d.child(m))
+                            .when_some(self.context_meter(cx), |d, m| d.child(m))
                             .child(
                                 div()
                                     .id("chat-send")
