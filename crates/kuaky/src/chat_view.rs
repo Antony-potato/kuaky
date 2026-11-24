@@ -77,6 +77,8 @@ pub enum ChatEvent {
     Title(String),
     /// Encender/apagar las rondas automáticas con la sesión conectada.
     RelayAuto(bool),
+    /// Modo seguir: el agente está leyendo o editando este archivo.
+    Follow { path: PathBuf, line: u32 },
 }
 
 /// Conexión con otra sesión (revisor ↔ autor), mostrada arriba del chat.
@@ -209,6 +211,9 @@ pub struct ChatView {
     pub session: Option<String>,
     pub title: Option<String>,
     pub relay: Option<RelayBanner>,
+    /// Seguir al agente: kuaky abre los archivos que lee o edita.
+    pub follow: bool,
+    last_followed: Option<(String, Option<u32>)>,
     client: Option<Arc<Client>>,
     turns: Vec<Turn>,
     branches: Vec<Branch>,
@@ -271,13 +276,16 @@ impl ChatView {
             input.update(cx, |s, cx| s.set_value(draft.clone(), window, cx));
         }
         input.update(cx, |s, cx| s.focus(window, cx));
-        let this = Self {
+        #[allow(unused_mut)]
+        let mut this = Self {
             launch,
             status: ChatStatus::Connecting,
             uid: new_uid(),
             session: None,
             title: None,
             relay: None,
+            follow: false,
+            last_followed: None,
             client: None,
             turns: Vec::new(),
             branches: Vec::new(),
@@ -303,6 +311,10 @@ impl ChatView {
             focus: cx.focus_handle(),
             _sub: sub,
         };
+        #[cfg(feature = "screenshot")]
+        {
+            this.follow = std::env::var("KUAKY_DEMO_FOLLOW").is_ok();
+        }
         this.connect(cx);
         this.load_files(cx);
         this
@@ -471,7 +483,9 @@ impl ChatView {
                 for d in &call.diffs {
                     turn.record_file(PathBuf::from(&d.path), d.old_text.clone(), d.new_text.clone());
                 }
+                let id = call.id.clone();
                 turn.items.push(Item::Tool(call));
+                self.follow_tool(&id, cx);
             }
             Event::ToolCallUpdate(update) => {
                 let turn = self.current_turn();
@@ -503,8 +517,9 @@ impl ChatView {
                             call.locations = update.locations;
                         }
                     }
-                    None => turn.items.push(Item::Tool(update)),
+                    None => turn.items.push(Item::Tool(update.clone())),
                 }
+                self.follow_tool(&update.id, cx);
             }
             Event::FileWritten { path, old_text, new_text } => self.current_turn().record_file(path, old_text, new_text),
             Event::Plan(entries) => {
@@ -601,6 +616,37 @@ impl ChatView {
             }
             _ => {}
         }
+    }
+
+    /// Con "seguir" encendido, avisa del archivo que toca la herramienta (lectura o edición).
+    fn follow_tool(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.follow {
+            return;
+        }
+        let Some(call) = self.turns.last().and_then(|t| {
+            t.items.iter().rev().find_map(|i| match i {
+                Item::Tool(c) if c.id == id => Some(c),
+                _ => None,
+            })
+        }) else {
+            return;
+        };
+        if matches!(call.kind.as_deref(), Some("execute" | "fetch" | "think")) {
+            return;
+        }
+        let Some(loc) = call.locations.first() else { return };
+        let key = (loc.path.clone(), loc.line);
+        if self.last_followed.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_followed = Some(key);
+        cx.emit(ChatEvent::Follow { path: PathBuf::from(&loc.path), line: loc.line.unwrap_or(1) });
+    }
+
+    pub fn set_follow(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.follow = on;
+        self.last_followed = None;
+        cx.notify();
     }
 
     /// Respuesta del agente en el último turno (para pasarla a la sesión conectada).
@@ -1578,6 +1624,21 @@ impl ChatView {
             .border_color(style::border())
             .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(title))
             .child(h_flex().gap_1().items_center().text_xs().text_color(status_color).child(div().size(px(6.)).rounded_full().bg(status_color)).child(status_label))
+            .child(
+                div()
+                    .id("follow-agent")
+                    .p_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(self.follow, |d| d.bg(style::accent_alpha(0.15)))
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(|window, cx| Tooltip::new("Follow the agent: open the files it reads and edits").build(window, cx))
+                    .child(crate::icons::ui("locate-fixed", px(14.), if self.follow { style::accent() } else { style::muted() }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let on = !this.follow;
+                        this.set_follow(on, cx);
+                    })),
+            )
             .child(
                 div()
                     .id("prompt-list-button")

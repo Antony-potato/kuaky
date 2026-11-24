@@ -138,8 +138,16 @@ impl Harness {
             Harness::OpenCode => ("opencode", &["acp"]),
             Harness::Shell => return None,
         };
-        let path = kuaky_git::find_agent(program)?;
-        Some((path, args.iter().map(|a| a.to_string()).collect()))
+        if let Some(path) = kuaky_git::find_agent(program) {
+            return Some((path, args.iter().map(|a| a.to_string()).collect()));
+        }
+        // Codex: sin `codex-acp` instalado, el adaptador oficial por npx (como Zed),
+        // solo si la CLI de Codex está instalada (usa su misma sesión).
+        if self == Harness::Codex && kuaky_git::find_agent("codex").is_some() {
+            let npx = kuaky_git::find_agent("npx")?;
+            return Some((npx, vec!["-y".into(), CODEX_ACP_PACKAGE.into()]));
+        }
+        None
     }
 
     /// Stable key used for persisted state and settings.
@@ -176,6 +184,9 @@ impl Harness {
         }
     }
 }
+
+/// Adaptador ACP de Codex (versión fija, la misma que ofrece el registro de Zed).
+const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.10.0";
 
 const SESSION_COLORS: &[(&str, u32)] = &[
     ("Teal", 0x5eead4),
@@ -225,6 +236,28 @@ enum TabKind {
 struct Tab {
     id: usize,
     kind: TabKind,
+}
+
+/// A session being dragged onto another metro line in the sidebar.
+#[derive(Clone)]
+pub(crate) struct DraggedSession {
+    uid: String,
+    title: SharedString,
+}
+
+impl Render for DraggedSession {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(style::accent())
+            .bg(style::panel_hover())
+            .text_sm()
+            .text_color(style::text())
+            .child(self.title.clone())
+    }
 }
 
 /// Terminals and chats: shown in the left sidebar instead of the tab strip.
@@ -342,6 +375,8 @@ pub struct ProjectView {
     board: Option<metro::Board>,
     /// Chats conectados (revisor ↔ autor).
     relays: Vec<metro::Relay>,
+    /// Chat al que se está siguiendo (abre los archivos que toca su agente).
+    following: Option<Entity<ChatView>>,
     mini_map_collapsed: bool,
     /// Shown in the window (other projects stay open in the background).
     visible: bool,
@@ -438,6 +473,7 @@ impl ProjectView {
             task_watchers: HashMap::new(),
             board: None,
             relays: Vec::new(),
+            following: None,
             mini_map_collapsed: false,
             visible: true,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
@@ -1185,6 +1221,12 @@ impl ProjectView {
                     this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx)
                 }
                 ChatEvent::Status => {}
+                ChatEvent::Follow { path, line } => {
+                    if view.read(cx).follow {
+                        this.following = Some(view.clone());
+                        this.open_file_at(path.clone(), line.saturating_sub(1), 0, window, cx);
+                    }
+                }
                 ChatEvent::RelayAuto(on) => {
                     let uid = view.read(cx).uid.clone();
                     this.set_relay_auto(&uid, *on, cx);
@@ -1792,9 +1834,16 @@ impl ProjectView {
                                 };
                                 let selected = self.active == Some(i);
                                 let tab_id = tab.id;
+                                let uid = match &tab.kind {
+                                    TabKind::Terminal { view, .. } => view.read(cx).uid.clone(),
+                                    TabKind::Chat { view, .. } => view.read(cx).uid.clone(),
+                                    _ => String::new(),
+                                };
+                                let dragged = DraggedSession { uid, title: title.clone() };
                                 Some(
                                     h_flex()
                                         .id(("session", tab_id))
+                                        .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
                                         .gap_2()
                                         .px_2()
                                         .py_1p5()
@@ -2162,6 +2211,61 @@ impl ProjectView {
             })
     }
 
+    /// "Following Claude Code" mientras el modo seguir te tiene fuera del chat.
+    fn follow_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let chat = self.following.clone().filter(|c| c.read(cx).follow)?;
+        let chat_tab = self.tabs.iter().position(|t| matches!(&t.kind, TabKind::Chat { view, .. } if *view == chat))?;
+        if self.active == Some(chat_tab) {
+            return None;
+        }
+        let label = chat.read(cx).launch.label;
+        let working = chat.read(cx).status == ChatStatus::Running;
+        let (back, stop) = (chat.clone(), chat.clone());
+        Some(
+            h_flex()
+                .px_3()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .bg(style::accent_alpha(0.1))
+                .border_b_1()
+                .border_color(style::accent_alpha(0.3))
+                .child(icons::ui("locate-fixed", px(12.), style::accent()))
+                .child(div().text_color(style::accent()).child(format!("Following {label}{}", if working { " · working" } else { "" })))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("follow-back")
+                        .cursor_pointer()
+                        .text_color(style::text())
+                        .hover(|d| d.text_color(style::accent()))
+                        .child("Back to chat")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            back.update(cx, |c, cx| c.set_follow(false, cx));
+                            this.following = None;
+                            if let Some(i) = this.tabs.iter().position(|t| matches!(&t.kind, TabKind::Chat { view, .. } if *view == back)) {
+                                this.activate(i, window, cx);
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id("follow-stop")
+                        .cursor_pointer()
+                        .text_color(style::muted())
+                        .hover(|d| d.text_color(style::text()))
+                        .child("Stop following")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            stop.update(cx, |c, cx| c.set_follow(false, cx));
+                            this.following = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = Instant::now();
         h_flex()
@@ -2306,6 +2410,7 @@ impl ProjectView {
             .size_full()
             .min_w_0()
             .when(self.tabs.iter().any(|t| !is_session(&t.kind)), |d| d.child(self.tab_bar(cx)))
+            .when_some(self.follow_bar(cx), |d, bar| d.child(bar))
             .when(self.merge_approval_ready, |d| {
                 d.child(
                     h_flex()

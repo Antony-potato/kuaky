@@ -488,6 +488,20 @@ impl ProjectView {
         self.spawn_terminal(harness, cwd, None, opts, window, cx);
     }
 
+    /// Pasa una sesión a otra línea (arrastrándola en la barra izquierda).
+    fn move_session_to(&mut self, uid: &str, target: &str, cx: &mut Context<Self>) {
+        if self.lines.line_of(uid).is_some_and(|l| l.id == target) {
+            return;
+        }
+        if let Some(session) = self.lines.line_of(uid).and_then(|l| l.sessions.iter().find(|s| s.uid == uid)).cloned() {
+            self.lines.attach(target, session);
+            let live: Vec<String> = self.trains(cx).into_keys().collect();
+            self.lines.prune_empty(&live);
+            self.lines.save();
+        }
+        cx.notify();
+    }
+
     fn chat_view_of(&self, uid: &str, cx: &App) -> Option<Entity<crate::chat_view::ChatView>> {
         self.tabs.iter().find_map(|t| match &t.kind {
             TabKind::Chat { view, .. } if view.read(cx).uid == uid => Some(view.clone()),
@@ -649,7 +663,12 @@ impl ProjectView {
                     .child(div().flex_1().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).child(line.name.clone()))
                     .when(total > 0, |d| d.child(div().flex_none().text_xs().text_color(style::faint()).child(format!("{done}/{total}"))))
                     .child(div().size(px(6.)).flex_none().rounded_full().bg(state_color))
-                    .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map")).build(window, cx))
+                    .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map · drop a session here to move it")).build(window, cx))
+                    .drag_over::<super::DraggedSession>(|s, _, _, _| s.bg(style::accent_alpha(0.18)))
+                    .on_drop(cx.listener({
+                        let target = line.id.clone();
+                        move |this, d: &super::DraggedSession, _, cx| this.move_session_to(&d.uid, &target, cx)
+                    }))
                     .on_click(cx.listener(move |this, _, window, cx| this.open_board(Some(id.clone()), window, cx)))
                     .into_any_element(),
             );

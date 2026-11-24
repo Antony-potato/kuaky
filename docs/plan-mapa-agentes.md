@@ -258,4 +258,6 @@ No hay arrastrar y soltar: mover una sesión a otra línea se hace desde la fich
 - Fase 4 hecha: **Inicio** muestra "Work in progress" con las líneas activas de todos los proyectos (abiertos y recientes); clic abre el proyecto con el board en esa línea.
 - Fase 7 hecha: si la sesión autora es un **chat**, Review/Test/Second opinion abren al otro agente también como chat, conectado. Arriba de ambos chats sale la conexión y el interruptor **Auto rounds**: al terminar un turno, la respuesta pasa al otro lado (máx. 3 rondas; para cuando el revisor responde LGTM).
 - Varios proyectos abiertos a la vez (pestañas en la barra de título).
-- Pendiente: resumen con modelo barato (fase 6); nombre de la línea desde el título del agente en vez del primer prompt (en discusión).
+- El nombre de la línea sale del primer título del agente de la sesión principal (el prompt queda como nombre provisional); tu nombre manual se respeta.
+- Arrastrar una sesión de la barra izquierda sobre el encabezado de otra línea la mueve a esa línea.
+- Pendiente: resumen con modelo barato (fase 6) — gastaría tokens tuyos en cada cambio, así que queda para cuando decidas si lo quieres.

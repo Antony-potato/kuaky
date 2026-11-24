@@ -331,4 +331,5 @@ Probado con el agente falso (`crates/kuaky-acp/tests/mock_agent.py`) y con el ha
 - % de contexto (y costo) desde `usage_update`.
 - Revisión por turno: Keep / Reject por bloque (rechazar revierte ese bloque en disco) y comentarios por línea que se mandan al chat.
 - Las sesiones ya no salen en las pestañas de arriba; viven en la barra izquierda.
-- Pendiente: seguir al agente (follow), Codex.
+- **Follow** (ícono de mira arriba del chat): kuaky abre los archivos que el agente lee o edita; arriba sale "Following …" con *Back to chat* y *Stop following*.
+- **Codex**: usa `codex-acp` si está instalado; si no, y está la CLI `codex`, corre el adaptador oficial por `npx` (`@agentclientprotocol/codex-acp@2.10.0`, la misma versión del registro de Zed). Sin probar aquí: Codex no está instalado en esta Mac.
