@@ -10,6 +10,8 @@ publish.workspace = true
 kuaky-usage.workspace = true
 kuaky-git.workspace = true
 kuaky-term.workspace = true
+kuaky-acp.workspace = true
+similar = "3"
 gpui-kit = { workspace = true, features = ["syntect"] }
 anyhow.workspace = true
 serde.workspace = true

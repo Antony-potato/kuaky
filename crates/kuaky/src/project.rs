@@ -2,6 +2,7 @@
 //! centro (terminales, archivos, diffs) y archivos / git / PRs a la derecha.
 
 use crate::agent_status::AgentState;
+use crate::chat_view::{ChatEvent, ChatLaunch, ChatStatus, ChatView};
 use crate::diff_view::DiffView;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
@@ -77,6 +78,20 @@ impl Harness {
         }
     }
 
+    /// Programa y argumentos para hablar con el agente por ACP, si está instalado.
+    fn chat_command(self) -> Option<(PathBuf, Vec<String>)> {
+        let (program, args): (&str, &[&str]) = match self {
+            Harness::Claude => ("claude-agent-acp", &[]),
+            Harness::Codex => ("codex-acp", &[]),
+            Harness::Antigravity => ("agy", &["acp"]),
+            Harness::Gemini => ("gemini", &["--acp"]),
+            Harness::OpenCode => ("opencode", &["acp"]),
+            Harness::Shell => return None,
+        };
+        let path = kuaky_git::find_agent(program)?;
+        Some((path, args.iter().map(|a| a.to_string()).collect()))
+    }
+
     /// Clave estable para guardar el estado.
     fn key(self) -> &'static str {
         self.command().unwrap_or("shell")
@@ -130,6 +145,7 @@ enum TabKind {
     Terminal { view: Entity<TerminalView>, harness: Harness, worktree: Option<String>, cwd: PathBuf },
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
+    Chat { view: Entity<ChatView>, harness: Harness },
 }
 
 struct Tab {
@@ -188,6 +204,8 @@ pub struct ProjectView {
     git: GitState,
     /// Agentes encontrados en este equipo y la ruta de su CLI.
     installed: HashMap<Harness, PathBuf>,
+    /// Agentes con modo chat (ACP) disponible.
+    chat_agents: HashMap<Harness, (PathBuf, Vec<String>)>,
     /// Abrir cada agente nuevo en su propio worktree y rama.
     isolate: bool,
     activity: Vec<ActivityRow>,
@@ -230,6 +248,7 @@ impl ProjectView {
             panel: SidePanel::Files,
             git: GitState::default(),
             installed: HashMap::new(),
+            chat_agents: HashMap::new(),
             isolate: false,
             focus: cx.focus_handle(),
             previous: saved.sessions.clone(),
@@ -325,13 +344,20 @@ impl ProjectView {
             let found = cx
                 .background_executor()
                 .spawn(async {
-                    Harness::AGENTS
+                    let installed = Harness::AGENTS
                         .into_iter()
                         .filter_map(|h| Some((h, kuaky_git::find_agent(h.command()?)?)))
-                        .collect::<HashMap<_, _>>()
+                        .collect::<HashMap<_, _>>();
+                    let chat = Harness::AGENTS
+                        .into_iter()
+                        .filter_map(|h| Some((h, h.chat_command()?)))
+                        .collect::<HashMap<_, _>>();
+                    (installed, chat)
                 })
                 .await;
             this.update(cx, |this, cx| {
+                let (found, chat) = found;
+                this.chat_agents = chat;
                 this.installed = found;
                 cx.notify();
             })
@@ -355,6 +381,16 @@ impl ProjectView {
         }
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
+        }
+        match std::env::var("KUAKY_DEMO_CHAT").as_deref() {
+            // Agente falso de las pruebas de kuaky-acp: no usa red ni tokens.
+            Ok("mock") => {
+                let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kuaky-acp/tests/mock_agent.py");
+                self.chat_agents.insert(Harness::Claude, (PathBuf::from("python3"), vec![script.to_string_lossy().into_owned()]));
+                self.open_chat(Harness::Claude, window, cx);
+            }
+            Ok(_) => self.open_chat(Harness::Claude, window, cx),
+            Err(_) => {}
         }
         if std::env::var("KUAKY_DEMO_QUICKOPEN").is_ok() {
             self.toggle_quick_open(window, cx);
@@ -479,11 +515,15 @@ impl ProjectView {
             AgentState::Done if was_working => (format!("{} terminó", harness.label()), "Es tu turno.".to_string()),
             _ => return,
         };
-        let project = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let is_active_tab = self
             .active
             .and_then(|i| self.tabs.get(i))
             .is_some_and(|tab| matches!(&tab.kind, TabKind::Terminal { view: v, .. } if v == view));
+        self.notify(title, message, is_active_tab, window, cx);
+    }
+
+    fn notify(&mut self, title: String, message: String, is_active_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let window_active = window.is_window_active();
         if !is_active_tab || !window_active {
             use gpui_kit::component::WindowExt as _;
@@ -583,6 +623,34 @@ impl ProjectView {
                 }))
                 .into_any_element(),
         )
+    }
+
+    pub fn open_chat(&mut self, harness: Harness, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((program, args)) = self.chat_agents.get(&harness).cloned().or_else(|| harness.chat_command()) else {
+            return;
+        };
+        let launch = ChatLaunch { label: harness.label(), program, args, cwd: self.root.clone() };
+        let view = cx.new(|cx| ChatView::new(launch, window, cx));
+        let sub = cx.subscribe_in(&view, window, move |this, view, ev: &ChatEvent, window, cx| {
+            let is_active_tab = this
+                .active
+                .and_then(|i| this.tabs.get(i))
+                .is_some_and(|tab| matches!(&tab.kind, TabKind::Chat { view: v, .. } if v == view));
+            match ev {
+                ChatEvent::OpenDiff { title, patch } => {
+                    let patch = patch.clone();
+                    this.open_diff(title.clone(), "cambio propuesto por el agente".into(), move || Ok(patch), window, cx);
+                }
+                ChatEvent::NeedsYou(msg) => {
+                    this.notify(format!("{} necesita tu permiso", harness.label()), msg.clone(), is_active_tab, window, cx)
+                }
+                ChatEvent::TurnDone => this.notify(format!("{} terminó", harness.label()), "Es tu turno.".into(), is_active_tab, window, cx),
+                ChatEvent::Status => {}
+            }
+            cx.notify();
+        });
+        self._subs.push(sub);
+        self.push_tab(TabKind::Chat { view, harness }, window, cx);
     }
 
     fn push_tab(&mut self, kind: TabKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -781,6 +849,27 @@ impl ProjectView {
                             .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
                             .child(harness_badge(h))
                             .child(div().flex_1().child(h.label()))
+                            .when(self.chat_agents.contains_key(&h), |d| {
+                                d.child(
+                                    div()
+                                        .id(SharedString::from(format!("chat-{}", h.label())))
+                                        .px_1p5()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .text_color(style::accent())
+                                        .border_1()
+                                        .border_color(style::soft(style::accent(), 0.4))
+                                        .hover(|d| d.bg(style::soft(style::accent(), 0.12)))
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new("Abrir en modo chat (ACP)").build(window, cx)
+                                        })
+                                        .child("chat")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_chat(h, window, cx);
+                                        })),
+                                )
+                            })
                             .child(div().text_xs().text_color(style::faint()).child(if installed { "+" } else { "instalar" }))
                             .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
                     }))
@@ -830,13 +919,22 @@ impl ProjectView {
                     .border_t_1()
                     .border_color(style::border())
                     .child(side_title("Sesiones abiertas"))
-                    .when(!self.tabs.iter().any(|t| matches!(t.kind, TabKind::Terminal { .. })), |d| {
+                    .when(!self.tabs.iter().any(|t| matches!(t.kind, TabKind::Terminal { .. } | TabKind::Chat { .. })), |d| {
                         d.child(div().px_2().text_xs().text_color(style::faint()).child("Ninguna todavía"))
                     })
                     .children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-                        let TabKind::Terminal { view, harness, worktree, .. } = &tab.kind else { return None };
-                        let t = view.read(cx);
-                        let (status, color) = terminal_status(t, now);
+                        let (harness, title, status, color, worktree): (Harness, SharedString, &str, Hsla, Option<String>) = match &tab.kind {
+                            TabKind::Terminal { view, harness, worktree, .. } => {
+                                let t = view.read(cx);
+                                let (status, color) = terminal_status(t, now);
+                                (*harness, t.title.clone().unwrap_or_else(|| t.label.clone()), status, color, worktree.clone())
+                            }
+                            TabKind::Chat { view, harness } => {
+                                let (status, color) = chat_status(view.read(cx));
+                                (*harness, format!("{} · chat", harness.label()).into(), status, color, None)
+                            }
+                            _ => return None,
+                        };
                         let selected = self.active == Some(i);
                         Some(
                             h_flex()
@@ -848,12 +946,12 @@ impl ProjectView {
                                 .cursor_pointer()
                                 .when(selected, |d| d.bg(style::panel_hover()))
                                 .hover(|d| d.bg(style::panel_hover()))
-                                .child(harness_badge(*harness))
+                                .child(harness_badge(harness))
                                 .child(
                                     v_flex()
                                         .flex_1()
                                         .min_w_0()
-                                        .child(div().text_sm().truncate().child(t.title.clone().unwrap_or_else(|| t.label.clone())))
+                                        .child(div().text_sm().truncate().child(title))
                                         .child(
                                             h_flex()
                                                 .gap_1()
@@ -862,7 +960,7 @@ impl ProjectView {
                                                 .child(div().size(px(6.)).rounded_full().bg(color))
                                                 .child(status),
                                         )
-                                        .when_some(worktree.clone(), |d, w| {
+                                        .when_some(worktree, |d, w| {
                                             d.child(div().text_xs().text_color(style::faint()).truncate().child(format!("⑂ {w}")))
                                         }),
                                 )
@@ -994,6 +1092,10 @@ impl ProjectView {
                         (text_icon("◇", style::muted().into()), None, f.title().into(), f.dirty)
                     }
                     TabKind::Diff(d) => (text_icon("±", style::accent().into()), None, d.read(cx).title.clone(), false),
+                    TabKind::Chat { view, harness } => {
+                        let (_, dot) = chat_status(view.read(cx));
+                        (harness_badge(*harness), Some(dot), format!("{} · chat", harness.label()).into(), false)
+                    }
                 };
                 h_flex()
                     .id(("tab", tab.id))
@@ -1036,6 +1138,7 @@ impl ProjectView {
                 TabKind::Terminal { view, .. } => view.clone().into_any_element(),
                 TabKind::File(v) => v.clone().into_any_element(),
                 TabKind::Diff(v) => v.clone().into_any_element(),
+                TabKind::Chat { view, .. } => view.clone().into_any_element(),
             },
             None => self.empty_state(cx).into_any_element(),
         };
@@ -1442,6 +1545,19 @@ fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
         ("trabajando", style::accent().into())
     } else {
         ("en espera", style::good().into())
+    }
+}
+
+fn chat_status(c: &ChatView) -> (&'static str, Hsla) {
+    if c.is_waiting_permission() {
+        return ("necesita tu permiso", style::bad().into());
+    }
+    match &c.status {
+        ChatStatus::Connecting => ("conectando", style::faint().into()),
+        ChatStatus::Ready => ("tu turno", style::good().into()),
+        ChatStatus::Running => ("trabajando", style::accent().into()),
+        ChatStatus::Error(_) => ("error", style::bad().into()),
+        ChatStatus::Exited => ("terminó", style::faint().into()),
     }
 }
 

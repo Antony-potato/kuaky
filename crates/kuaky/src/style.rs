@@ -3,6 +3,17 @@
 use gpui_kit::{Hsla, Rgba, rgb, rgba};
 use kuaky_usage::{Agent, Provider};
 
+/// Fuente monoespaciada del sistema.
+pub fn mono_font() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else if cfg!(windows) {
+        "Consolas"
+    } else {
+        "monospace"
+    }
+}
+
 pub fn bg() -> Rgba {
     rgb(0x0b0c0f)
 }

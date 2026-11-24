@@ -21,7 +21,7 @@ kuaky es un editor de escritorio ligero (macOS + Windows) centrado en agentes. A
 | 4. Git | ✅ | Cambios locales con diff, diff entre ramas, cambiar de rama |
 | 5. PRs | ✅ | Lista con `gh` y diff de cada PR |
 | 8. Editor | 🟡 | Editor de GPUI Kit con resaltado (syntect) y guardado ⌘S. Falta: LSP, búsqueda |
-| 7. Chat ACP | ⏳ | |
+| 7. Chat ACP | ✅ | `kuaky-acp`: cliente ACP propio (JSON-RPC por stdio, sin runtime async), probado contra un agente falso. Chat con Markdown, pensamiento, herramientas, permisos con botones, plan y diffs de cada edición. Claude Code vía `claude-agent-acp` (el que instaló Zed); también Antigravity (`agy acp`), Gemini (`--acp`), Codex (`codex-acp`) y OpenCode (`acp`) si están instalados |
 | 9. Worktrees y distribución | 🟡 | Worktree por sesión con cambios / terminal / crear PR / fusionar / eliminar; `kuaky.app` con ícono (`script/bundle-macos.sh`). Falta: instalador de Windows, auto-actualización |
 | Uso diario | ✅ | Menús nativos, paneles redimensionables, ⌘P, estado persistente y sesiones para reanudar |
 

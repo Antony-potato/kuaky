@@ -1,5 +1,6 @@
 mod agent_status;
 mod app;
+mod chat_view;
 mod diff_view;
 mod file_tree;
 mod file_view;
