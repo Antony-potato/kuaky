@@ -583,18 +583,14 @@ enum RunAction {
 fn run_icon(run: &WorkflowRun, id: (&'static str, usize)) -> AnyElement {
     if run.running() {
         let color: Hsla = if run.status == "in_progress" { style::accent().into() } else { style::muted().into() };
-        return icons::ui("loader-circle", px(13.), color)
-            .with_animation(SharedString::from(format!("{}-{}", id.0, id.1)), Animation::new(Duration::from_millis(1100)).repeat(), |svg, d| {
-                svg.with_transformation(Transformation::rotate(percentage(d)))
-            })
-            .into_any_element();
+        return crate::motion::spinner(SharedString::from(format!("{}-{}", id.0, id.1)), color, px(13.)).into_any_element();
     }
     let (icon, color): (&'static str, Hsla) = match run.conclusion.as_str() {
         "success" => ("circle-check", style::good().into()),
         "failure" | "startup_failure" | "timed_out" => ("circle-x", style::bad().into()),
         "cancelled" => ("ban", style::faint().into()),
         "skipped" | "neutral" => ("circle-slash", style::faint().into()),
-        "action_required" => ("circle-dot", rgb(0xfbbf24).into()),
+        "action_required" => ("circle-dot", style::warn().into()),
         _ => ("circle-dot", style::faint().into()),
     };
     icons::ui(icon, px(13.), color).into_any_element()
@@ -684,7 +680,11 @@ impl Render for ActionsPanel {
                     .child(workflows)
                     .when_some(form, |d, f| d.child(div().pt_1().child(f)))
                     .when_some(self.error.clone(), |d, e| d.child(div().px_3().py_1().text_xs().text_color(style::bad()).whitespace_normal().child(e)))
-                    .when_some(self.notice.clone(), |d, n| d.child(div().px_3().py_1().text_xs().text_color(style::muted()).whitespace_normal().child(n)))
+                    .when_some(self.notice.clone(), |d, n| {
+                        let id = SharedString::from(format!("notice-{n}"));
+                        let note = div().px_3().py_1().text_xs().text_color(style::muted()).whitespace_normal().child(n);
+                        d.child(crate::motion::fade_in(note, id, crate::motion::NORMAL))
+                    })
                     .child(
                         h_flex()
                             .pr_3()

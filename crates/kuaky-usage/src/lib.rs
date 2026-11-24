@@ -38,10 +38,26 @@ pub fn load_all() -> Vec<UsageEvent> {
         }
     }
     events.sort_by_key(|e| e.ts);
+    share_strings(&mut events);
     tracing::info!(
         total = events.len(),
         ms = started.elapsed().as_millis() as u64,
         "consumo cargado"
     );
     events
+}
+
+/// Un solo `Arc<str>` por modelo, sesión y carpeta en todos los eventos.
+///
+/// Cada fuente ya comparte dentro de un archivo, pero no entre archivos, y
+/// las copias de cada evento se sueltan aquí (son ~90 000 eventos).
+fn share_strings(events: &mut [UsageEvent]) {
+    let mut interner = sources::Interner::default();
+    for e in events {
+        e.model = interner.get(&e.model);
+        e.session = interner.get(&e.session);
+        if let Some(p) = &e.project {
+            e.project = Some(interner.get(p));
+        }
+    }
 }

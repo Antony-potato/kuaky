@@ -302,7 +302,7 @@ impl ReviewView {
                             .rounded_md()
                             .text_xs()
                             .bg(style::accent())
-                            .text_color(style::bg())
+                            .text_color(style::on_accent())
                             .cursor_pointer()
                             .child("Save")
                             .on_click(cx.listener(|this, _, window, cx| this.save_comment(window, cx))),
@@ -478,7 +478,7 @@ impl Render for ReviewView {
                                 .rounded_md()
                                 .cursor_pointer()
                                 .bg(style::accent())
-                                .text_color(style::bg())
+                                .text_color(style::on_accent())
                                 .child(format!("Send {comments} comment{} to agent", if comments == 1 { "" } else { "s" }))
                                 .on_click(cx.listener(|this, _, _, cx| this.send(cx))),
                         )

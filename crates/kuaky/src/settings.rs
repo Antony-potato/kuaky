@@ -29,6 +29,7 @@ struct AgentRowState {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
+    Appearance,
     Agents,
     Panel,
     Pulls,
@@ -36,10 +37,11 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 4] = [Section::Agents, Section::Panel, Section::Pulls, Section::Worktrees];
+    const ALL: [Section; 5] = [Section::Appearance, Section::Agents, Section::Panel, Section::Pulls, Section::Worktrees];
 
     fn label(self) -> &'static str {
         match self {
+            Section::Appearance => "Appearance",
             Section::Agents => "Agents",
             Section::Panel => "Right panel",
             Section::Pulls => "Pull requests",
@@ -49,6 +51,7 @@ impl Section {
 
     fn icon(self) -> &'static str {
         match self {
+            Section::Appearance => "palette",
             Section::Agents => "bot",
             Section::Panel => "panel-right",
             Section::Pulls => "git-pull-request",
@@ -120,7 +123,7 @@ impl SettingsView {
         }));
 
         let this = Self {
-            section: Section::Agents,
+            section: if std::env::var_os("KUAKY_DEMO_APPEARANCE").is_some() { Section::Appearance } else { Section::Agents },
             agents,
             detected: HashMap::new(),
             worktrees_input,
@@ -328,6 +331,101 @@ impl SettingsView {
             )
     }
 
+    /// Elige el tema para su apariencia (claro u oscuro) y lo muestra de inmediato.
+    fn pick_theme(&mut self, name: String, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let system_dark = crate::theme::system_is_dark(Some(window), cx);
+        state::update(cx, |s| {
+            let t = &mut s.settings.theme;
+            if dark {
+                t.dark = name;
+            } else {
+                t.light = name;
+            }
+            t.mode = crate::theme::mode_after_pick(&t.mode, system_dark, dark).to_string();
+        });
+        crate::theme::apply(Some(window), cx);
+        cx.emit(SettingsEvent::Changed);
+        cx.notify();
+    }
+
+    fn set_theme_mode(&mut self, mode: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        state::update(cx, |s| s.settings.theme.mode = mode.to_string());
+        crate::theme::apply(Some(window), cx);
+        cx.emit(SettingsEvent::Changed);
+        cx.notify();
+    }
+
+    fn appearance_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let saved = state::get(cx).settings.theme.clone();
+        let choices = ThemeChoice::all(cx);
+        v_flex()
+            .gap_4()
+            .child(self.theme_mode_picker(&saved.mode, cx))
+            .child(self.theme_group(&choices, true, saved.dark_or_default(), cx))
+            .child(self.theme_group(&choices, false, saved.light_or_default(), cx))
+            .child(themes_folder_row(cx))
+    }
+
+    /// System / Light / Dark.
+    fn theme_mode_picker(&self, mode: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = if mode.is_empty() { "system" } else { mode };
+        let modes = [("system", "System"), ("light", "Light"), ("dark", "Dark")];
+        v_flex()
+            .gap_2()
+            .child(div().text_xs().text_color(style::muted()).child("APPEARANCE"))
+            .child(h_flex().gap_1().children(modes.into_iter().map(|(key, label)| {
+                div()
+                    .id(SharedString::from(format!("theme-mode-{key}")))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if mode == key { style::accent().into() } else { style::border() })
+                    .text_color(if mode == key { style::accent() } else { style::muted() })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_theme_mode(key, window, cx)))
+            })))
+    }
+
+    fn theme_group(&self, choices: &[ThemeChoice], dark: bool, chosen: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_1p5()
+            .child(div().text_xs().text_color(style::faint()).child(if dark { "DARK THEMES" } else { "LIGHT THEMES" }))
+            .children(choices.iter().filter(|c| c.dark == dark).map(|c| self.theme_row(c, c.name == chosen, cx)))
+    }
+
+    fn theme_row(&self, c: &ThemeChoice, selected: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let (name, dark) = (c.name.clone(), c.dark);
+        h_flex()
+            .id(SharedString::from(format!("theme-{name}")))
+            .p_2()
+            .gap_3()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(if selected { style::accent().into() } else { style::border() })
+            .bg(style::bg())
+            .cursor_pointer()
+            .hover(|d| d.bg(style::panel_hover()))
+            .child(theme_swatch(&c.swatch))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
+                            .when(c.custom, |d| d.child(div().text_xs().text_color(style::faint()).child("custom")))
+                            .when(c.live, |d| d.child(div().text_xs().text_color(style::accent()).child("in use"))),
+                    )
+                    .child(div().text_xs().text_color(style::faint()).whitespace_normal().child(c.about.clone())),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.pick_theme(name.clone(), dark, window, cx)))
+    }
+
     fn on_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if ev.keystroke.key == "escape" {
             cx.stop_propagation();
@@ -494,6 +592,7 @@ impl Render for SettingsView {
                                             })
                                     })),
                             ))
+                            .when(self.section == Section::Appearance, |d| d.child(self.appearance_section(cx)))
                             .when(self.section == Section::Panel, |d| d.child(self.panels_section(cx)))
                             .when(self.section == Section::Pulls, |d| d.child(self.merge_section(cx)))
                             .when(self.section == Section::Worktrees, |d| d.child(
@@ -540,12 +639,88 @@ impl Render for SettingsView {
                             .font_weight(FontWeight::MEDIUM)
                             .cursor_pointer()
                             .bg(style::accent())
-                            .text_color(style::bg())
+                            .text_color(style::on_accent())
                             .child("Done")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close))),
                     ),
             )
     }
+}
+
+/// Un tema tal como se muestra en la lista de Appearance.
+struct ThemeChoice {
+    name: String,
+    about: String,
+    dark: bool,
+    swatch: Vec<Rgba>,
+    custom: bool,
+    live: bool,
+}
+
+impl ThemeChoice {
+    fn all(cx: &App) -> Vec<Self> {
+        let registry = cx.global::<crate::theme::Registry>();
+        registry
+            .themes
+            .iter()
+            .map(|t| {
+                let p = &t.palette;
+                Self {
+                    name: t.name.clone(),
+                    about: t.description.clone(),
+                    dark: t.is_dark(),
+                    swatch: vec![p.background, p.surface, p.text, p.accent, p.data_output, p.warning],
+                    custom: t.source.is_some(),
+                    live: t.name == registry.active,
+                }
+            })
+            .collect()
+    }
+}
+
+fn theme_swatch(colors: &[Rgba]) -> impl IntoElement {
+    h_flex()
+        .flex_none()
+        .rounded_sm()
+        .overflow_hidden()
+        .border_1()
+        .border_color(style::border())
+        .children(colors.iter().map(|c| div().w(px(14.)).h(px(28.)).bg(*c)))
+}
+
+/// Carpeta de temas propios y botón para volver a leerlos.
+fn themes_folder_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
+    let folder = crate::theme::user_dir().map(|p| crate::home::tilde(&p)).unwrap_or_default();
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(style::faint())
+                .whitespace_normal()
+                .child(format!("Your own themes: JSON files in {folder}")),
+        )
+        .child(
+            div()
+                .id("themes-reload")
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .border_1()
+                .border_color(style::border())
+                .text_color(style::muted())
+                .hover(|d| d.bg(style::panel_hover()))
+                .child("Reload themes")
+                .on_click(cx.listener(|_, _, _, cx| {
+                    crate::theme::reload(cx);
+                    cx.notify();
+                })),
+        )
 }
 
 fn switch(on: bool) -> impl IntoElement {

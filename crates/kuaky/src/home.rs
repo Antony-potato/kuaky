@@ -1,6 +1,7 @@
 //! Ventana de inicio: consumo de tokens de todos los agentes.
 
 use crate::icons;
+use crate::motion;
 use crate::style::{self, human, thousands};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -32,6 +33,8 @@ pub struct HomeView {
     work: Vec<ProjectWork>,
     /// Live agents of the projects open in kuaky.
     live: HashMap<PathBuf, LiveSummary>,
+    /// KPIs before the last range or agent change: the numbers count from here.
+    prev_kpis: Option<kuaky_usage::report::Kpis>,
 }
 
 struct ProjectWork {
@@ -72,6 +75,7 @@ impl HomeView {
             range: Range::Days(30),
             agent: None,
             report: Report::default(),
+            prev_kpis: None,
             tz: TimeZone::system(),
             now: Timestamp::now(),
             pricing: Arc::new(Pricing::embedded()),
@@ -169,6 +173,7 @@ impl HomeView {
             "Work in progress",
             Some(format!("{total} line{} · click to open", if total == 1 { "" } else { "s" })),
             v_flex().gap_4().children(self.work.iter().enumerate().map(|(pi, w)| {
+                let first_row: usize = self.work[..pi].iter().map(|w| w.lines.len()).sum();
                 let name = w.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let live = self.live.get(&w.root);
                 let open = live.is_some();
@@ -191,7 +196,8 @@ impl HomeView {
                             .when(open, |d| d.child(pill("open".into(), style::accent()))),
                     )
                     .children(w.lines.iter().enumerate().map(|(li, (line, depth))| {
-                        self.work_row(pi * 100 + li, &w.root, line, *depth, live, now, cx).into_any_element()
+                        let row = self.work_row(pi * 100 + li, &w.root, line, *depth, live, now, cx);
+                        motion::row_in(row, SharedString::from(format!("work-in-{}", line.id)), first_row + li).into_any_element()
                     }))
             })),
         )
@@ -207,8 +213,8 @@ impl HomeView {
         live: Option<&LiveSummary>,
         now: Timestamp,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let color = rgb(line.color);
+    ) -> Stateful<Div> {
+        let color = style::lane(line.color);
         let total = line.stations.len();
         let done = line.done_count();
         let trains: Vec<(Option<Agent>, bool, bool)> = line
@@ -262,8 +268,12 @@ impl HomeView {
                     }),
             )
             .child(station_chain(&shown, color, total > shown.len()))
+            .when(working && !needs_you, |d| d.child(progress_sweep(SharedString::from(format!("sweep-{}", line.id)), color)))
             .child(div().flex_1())
-            .when(needs_you, |d| d.child(pill("needs you".into(), style::bad())))
+            .when(needs_you, |d| {
+                let id = SharedString::from(format!("needs-{}", line.id));
+                d.child(motion::fade_in(pill("needs you".into(), style::bad()), id, motion::NORMAL))
+            })
             .when(working && !needs_you, |d| d.child(pill("working".into(), style::accent())))
             .child(h_flex().gap_1().children(trains.iter().filter_map(|t| t.0).map(agent_badge)))
             .child(
@@ -292,12 +302,14 @@ impl HomeView {
     }
 
     fn set_range(&mut self, range: Range, cx: &mut Context<Self>) {
+        self.prev_kpis = Some(self.report.kpis);
         self.range = range;
         self.rebuild();
         cx.notify();
     }
 
     fn toggle_agent(&mut self, agent: Agent, cx: &mut Context<Self>) {
+        self.prev_kpis = Some(self.report.kpis);
         self.agent = if self.agent == Some(agent) { None } else { Some(agent) };
         self.rebuild();
         cx.notify();
@@ -318,7 +330,10 @@ impl HomeView {
             .child(
                 v_flex()
                     .gap_0p5()
-                    .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(match style::display_font() {
+                        Some(font) => div().text_3xl().font_family(font).font_weight(FontWeight::SEMIBOLD).child(title),
+                        None => div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title),
+                    })
                     .child(div().text_sm().text_color(style::muted()).child(subtitle)),
             )
             .child(
@@ -342,10 +357,14 @@ impl HomeView {
                                     .text_sm()
                                     .cursor_pointer()
                                     .text_color(if selected { style::text() } else { style::muted() })
-                                    .when(selected, |d| d.bg(style::panel_hover()))
                                     .hover(|d| d.text_color(style::text()))
                                     .child(r.label())
                                     .on_click(cx.listener(move |this, _, _, cx| this.set_range(r, cx)))
+                                    .with_animation(
+                                        SharedString::from(format!("range-bg-{}-{selected}", r.label())),
+                                        motion::once(motion::FAST),
+                                        move |d, t| if selected { d.bg(style::soft(style::panel_hover(), t)) } else { d },
+                                    )
                             })),
                     )
                     .child(
@@ -357,7 +376,7 @@ impl HomeView {
                             .text_sm()
                             .cursor_pointer()
                             .bg(style::accent())
-                            .text_color(style::bg())
+                            .text_color(style::on_accent())
                             .font_weight(FontWeight::MEDIUM)
                             .child("Open folder")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::PickFolder))),
@@ -396,7 +415,7 @@ impl HomeView {
                         let bar_color = if rem <= 10.0 {
                             style::bad()
                         } else if rem <= 25.0 {
-                            rgb(0xfbbf24)
+                            style::warn()
                         } else {
                             style::accent()
                         };
@@ -423,13 +442,15 @@ impl HomeView {
                                     .rounded_full()
                                     .bg(style::panel_hover())
                                     .overflow_hidden()
-                                    .child(
+                                    .child({
+                                        let full = (rem as f32 / 100.0).clamp(0.0, 1.0);
+                                        let id = SharedString::from(format!("limit-{}-{}", al.agent.name(), w.label));
                                         div()
                                             .h_full()
-                                            .w(relative((rem as f32 / 100.0).clamp(0.0, 1.0)))
                                             .rounded_full()
-                                            .bg(bar_color),
-                                    ),
+                                            .bg(bar_color)
+                                            .with_animation(id, motion::once(motion::SLOW), move |d, t| d.w(relative(full * t)))
+                                    }),
                             )
                     }))
             })),
@@ -439,17 +460,31 @@ impl HomeView {
     fn kpi_cards(&self) -> impl IntoElement {
         let r = &self.report;
         let k = r.kpis;
+        let prev = self.prev_kpis.unwrap_or_default();
+        let key = format!("{}-{:?}", self.range.label(), self.agent);
         let series = |f: fn(&kuaky_usage::report::DayStat) -> u64| r.days.iter().map(f).collect::<Vec<_>>();
+        let count = |label: &'static str, from: u64, to: u64, fmt: fn(u64) -> String| Counter {
+            id: SharedString::from(format!("kpi-{label}-{key}")),
+            from: from as f64,
+            to: to as f64,
+            fmt: Box::new(move |v| fmt(v.round() as u64)),
+        };
         let parallel = if k.max_parallel > 1 {
             format!("up to {} in parallel", k.max_parallel)
         } else {
             "one session at a time".into()
         };
+        let cost = Counter {
+            id: SharedString::from(format!("kpi-cost-{key}")),
+            from: prev.cost,
+            to: k.cost,
+            fmt: Box::new(style::money),
+        };
         h_flex()
             .gap_4()
             .child(kpi_card(
                 "Input tokens",
-                human(k.input_total),
+                count("input", prev.input_total, k.input_total, human),
                 format!("{:.0}% from cache", k.cache_pct()),
                 r.delta(|k| k.input_total),
                 series(|d| d.input_total),
@@ -457,7 +492,7 @@ impl HomeView {
             ))
             .child(kpi_card(
                 "Output tokens",
-                human(k.output),
+                count("output", prev.output, k.output, human),
                 format!("{} per response", human(k.output_per_turn())),
                 r.delta(|k| k.output),
                 series(|d| d.output),
@@ -465,7 +500,7 @@ impl HomeView {
             ))
             .child(kpi_card(
                 "Sessions",
-                thousands(k.sessions),
+                count("sessions", prev.sessions, k.sessions, thousands),
                 format!("{} responses", thousands(k.turns)),
                 r.delta(|k| k.sessions),
                 series(|d| d.sessions),
@@ -473,7 +508,7 @@ impl HomeView {
             ))
             .child(kpi_card(
                 "Agent time",
-                style::duration(k.agent_secs),
+                count("time", prev.agent_secs, k.agent_secs, style::duration),
                 parallel,
                 r.delta(|k| k.agent_secs),
                 series(|d| d.agent_secs),
@@ -481,7 +516,7 @@ impl HomeView {
             ))
             .child(kpi_card(
                 "API cost",
-                style::money(k.cost),
+                cost,
                 if k.unpriced > 0 {
                     format!("{} unpriced responses", thousands(k.unpriced))
                 } else {
@@ -869,9 +904,25 @@ impl Render for HomeView {
 
 // ── piezas ───────────────────────────────────────────────────────────────
 
+/// A big number that counts from its previous value to the new one.
+struct Counter {
+    id: SharedString,
+    from: f64,
+    to: f64,
+    fmt: Box<dyn Fn(f64) -> String>,
+}
+
+impl Counter {
+    fn into_element(self) -> impl IntoElement {
+        let Counter { id, from, to, fmt } = self;
+        let el = div().text_3xl().font_weight(FontWeight::SEMIBOLD).when_some(style::display_font(), |d, f| d.font_family(f));
+        el.with_animation(id, motion::once(motion::SLOW), move |d, t| d.child(fmt(motion::lerp(from, to, t))))
+    }
+}
+
 fn kpi_card(
     label: &'static str,
-    value: String,
+    value: Counter,
     sub: String,
     delta: Option<f64>,
     series: Vec<u64>,
@@ -893,7 +944,7 @@ fn kpi_card(
                 .child(div().text_xs().text_color(style::muted()).child(label.to_uppercase()))
                 .when_some(delta, |d, delta| d.child(delta_pill(delta))),
         )
-        .child(div().text_3xl().font_weight(FontWeight::SEMIBOLD).child(value))
+        .child(value.into_element())
         .child(div().text_sm().text_color(style::muted()).child(sub))
         .child(
             h_flex()
@@ -952,7 +1003,25 @@ fn station_chain(stations: &[&crate::lines::Station], color: Rgba, more: bool) -
         }))
 }
 
-fn pill(text: String, color: Rgba) -> impl IntoElement {
+/// An agent is working on this line: a short segment runs along a track at
+/// constant speed, like a progress bar (not a pulse).
+fn progress_sweep(id: SharedString, color: Rgba) -> impl IntoElement {
+    const TRACK: f32 = 28.;
+    const SEGMENT: f32 = 9.;
+    div()
+        .w(px(TRACK))
+        .h(px(2.))
+        .relative()
+        .overflow_hidden()
+        .bg(style::soft(color, 0.2))
+        .child(div().absolute().top_0().h_full().w(px(SEGMENT)).bg(color).with_animation(
+            id,
+            Animation::new(std::time::Duration::from_millis(1200)).repeat_synced().with_max_fps(motion::SMOOTH_FPS),
+            |d, t| d.left(px(-SEGMENT + t * (TRACK + SEGMENT))),
+        ))
+}
+
+fn pill(text: String, color: Rgba) -> Div {
     div().px_1p5().rounded_full().text_xs().bg(style::soft(color, 0.14)).text_color(color).child(text)
 }
 

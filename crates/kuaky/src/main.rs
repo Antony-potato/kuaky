@@ -16,6 +16,8 @@ mod home;
 mod icons;
 mod lines;
 mod lsp;
+mod memory;
+mod motion;
 mod project;
 mod pr_view;
 mod quick_open;
@@ -26,8 +28,9 @@ mod state;
 mod style;
 mod terminal_view;
 mod updater;
+mod theme;
 
-use gpui_kit::component::{Theme, ThemeMode, TitleBar};
+use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 fn main() {
@@ -52,8 +55,8 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {
             gpui_kit::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
             state::init(cx);
+            theme::init(cx);
             app::init(cx);
             project::init(cx);
             chat_view::init(cx);

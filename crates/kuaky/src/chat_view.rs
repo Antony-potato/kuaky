@@ -119,8 +119,9 @@ impl Detail {
 
 #[derive(Clone)]
 enum Item {
-    Agent(String),
-    Thought(String),
+    // SharedString: el render pasa el texto a TextView en cada frame sin copiarlo.
+    Agent(SharedString),
+    Thought(SharedString),
     Tool(ToolCall),
     Permission { req: PermissionRequest, answer: Option<String> },
     Notice(String),
@@ -135,14 +136,35 @@ struct Attachment {
 }
 
 impl Attachment {
+    /// El original solo viaja en base64 al agente; en pantalla queda una miniatura.
     fn new(format: ImageFormat, bytes: Vec<u8>) -> Attachment {
         use base64::Engine as _;
-        Attachment {
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            mime: format.mime_type().to_string(),
-            image: Arc::new(Image::from_bytes(format, bytes)),
-        }
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let mime = format.mime_type().to_string();
+        let image = thumbnail(format, &bytes).unwrap_or_else(|| Image::from_bytes(format, bytes));
+        Attachment { data, mime, image: Arc::new(image) }
     }
+}
+
+/// Lado mayor de la miniatura: el chat pinta las imágenes a 240×160 como
+/// mucho (el doble para pantallas retina).
+const THUMB_MAX: (u32, u32) = (480, 320);
+
+/// Copia chica para mostrar. Decodificada, una captura retina ocupa
+/// ancho × alto × 4 bytes (13 MB una de 2230×1478) mientras viva el chat.
+/// `None` si ya es chica, si es un GIF (perdería la animación) o no se lee.
+fn thumbnail(format: ImageFormat, bytes: &[u8]) -> Option<Image> {
+    if matches!(format, ImageFormat::Gif) {
+        return None;
+    }
+    let decoded = image::load_from_memory(bytes).ok()?;
+    if decoded.width() <= THUMB_MAX.0 && decoded.height() <= THUMB_MAX.1 {
+        return None;
+    }
+    let small = decoded.thumbnail(THUMB_MAX.0, THUMB_MAX.1);
+    let mut png = Vec::new();
+    small.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    Some(Image::from_bytes(ImageFormat::Png, png))
 }
 
 /// Mensaje en cola mientras el agente trabaja.
@@ -187,8 +209,8 @@ impl Turn {
     }
 
     fn stats(&self) -> (usize, usize) {
-        self.files.iter().fold((0, 0), |(a, r), (path, (old, new))| {
-            let (x, y) = count_changes(&FileDiff { path: path.to_string_lossy().into_owned(), old_text: old.clone(), new_text: new.clone() });
+        self.files.values().fold((0, 0), |(a, r), (old, new)| {
+            let (x, y) = count_text_changes(old.as_deref(), new);
             (a + x, r + y)
         })
     }
@@ -260,6 +282,11 @@ pub struct ChatView {
     reconnects: Vec<Instant>,
     /// Posición del scroll la última vez que llegaron eventos.
     last_offset: Pixels,
+    /// Proceso del agente cerrado por inactividad: se vuelve a abrir solo al
+    /// mandar el próximo mensaje (cada agente ocupa 50–250 MB).
+    asleep: bool,
+    /// Conexión vigente: los eventos de un proceso anterior se ignoran.
+    conn: u64,
     focus: FocusHandle,
     _sub: Subscription,
 }
@@ -336,6 +363,8 @@ impl ChatView {
             stick_bottom: true,
             reconnects: Vec::new(),
             last_offset: px(0.),
+            asleep: false,
+            conn: 0,
             focus: cx.focus_handle(),
             _sub: sub,
         };
@@ -345,7 +374,51 @@ impl ChatView {
         }
         this.connect(cx);
         this.load_files(cx);
+        this.watch_idle(cx);
         this
+    }
+
+    /// Revisa cada minuto si el agente lleva [`IDLE_SLEEP`] sin hacer nada.
+    fn watch_idle(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(60)).await;
+            if this.update(cx, |this, cx| this.sleep_if_idle(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Cierra el proceso del agente si está esperando sin nada pendiente.
+    /// La conversación queda en pantalla; el próximo mensaje la retoma.
+    fn sleep_if_idle(&mut self, cx: &mut Context<Self>) {
+        let idle = !self.asleep
+            && self.status == ChatStatus::Ready
+            && self.client.is_some()
+            && self.session.is_some()
+            && self.queue.is_empty()
+            && !self.is_waiting_permission()
+            && self.last_event.elapsed() >= IDLE_SLEEP;
+        if !idle {
+            return;
+        }
+        tracing::info!(agent = self.launch.label, "chat inactivo: se cierra el proceso del agente");
+        self.asleep = true;
+        // El `Exited` que manda el proceso al morir es de una conexión vieja.
+        self.conn += 1;
+        self.client = None;
+        cx.notify();
+    }
+
+    /// Vuelve a abrir un agente dormido, sin avisos en la conversación.
+    fn wake(&mut self, cx: &mut Context<Self>) {
+        if !self.asleep || self.status == ChatStatus::Connecting {
+            return;
+        }
+        self.status = ChatStatus::Connecting;
+        cx.emit(ChatEvent::Status);
+        cx.notify();
+        self.connect_with(true, cx);
     }
 
     pub fn is_waiting_permission(&self) -> bool {
@@ -382,7 +455,10 @@ impl ChatView {
         }
         // Preferencias de la última vez (solo para sesiones nuevas): modelo primero,
         // porque las demás opciones (esfuerzo…) pueden depender de él.
-        let mut prefs: Vec<(String, String)> = if launch.resume.is_none() {
+        let mut prefs: Vec<(String, String)> = if again {
+            // Al reconectar, lo elegido en esta conversación (modelo, esfuerzo…).
+            self.config.iter().map(|o| (o.id.clone(), o.current.clone())).collect()
+        } else if launch.resume.is_none() {
             crate::state::get(cx).settings.chat_prefs.get(launch.label).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
         } else {
             Vec::new()
@@ -432,6 +508,7 @@ impl ChatView {
                             text
                         };
                         if again {
+                            this.asleep = false;
                             this.current_turn().items.push(Item::Notice(format!("Could not reconnect: {hint}")));
                             this.status = ChatStatus::Exited;
                         } else {
@@ -445,15 +522,17 @@ impl ChatView {
                 }
             };
             let events = client.events();
-            let ok = this
+            let conn = this
                 .update(cx, |this, cx| {
-                    if again {
+                    if again && !this.asleep {
                         this.current_turn().items.push(Item::Notice(if resumed {
                             "Reconnected to the agent; the conversation continues.".into()
                         } else {
                             "Reconnected in a new session: this agent can't resume, so it doesn't remember the messages above.".into()
                         }));
                     }
+                    this.asleep = false;
+                    this.conn += 1;
                     this.session = Some(info.id.clone());
                     this.config = info.config;
                     this.client = Some(client);
@@ -478,16 +557,19 @@ impl ChatView {
                         this.dispatch(prompt, Vec::new(), cx);
                     }
                     cx.notify();
+                    this.conn
                 })
-                .is_ok();
-            if !ok {
-                return;
-            }
+                .ok();
+            let Some(conn) = conn else { return };
             while let Ok(first) = events.recv_async().await {
                 let mut batch = vec![first];
                 batch.extend(events.try_iter());
                 let alive = this
                     .update(cx, |this, cx| {
+                        // Proceso cerrado (dormido o reemplazado): sus eventos ya no cuentan.
+                        if this.conn != conn {
+                            return false;
+                        }
                         this.check_manual_scroll();
                         for ev in batch {
                             this.on_event(ev, cx);
@@ -496,8 +578,9 @@ impl ChatView {
                             this.scroll.scroll_to_bottom();
                         }
                         cx.notify();
+                        true
                     })
-                    .is_ok();
+                    .unwrap_or(false);
                 if !alive {
                     break;
                 }
@@ -583,12 +666,12 @@ impl ChatView {
                 }
             },
             Event::MessageChunk(t) => match self.current_turn().items.last_mut() {
-                Some(Item::Agent(s)) => s.push_str(&t),
-                _ => self.current_turn().items.push(Item::Agent(t)),
+                Some(Item::Agent(s)) => append(s, &t),
+                _ => self.current_turn().items.push(Item::Agent(t.into())),
             },
             Event::ThoughtChunk(t) => match self.current_turn().items.last_mut() {
-                Some(Item::Thought(s)) => s.push_str(&t),
-                _ => self.current_turn().items.push(Item::Thought(t)),
+                Some(Item::Thought(s)) => append(s, &t),
+                _ => self.current_turn().items.push(Item::Thought(t.into())),
             },
             Event::ToolCall(call) => {
                 let turn = self.current_turn();
@@ -897,7 +980,7 @@ impl ChatView {
     /// Respuesta del agente en el último turno (para pasarla a la sesión conectada).
     pub fn last_answer(&self) -> Option<String> {
         let turn = self.turns.iter().rev().find(|t| t.items.iter().any(|i| matches!(i, Item::Agent(_))))?;
-        let text: Vec<&str> = turn.items.iter().filter_map(|i| if let Item::Agent(t) = i { Some(t.as_str()) } else { None }).collect();
+        let text: Vec<&str> = turn.items.iter().filter_map(|i| if let Item::Agent(t) = i { Some(t.as_ref()) } else { None }).collect();
         Some(text.join("\n\n").trim().to_string()).filter(|t| !t.is_empty())
     }
 
@@ -957,7 +1040,9 @@ impl ChatView {
         let (Some(client), Some(session)) = (self.client.clone(), self.session.clone()) else {
             self.queue.insert(0, Queued { text, images });
             // Sin agente vivo: se reconecta y el mensaje sale al conectar.
-            if self.status == ChatStatus::Exited {
+            if self.asleep {
+                self.wake(cx);
+            } else if self.status == ChatStatus::Exited {
                 self.reconnect(cx);
             }
             return;
@@ -1009,6 +1094,18 @@ impl ChatView {
     /// Editar el mensaje `#at`: la conversación desde ahí pasa a ser una
     /// versión anterior y se sigue en una sesión nueva con el contexto previo.
     fn fork_at(&mut self, at: usize, text: String, cx: &mut Context<Self>) {
+        // Sin agente vivo no se puede abrir la versión nueva: antes de tocar los
+        // turnos se reconecta (si no, la edición se perdía).
+        if self.client.is_none() {
+            if self.asleep {
+                self.wake(cx);
+            } else if self.status == ChatStatus::Exited {
+                self.reconnect(cx);
+            }
+            self.current_turn().items.push(Item::Notice("Reconnecting to the agent: edit the message again once it's ready.".into()));
+            cx.notify();
+            return;
+        }
         let Some(pos) = self.turns.iter().position(|t| t.user.as_ref().is_some_and(|u| u.n == at)) else {
             self.dispatch(text, Vec::new(), cx);
             return;
@@ -1294,7 +1391,8 @@ impl ChatView {
                 return col;
             }
             let ids = std::mem::take(group);
-            col.child(this.tool_group(ti, turn, &ids, live && last, cx))
+            let el = this.tool_group(ti, turn, &ids, live && last, cx);
+            col.child(Self::arrive(last, format!("arrive-{ti}-g{}", ids[0]), el))
         };
         // Pasos de subagentes: van dentro de la tarjeta de su subagente.
         let tool_ids: HashSet<&str> = turn.items.iter().filter_map(|i| match i {
@@ -1314,7 +1412,8 @@ impl ChatView {
                 continue;
             }
             col = flush(col, &mut group, self, cx);
-            col = col.child(self.render_item(ti, ii, item, live, cx));
+            let el = self.render_item(ti, ii, item, live, cx);
+            col = col.child(Self::arrive(last, format!("arrive-{ti}-{ii}"), el));
         }
         col = flush(col, &mut group, self, cx);
         if last && self.status == ChatStatus::Running {
@@ -1324,6 +1423,14 @@ impl ChatView {
             col = col.child(self.changes_card(ti, turn, live, cx));
         }
         col.into_any_element()
+    }
+
+    /// Lo nuevo del turno en curso entra con un fundido corto; el historial no se anima.
+    fn arrive(current: bool, id: String, el: impl IntoElement) -> AnyElement {
+        match current {
+            true => crate::motion::fade_in(div().child(el), SharedString::from(id), crate::motion::FAST).into_any_element(),
+            false => el.into_any_element(),
+        }
     }
 
     /// Línea viva mientras el agente trabaja: qué hace, cuánto lleva y si está callado.
@@ -1347,18 +1454,23 @@ impl ChatView {
         };
         let elapsed = turn.started.map(|s| s.elapsed()).unwrap_or_default();
         let quiet = self.last_event.elapsed();
-        let color: Hsla = if waiting { rgb(0xfbbf24).into() } else { style::accent().into() };
+        let color: Hsla = if waiting { style::warn().into() } else { style::accent().into() };
         h_flex()
             .gap_2()
             .items_center()
             .text_sm()
-            .child(
-                crate::icons::ui("loader-circle", px(14.), color)
-                    .with_animation("chat-working", Animation::new(Duration::from_millis(1100)).repeat(), |svg, delta| {
-                        svg.with_transformation(Transformation::rotate(percentage(delta)))
-                    }),
-            )
-            .child(div().text_color(color).child(format!("{doing}…")))
+            .child(crate::motion::spinner("chat-working", color, px(14.)))
+            // Como Claude Code: un brillo recorre el verbo mientras trabaja; esperando permiso queda quieto.
+            .child(match waiting {
+                true => div().text_color(color).child(format!("{doing}…")).into_any_element(),
+                false => crate::motion::shimmer(
+                    SharedString::from(format!("chat-verb-{doing}")),
+                    format!("{doing}…"),
+                    style::soft(style::accent(), 0.65),
+                    style::text().into(),
+                )
+                .into_any_element(),
+            })
             .child(div().text_xs().text_color(style::faint()).child(fmt_duration(elapsed)))
             .when(quiet > Duration::from_secs(30) && !waiting, |d| {
                 d.child(div().text_xs().text_color(style::faint()).child(format!("· no output for {}", fmt_duration(quiet))))
@@ -1370,7 +1482,6 @@ impl ChatView {
     fn changes_card(&self, ti: usize, turn: &Turn, live: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (added, removed) = turn.stats();
         let files = turn.files.len();
-        let review: Vec<(PathBuf, Option<String>, String)> = turn.files.iter().map(|(p, (old, new))| (p.clone(), old.clone(), new.clone())).collect();
         let n = turn.user.as_ref().map(|u| u.n).unwrap_or(0);
         let open = self.expanded.contains(&(ti, usize::MAX));
         v_flex()
@@ -1409,16 +1520,19 @@ impl ChatView {
                             .text_color(style::text())
                             .hover(|d| d.bg(style::panel_hover()))
                             .child("Review")
-                            .on_click(cx.listener(move |_, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                cx.emit(ChatEvent::OpenReview { title: format!("Review · message #{n}"), files: review.clone() });
+                                // Se copian los textos al pulsar, no en cada frame.
+                                let Some(turn) = this.shown_turns().get(ti).copied() else { return };
+                                let files = turn.files.iter().map(|(p, (old, new))| (p.clone(), old.clone(), new.clone())).collect();
+                                cx.emit(ChatEvent::OpenReview { title: format!("Review · message #{n}"), files });
                             })),
                     ),
             )
             .when(open, |d| {
                 d.children(turn.files.iter().enumerate().map(|(fi, (path, (old, new)))| {
                     let name = path.strip_prefix(&self.launch.cwd).unwrap_or(path).to_string_lossy().into_owned();
-                    let (a, r) = count_changes(&FileDiff { path: name.clone(), old_text: old.clone(), new_text: new.clone() });
+                    let (a, r) = count_text_changes(old.as_deref(), new);
                     let (path, old) = (path.clone(), old.clone());
                     h_flex()
                         .px_3()
@@ -1588,7 +1702,8 @@ impl ChatView {
                             })),
                     )
                     .when(open, |d| {
-                        d.child(div().mt_1().pl_3().border_l_2().border_color(style::border()).text_xs().text_color(style::muted()).child(text.clone()))
+                        let body = div().mt_1().pl_3().border_l_2().border_color(style::border()).text_xs().text_color(style::muted()).child(text.clone());
+                        d.child(crate::motion::fade_in(body, SharedString::from(format!("open-{key}")), crate::motion::FAST))
                     })
                     .into_any_element()
             }
@@ -1609,14 +1724,14 @@ impl ChatView {
                         .p_3()
                         .rounded_lg()
                         .border_1()
-                        .border_color(style::soft(rgb(0xfbbf24), if pending { 0.7 } else { 0.3 }))
-                        .bg(style::soft(rgb(0xfbbf24), 0.07))
+                        .border_color(style::soft(style::warn(), if pending { 0.7 } else { 0.3 }))
+                        .bg(style::soft(style::warn(), 0.07))
                         .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
                                 .text_sm()
-                                .child(crate::icons::ui("triangle-alert", px(14.), rgb(0xfbbf24)))
+                                .child(crate::icons::ui("triangle-alert", px(14.), style::warn()))
                                 .child(div().flex_1().child(req.title.clone())),
                         )
                         .when(pending, |d| {
@@ -1758,15 +1873,14 @@ impl ChatView {
                     })),
             )
             .when(open, |d| {
-                d.child(
-                    v_flex()
-                        .gap_1p5()
-                        .children(ids.iter().filter_map(|&i| match turn.items.get(i) {
-                            Some(Item::Tool(c)) => Some(self.tool_card(ti * 10_000 + i, c, &steps_of(turn, &c.id), cx)),
-                            Some(it @ Item::Permission { .. }) => Some(self.render_item(ti, i, it, false, cx)),
-                            _ => None,
-                        })),
-                )
+                let body = v_flex()
+                    .gap_1p5()
+                    .children(ids.iter().filter_map(|&i| match turn.items.get(i) {
+                        Some(Item::Tool(c)) => Some(self.tool_card(ti * 10_000 + i, c, &steps_of(turn, &c.id), cx)),
+                        Some(it @ Item::Permission { .. }) => Some(self.render_item(ti, i, it, false, cx)),
+                        _ => None,
+                    }));
+                d.child(crate::motion::fade_in(body, SharedString::from(format!("group-open-{ti}-{first}")), crate::motion::FAST))
             })
             .when(!open, |d| {
                 d.when_some(current, |d, c| d.child(self.tool_card(ti * 10_000 + 9_999, c, &steps_of(turn, &c.id), cx)))
@@ -1840,7 +1954,15 @@ impl ChatView {
                             .child(div().text_color(style::good()).child(format!("+{added}")))
                             .child(div().text_color(style::bad()).child(format!("−{removed}")))
                     }))
-                    .child(crate::icons::ui(status_icon, px(12.), color)),
+                    .child(match status {
+                        // En curso: el ícono parpadea lento, como el punto de Claude Code.
+                        "in_progress" => crate::motion::blink(
+                            div().child(crate::icons::ui(status_icon, px(12.), color)),
+                            SharedString::from(format!("tool-blink-{}", call.id)),
+                        )
+                        .into_any_element(),
+                        _ => crate::icons::ui(status_icon, px(12.), color).into_any_element(),
+                    }),
             )
             .child(
                 div()
@@ -1848,7 +1970,7 @@ impl ChatView {
                     .pt_0p5()
                     .pb_2()
                     .text_xs()
-                    .font_family(crate::style::mono_font())
+                    .font_family(style::mono_font())
                     .text_color(style::muted())
                     .whitespace_normal()
                     .child(title),
@@ -1882,7 +2004,7 @@ impl ChatView {
                         .border_t_1()
                         .border_color(style::border())
                         .text_xs()
-                        .font_family(crate::style::mono_font())
+                        .font_family(style::mono_font())
                         .text_color(style::faint())
                         .child(short),
                 )
@@ -1955,7 +2077,7 @@ impl ChatView {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_family(crate::style::mono_font())
+                                    .font_family(style::mono_font())
                                     .text_color(style::muted())
                                     .child(title.lines().next().unwrap_or("").to_string()),
                             )
@@ -1993,7 +2115,7 @@ impl ChatView {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (status_label, status_color): (String, Hsla) = match &self.status {
-            _ if self.is_waiting_permission() => ("needs you".into(), rgb(0xfbbf24).into()),
+            _ if self.is_waiting_permission() => ("needs you".into(), style::warn().into()),
             ChatStatus::Connecting => ("connecting…".into(), style::faint().into()),
             ChatStatus::Ready => ("ready".into(), style::good().into()),
             ChatStatus::Running => ("working".into(), style::accent().into()),
@@ -2152,7 +2274,7 @@ impl ChatView {
                     .rounded_sm()
                     .cursor_pointer()
                     .bg(if waiting {
-                        rgb(0xfbbf24).into()
+                        style::warn().into()
                     } else if current {
                         style::accent().into()
                     } else {
@@ -2301,7 +2423,7 @@ impl ChatView {
         let color: Hsla = if pct >= 85. {
             style::bad().into()
         } else if pct >= 65. {
-            rgb(0xfbbf24).into()
+            style::warn().into()
         } else {
             style::muted().into()
         };
@@ -2419,9 +2541,11 @@ fn human(n: u64) -> String {
 
 impl Render for ChatView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let turns: Vec<Turn> = self.shown_turns().into_iter().cloned().collect();
+        // Referencias, no copias: clonar los turnos copiaba toda la conversación
+        // (textos, salidas, archivos antes/después) en cada frame.
+        let refs: Vec<&Turn> = self.shown_turns();
+        let turns = &refs;
         let live_upto = if self.viewing.is_some() { 0 } else { usize::MAX };
-        let refs: Vec<&Turn> = turns.iter().collect();
 
         // Prompt fijo: el del turno que estás leyendo, si su burbuja ya pasó.
         let (top, offset) = self.scroll.logical_scroll_top();
@@ -2911,8 +3035,8 @@ impl Render for ChatView {
                         .py_1()
                         .gap_2()
                         .text_xs()
-                        .bg(style::soft(rgb(0xfbbf24), 0.08))
-                        .text_color(rgb(0xfbbf24))
+                        .bg(style::soft(style::warn(), 0.08))
+                        .text_color(style::warn())
                         .child("You're viewing an earlier version (read-only).")
                         .child(
                             div()
@@ -2991,7 +3115,7 @@ fn transcript(turns: &[Turn], max_chars: usize) -> String {
         if let Some(u) = &t.user {
             out.push_str(&format!("User: {}\n", u.text));
         }
-        let answer: String = t.items.iter().filter_map(|i| if let Item::Agent(s) = i { Some(s.as_str()) } else { None }).collect::<Vec<_>>().join("");
+        let answer: String = t.items.iter().filter_map(|i| if let Item::Agent(s) = i { Some(s.as_ref()) } else { None }).collect::<Vec<_>>().join("");
         if !answer.trim().is_empty() {
             out.push_str(&format!("Assistant: {}\n", answer.trim()));
         }
@@ -3008,14 +3132,42 @@ fn text_only(full: &str) -> String {
     full.rsplit_once("\n\n---\n\n").map(|(_, t)| t.to_string()).unwrap_or_else(|| full.to_string())
 }
 
+/// Tiempo sin eventos tras el que se cierra el proceso de un agente que espera.
+const IDLE_SLEEP: Duration = Duration::from_secs(30 * 60);
+
 fn fmt_duration(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
 }
 
+/// Agrega un trozo que llegó por streaming a un texto compartido.
+fn append(s: &mut SharedString, chunk: &str) {
+    let mut text = String::with_capacity(s.len() + chunk.len());
+    text.push_str(s);
+    text.push_str(chunk);
+    *s = text.into();
+}
+
 fn count_changes(d: &FileDiff) -> (usize, usize) {
-    let old = d.old_text.as_deref().unwrap_or("");
-    let diff = similar::TextDiff::from_lines(old, &d.new_text);
+    count_text_changes(d.old_text.as_deref(), &d.new_text)
+}
+
+/// Líneas agregadas y quitadas. Se pide en cada frame por cada tarjeta, así
+/// que el resultado se recuerda por contenido: hashear es mucho más barato que
+/// volver a calcular el diff.
+fn count_text_changes(old: Option<&str>, new: &str) -> (usize, usize) {
+    use std::hash::{Hash, Hasher};
+    thread_local! {
+        static MEMO: std::cell::RefCell<HashMap<u64, (usize, usize)>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    old.hash(&mut h);
+    new.hash(&mut h);
+    let key = h.finish();
+    if let Some(counts) = MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return counts;
+    }
+    let diff = similar::TextDiff::from_lines(old.unwrap_or(""), new);
     let mut added = 0;
     let mut removed = 0;
     for change in diff.iter_all_changes() {
@@ -3025,6 +3177,13 @@ fn count_changes(d: &FileDiff) -> (usize, usize) {
             similar::ChangeTag::Equal => {}
         }
     }
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(key, (added, removed));
+    });
     (added, removed)
 }
 

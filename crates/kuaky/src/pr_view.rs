@@ -99,7 +99,7 @@ impl PrView {
     fn status(&self) -> (String, Hsla) {
         if let Some(Ok(d)) = &self.detail {
             if d.state == "MERGED" {
-                return ("Merged".into(), rgb(0xa78bfa).into());
+                return ("Merged".into(), style::merged().into());
             }
         }
         if self.pr.is_draft {
@@ -114,9 +114,9 @@ impl PrView {
         };
         match state.as_str() {
             "CLEAN" | "HAS_HOOKS" => ("Ready to merge".into(), style::good().into()),
-            "BEHIND" => ("Behind the base branch (can still merge)".into(), rgb(0xfbbf24).into()),
-            "BLOCKED" => ("Blocked: needs approval or checks".into(), rgb(0xfbbf24).into()),
-            "UNSTABLE" => ("Checks failing".into(), rgb(0xfbbf24).into()),
+            "BEHIND" => ("Behind the base branch (can still merge)".into(), style::warn().into()),
+            "BLOCKED" => ("Blocked: needs approval or checks".into(), style::warn().into()),
+            "UNSTABLE" => ("Checks failing".into(), style::warn().into()),
             _ => ("Checking…".into(), style::muted().into()),
         }
     }
@@ -132,8 +132,8 @@ pub fn merge_button(id: impl Into<ElementId>, conflicts: bool, small: bool) -> S
         .rounded_md()
         .cursor_pointer()
         .font_weight(FontWeight::MEDIUM)
-        .when(conflicts, |d| d.bg(style::soft(rgb(0xfbbf24), 0.18)).text_color(rgb(0xfbbf24)).hover(|d| d.bg(style::soft(rgb(0xfbbf24), 0.28))))
-        .when(!conflicts, |d| d.bg(style::accent()).text_color(style::bg()).hover(|d| d.opacity(0.9)))
+        .when(conflicts, |d| d.bg(style::soft(style::warn(), 0.18)).text_color(style::warn()).hover(|d| d.bg(style::soft(style::warn(), 0.28))))
+        .when(!conflicts, |d| d.bg(style::accent()).text_color(style::on_accent()).hover(|d| d.opacity(0.9)))
         .child(if conflicts { "Resolve & merge" } else { "Merge" })
 }
 

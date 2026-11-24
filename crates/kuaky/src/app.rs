@@ -121,6 +121,8 @@ pub struct KuakyApp {
     /// Observer of each open project (same order as `projects`).
     project_subs: Vec<Subscription>,
     settings: Option<Entity<SettingsView>>,
+    /// Memoria de kuaky y sus agentes (se mide cada 5 s).
+    memory: Option<crate::memory::Usage>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,7 +146,18 @@ impl KuakyApp {
                 }
             }
         });
-        let mut this = Self { home, projects: Vec::new(), active: None, project_subs: Vec::new(), settings: None, _subscriptions: vec![sub, obs] };
+        // Con el modo "system", el tema sigue al claro/oscuro del sistema operativo.
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| crate::theme::apply(Some(window), cx));
+        let mut this = Self {
+            home,
+            projects: Vec::new(),
+            active: None,
+            project_subs: Vec::new(),
+            settings: None,
+            memory: None,
+            _subscriptions: vec![sub, obs, appearance],
+        };
+        this.watch_memory(cx);
         let capture = std::env::var_os("KUAKY_SCREENSHOT").is_some();
         if let Some(path) = std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_dir()) {
             this.open_project(path, window, cx);
@@ -198,6 +211,14 @@ impl KuakyApp {
             .unwrap_or(6);
         cx.spawn_in(window, async move |_, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(delay)).await;
+            // An off-screen window gets no frames from macOS, so animations would be
+            // captured at their first frame. Draw once, let them finish, then capture.
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .ok();
+            cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
             cx.update(|window, cx| {
                 window.refresh();
                 let arena = window.draw(cx);
@@ -376,6 +397,56 @@ impl KuakyApp {
         .detach();
     }
 
+    /// Mide la memoria cada 5 s; solo redibuja si cambió al menos 1 MB.
+    fn watch_memory(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            let usage = cx.background_executor().spawn(async { crate::memory::sample() }).await;
+            let Some(usage) = usage else { break };
+            let alive = this
+                .update(cx, |this, cx| {
+                    let mb = |u: Option<crate::memory::Usage>| u.map(|u| (u.app >> 20, u.children >> 20, u.child_count));
+                    if mb(this.memory) != mb(Some(usage)) {
+                        this.memory = Some(usage);
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+            cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+        })
+        .detach();
+    }
+
+    /// Memoria en la barra de título: total, con el desglose al pasar el mouse.
+    fn memory_chip(&self) -> Option<impl IntoElement> {
+        use crate::memory::format;
+        let usage = self.memory?;
+        // Más de 1.5 GB solo en kuaky ya es para revisar.
+        let heavy = usage.app > 1536 << 20;
+        let tip: SharedString = format!(
+            "Memory · kuaky {} · agents and tools {} ({} process{})",
+            format(usage.app),
+            format(usage.children),
+            usage.child_count,
+            if usage.child_count == 1 { "" } else { "es" },
+        )
+        .into();
+        Some(
+            div()
+                .id("memory")
+                .px_1p5()
+                .py_0p5()
+                .rounded_md()
+                .text_xs()
+                .text_color(if heavy { style::warn() } else { style::faint() })
+                .hover(|d| d.bg(style::panel_hover()))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .child(format(usage.total())),
+        )
+    }
+
     fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The title bar keeps 80 px for the macOS window buttons, which are hidden
         // in full screen: there, pull the content back to the left edge.
@@ -416,12 +487,20 @@ impl KuakyApp {
                     })))
                 })
                 .child(
-                    div()
+                    h_flex()
                         .id("brand")
+                        .gap_1p5()
+                        .items_center()
                         .cursor_pointer()
                         .mr_1()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(style::accent())
+                        .map(|d| match style::brand_mark() {
+                            // Carteles japoneses: un sol de acento y el nombre en tinta.
+                            true => d
+                                .text_color(style::text())
+                                .child(div().size(px(11.)).rounded_full().bg(style::accent())),
+                            false => d.text_color(style::accent()),
+                        })
                         .child("kuaky")
                         .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
                 )
@@ -463,6 +542,7 @@ impl KuakyApp {
                         .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
                 )
                 .child(div().flex_1())
+                .children(self.memory_chip())
                 .children(crate::updater::title_button(cx))
                 .when(has_project, |d| {
                     d.child(
@@ -589,15 +669,15 @@ impl Render for KuakyApp {
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
             .child(self.title_bar(window, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .map(|d| match self.current() {
-                        Some(project) => d.child(project.clone()),
-                        None => d.child(self.home.clone()),
-                    }),
-            )
+            .child(crate::motion::fade_in(
+                // Al cambiar entre Home y un proyecto, la vista nueva entra con un fundido corto.
+                div().flex_1().min_h_0().map(|d| match self.current() {
+                    Some(project) => d.child(project.clone()),
+                    None => d.child(self.home.clone()),
+                }),
+                SharedString::from(format!("view-{:?}", self.active)),
+                crate::motion::FAST,
+            ))
             .when_some(self.settings.clone(), |d, view| {
                 d.child(
                     div()
@@ -615,7 +695,8 @@ impl Render for KuakyApp {
                             this.settings = None;
                             cx.notify();
                         }))
-                        .child(div().id("settings-box").on_click(|_, _, cx| cx.stop_propagation()).child(view)),
+                        .child(div().id("settings-box").on_click(|_, _, cx| cx.stop_propagation()).child(view))
+                        .with_animation("settings-in", crate::motion::once(crate::motion::FAST), |d, t| d.opacity(t)),
                 )
             })
     }

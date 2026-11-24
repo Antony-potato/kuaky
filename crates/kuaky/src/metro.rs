@@ -105,11 +105,11 @@ pub(super) struct Train {
 }
 
 fn line_color(c: u32) -> Rgba {
-    rgb(c)
+    crate::style::lane(c)
 }
 
 fn amber() -> Rgba {
-    rgb(0xfbbf24)
+    crate::style::warn()
 }
 
 /// Un título de terminal que vale como resumen de la tarea (no el nombre del

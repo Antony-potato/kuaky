@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Propuestas de diseño kuaky</title>
+<style>
+  :root {
+    --page: #111110; --card: #1a1a18; --line: #2c2b28; --ink: #ecebe6; --dim: #9a9893;
+    --mono: "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink); font: 15px/1.55 var(--sans); }
+  main { max-width: 1180px; margin: 0 auto; padding: 48px 16px 96px; }
+  h1 { font-size: 34px; letter-spacing: -0.02em; margin: 0 0 6px; }
+  h2 { font-size: 24px; margin: 0; letter-spacing: -0.01em; }
+  h3 { font: 600 12px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 28px 0 10px; }
+  p { margin: 0 0 12px; color: #d4d2cc; max-width: 75ch; }
+  .lead { color: var(--dim); font-size: 17px; }
+  code { font: 13px var(--mono); background: #232320; padding: 1px 5px; border-radius: 3px; }
+  section { border-top: 1px solid var(--line); padding-top: 36px; margin-top: 48px; }
+  .tag { font: 600 11px/1 var(--mono); letter-spacing: .1em; padding: 5px 8px; border: 1px solid currentColor; display: inline-block; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 860px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+  figure { margin: 0; }
+  figure img { width: 100%; display: block; border: 1px solid var(--line); }
+  figcaption { font: 12px var(--mono); color: var(--dim); margin-top: 6px; }
+  ul { margin: 0 0 12px; padding-left: 20px; color: #d4d2cc; }
+  li { margin: 4px 0; }
+  .swatches { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+  .sw { width: 92px; font: 11px/1.3 var(--mono); color: var(--dim); }
+  .sw i { display: block; height: 40px; border: 1px solid #ffffff1f; margin-bottom: 4px; }
+  .head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
+  .reco { background: #1f1d18; border: 1px solid #3a352a; padding: 18px 20px; margin-top: 24px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  td, th { border-bottom: 1px solid var(--line); padding: 8px 10px 8px 0; text-align: left; vertical-align: top; }
+  th { font: 600 11px var(--mono); letter-spacing: .08em; color: var(--dim); text-transform: uppercase; }
+  .mock { overflow: hidden; }
+  .anim-demo { animation: rise .42s cubic-bezier(.16,1,.3,1) both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+  /* ---------- Mock A: Etiqueta ---------- */
+  .A { background: #0a0a0b; color: #e8e6e1; font-family: var(--sans); border: 1px solid #26262d; }
+  .A .bar { display: flex; align-items: center; gap: 12px; padding: 8px 14px; border-bottom: 1px solid #26262d; font: 700 13px var(--mono); }
+  .A .bar b { color: #ff6a1a; letter-spacing: .02em; }
+  .A .bar span { color: #a3a3ab; font-weight: 400; }
+  .A .body { padding: 16px; display: grid; gap: 12px; }
+  .A .label { border: 1.5px solid #e8e6e1; display: grid; grid-template-columns: 74px 1fr; }
+  .A .label .big { background: #e8e6e1; color: #0a0a0b; font: 800 54px/1 var(--sans); display: grid; place-items: center; letter-spacing: -0.04em; }
+  .A .fields { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .A .f { padding: 8px 10px; border-left: 1px solid #e8e6e14d; border-bottom: 1px solid #e8e6e14d; }
+  .A .f small { display: block; font: 600 9.5px var(--mono); letter-spacing: .1em; color: #a3a3ab; }
+  .A .f strong { font: 700 22px/1.25 var(--sans); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .A .barcode { grid-column: 1 / -1; height: 26px; margin: 8px 10px; background: repeating-linear-gradient(90deg, #e8e6e1 0 2px, transparent 2px 4px, #e8e6e1 4px 5px, transparent 5px 8px, #e8e6e1 8px 11px, transparent 11px 12px); }
+  .A .sec { display: flex; align-items: center; gap: 10px; font: 700 11px var(--mono); letter-spacing: .12em; }
+  .A .sec::after { content: ""; flex: 1; border-top: 1px dashed #6b6b75; }
+  .A .sec em { font-style: normal; background: #e8e6e1; color: #0a0a0b; padding: 3px 6px; }
+  .A .row { display: grid; grid-template-columns: 36px 1fr auto auto; gap: 12px; align-items: center; border: 1px solid #26262d; padding: 8px 10px; transition: background .12s, border-color .12s; }
+  .A .row:hover { background: #1a1a1f; border-color: #6b6b75; }
+  .A .idx { font: 600 11px var(--mono); color: #a3a3ab; }
+  .A .t { font-weight: 600; font-size: 14px; } .A .t small { display: block; color: #a3a3ab; font: 11px var(--mono); }
+  .A .dots { display: flex; gap: 4px; } .A .dots i { width: 9px; height: 9px; background: currentColor; display: block; }
+  .A .needs { background: repeating-linear-gradient(135deg, #f2b134 0 6px, #0a0a0b 6px 12px); width: 52px; height: 18px; }
+  .A .btn { font: 700 12px var(--mono); letter-spacing: .08em; background: #ff6a1a; color: #0a0a0b; padding: 8px 12px; justify-self: end; border-radius: 4px; }
+  .A .label, .A .row { border-radius: 4px; }
+  .A .label .big { border-radius: 3px 0 0 3px; }
+  .A .strip { display: flex; gap: 18px; flex-wrap: wrap; font: 500 10px var(--mono); letter-spacing: .1em; color: #6b6b75; border-top: 1px solid #26262d; padding: 8px 14px; }
+  .A.light { background: #f4f2ed; color: #0a0a0b; border-color: #b8b8be; }
+  .A.light .bar, .A.light .strip { border-color: #b8b8be; }
+  .A.light .bar b, .A.light .sec em { color: #e25510; }
+  .A.light .bar span, .A.light .idx, .A.light .t small, .A.light .f small { color: #5a5a63; }
+  .A.light .label { border-color: #0a0a0b; }
+  .A.light .label .big { background: #0a0a0b; color: #f4f2ed; }
+  .A.light .f { border-color: #0a0a0b33; }
+  .A.light .barcode { background: repeating-linear-gradient(90deg, #0a0a0b 0 2px, transparent 2px 4px, #0a0a0b 4px 5px, transparent 5px 8px, #0a0a0b 8px 11px, transparent 11px 12px); }
+  .A.light .sec em { background: transparent; padding: 0; }
+  .A.light .sec::after { border-color: #b8b8be; }
+  .A.light .row { border-color: #b8b8be; }
+  .A.light .row:hover { background: #e8e6e1; border-color: #0a0a0b; }
+  .A.light .btn { background: #e25510; }
+  .A.light .needs { background: repeating-linear-gradient(135deg, #b7791f 0 6px, #f4f2ed 6px 12px); }
+  .A .sec em { background: transparent; color: #ff6a1a; padding: 0; }
+  @media (max-width: 620px) {
+    .A .label { grid-template-columns: 52px 1fr; }
+    .A .label .big { font-size: 38px; }
+    .A .fields { grid-template-columns: 1fr 1fr; }
+    .A .row { grid-template-columns: 30px 1fr auto; }
+    .A .row .dots, .A .row .needs { display: none; }
+  }
+
+  /* ---------- Mock B: Rejilla ---------- */
+  .B { background: #050505; color: #f2f2f2; font-family: var(--mono); border: 1px solid #3a3a3a;
+       background-image: linear-gradient(#ffffff0a 1px, transparent 1px), linear-gradient(90deg, #ffffff0a 1px, transparent 1px); background-size: 24px 24px; }
+  .B .bar { display: flex; gap: 0; border-bottom: 1px solid #f2f2f2; font-size: 12px; }
+  .B .bar > * { padding: 7px 12px; border-right: 1px solid #3a3a3a; }
+  .B .bar .on { background: #f2f2f2; color: #050505; font-weight: 700; }
+  .B .body { display: grid; grid-template-columns: 1.1fr 1fr; }
+  .B .cell { border-right: 1px solid #3a3a3a; border-bottom: 1px solid #3a3a3a; padding: 12px; position: relative; }
+  .B .cell::before { content: ""; position: absolute; left: -1px; top: -1px; width: 7px; height: 7px; border-left: 2px solid #f2f2f2; border-top: 2px solid #f2f2f2; }
+  .B .k { font-size: 10px; color: #a3a3a3; letter-spacing: .14em; }
+  .B .num { font: 700 38px/1.1 var(--mono); letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+  .B .num small { font-size: 13px; color: #a3a3a3; }
+  .B .alert { display: inline-block; background: #f08a24; color: #050505; font-weight: 700; font-size: 11px; padding: 2px 6px; margin-bottom: 6px; }
+  .B .gauge { width: 112px; height: 112px; border-radius: 50%; margin: 4px auto 0;
+     background: conic-gradient(#f08a24 0 151deg, #3a3a3a 151deg 360deg); display: grid; place-items: center; animation: spin-in .9s cubic-bezier(.2,0,0,1) both; }
+  .B .gauge div { width: 84px; height: 84px; border-radius: 50%; background: #050505; border: 1px dashed #5c5c5c; display: grid; place-items: center; font-weight: 700; font-size: 20px; }
+  @keyframes spin-in { from { transform: rotate(-90deg); opacity: 0; } }
+  .B .rows { grid-column: 1 / -1; }
+  .B .r { display: grid; grid-template-columns: 54px 1fr 120px 58px; border-bottom: 1px solid #3a3a3a; font-size: 12px; transition: background .1s; }
+  .B .r:hover { background: #161616; }
+  .B .r > * { padding: 7px 10px; border-right: 1px solid #3a3a3a; }
+  .B .r .id { color: #a3a3a3; }
+  .B .bars { display: flex; gap: 2px; align-items: center; } .B .bars i { width: 6px; height: 12px; background: currentColor; display: block; }
+  .B .x { background: linear-gradient(45deg, transparent 49%, #5c5c5c 49% 51%, transparent 51%), linear-gradient(-45deg, transparent 49%, #5c5c5c 49% 51%, transparent 51%); }
+  .B .blink { animation: blink 1s steps(2) infinite; } @keyframes blink { 50% { opacity: 0; } }
+
+  /* ---------- Mock C: Sumi / Papel ---------- */
+  .C { font-family: var(--sans); border: 1px solid #342e27; position: relative; }
+  .C.dark { background: #14120f; color: #efe6d4; }
+  .C.light { background: #f3ecdd; color: #1b1915; border-color: #d3c6ab; }
+  .C .bar { display: flex; align-items: center; gap: 10px; padding: 9px 14px; font-size: 13px; border-bottom: 1px solid #342e27; }
+  .C.light .bar { border-color: #d3c6ab; }
+  .C .sun { width: 16px; height: 16px; border-radius: 50%; background: #d1402a; }
+  .C.light .sun { background: #c8371f; }
+  .C .body { display: grid; grid-template-columns: 1fr 42px; padding: 18px 16px 18px 20px; gap: 12px; }
+  .C .vert { writing-mode: vertical-rl; font: 600 15px "Hiragino Mincho ProN", "Yu Mincho", serif; letter-spacing: .3em; color: #d1402a; border-left: 1px solid currentColor; padding-left: 8px; }
+  .C.light .vert { color: #c8371f; }
+  .C h4 { font: 600 30px/1.1 "Hiragino Mincho ProN", "Yu Mincho", Georgia, serif; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .C .sub { font-size: 12px; opacity: .7; margin-bottom: 14px; }
+  .C .kpis { display: flex; gap: 22px; margin-bottom: 16px; }
+  .C .kpis div { font: 600 24px/1 "Hiragino Mincho ProN", Georgia, serif; font-variant-numeric: tabular-nums; }
+  .C .kpis small { display: block; font: 11px var(--sans); opacity: .65; margin-top: 4px; }
+  .C .item { display: grid; grid-template-columns: 4px 1fr auto; gap: 12px; padding: 9px 0; border-top: 1px solid #342e27; align-items: center; transition: padding-left .18s; }
+  .C.light .item { border-color: #d3c6ab; }
+  .C .item:hover { padding-left: 6px; }
+  .C .item i { align-self: stretch; display: block; border-radius: 2px; }
+  .C .item b { font-weight: 600; font-size: 14px; } .C .item small { display: block; font-size: 12px; opacity: .65; }
+  .C .stamp { font: 700 11px var(--sans); border: 1.5px solid currentColor; border-radius: 3px; padding: 2px 6px; color: #d1402a; transform: rotate(-4deg); }
+  .C.light .stamp { color: #c8371f; }
+  .C .btn { display: inline-block; background: #d1402a; color: #fffaf2; font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 4px; }
+  .C.light .btn { background: #c8371f; color: #fbf6ec; }
+  .C .halftone { position: absolute; right: 52px; top: 52px; width: 110px; height: 110px; border-radius: 50%; opacity: .16;
+       background: radial-gradient(circle, #d1402a 1.4px, transparent 1.6px) 0 0 / 7px 7px; pointer-events: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Propuestas de diseño para kuaky</h1>
+  <div class="reco" style="margin:18px 0 24px"><p style="margin:0"><b>Decisión (24/11/2026): se eligió la C · Sumi / Papel</b> y ya está en la app con sus animaciones. Sumi es el tema oscuro y Papel el claro; por defecto kuaky sigue el modo del sistema. Kuaky Original sigue disponible en Settings → Appearance. A y B se quedan aquí solo como registro.</p></div>
+  <p class="lead">Tres direcciones basadas en tus referencias. El diseño actual quedó guardado como el tema <b>Kuaky Original</b> y en la etiqueta de git <code>diseno-original-v0</code>. Los cinco temas ya funcionan en la app (Settings → Appearance). Las maquetas de abajo muestran además la estructura y la tipografía, que todavía no están en el código.</p>
+
+  <section>
+    <div class="head"><h2>0 · Qué está mal hoy</h2></div>
+    <div class="grid2">
+      <figure><img src="capturas/actual-home.png" alt="Home actual de kuaky"><figcaption>Home actual · acento #5eead4</figcaption></figure>
+      <figure><img src="capturas/actual-proyecto.png" alt="Proyecto actual de kuaky"><figcaption>Proyecto actual</figcaption></figure>
+    </div>
+    <h3>Diagnóstico</h3>
+    <ul>
+      <li><b>El turquesa #5eead4 es neón:</b> está muy saturado y muy claro sobre un fondo casi negro y azulado. Vibra, compite con el texto y aparece en todo (logo, rama, carpeta, botón, selección), así que deja de señalar nada.</li>
+      <li><b>El gris es azulado</b> (#0b0c0f, #13151a). Junto con el turquesa da el look genérico de "dashboard SaaS".</li>
+      <li><b>Todo tiene el mismo peso:</b> títulos, filas y metadatos casi del mismo tamaño. No hay jerarquía, ni números grandes, ni etiquetas.</li>
+      <li><b>Las líneas del metro usan 8 colores Tailwind saturados</b>. Con el turquesa suman demasiados neones a la vez.</li>
+      <li><b>No hay estructura visible:</b> mucho espacio vacío sin rejilla y bordes casi invisibles (#22262e). Tus referencias hacen lo contrario: marcos, divisiones y etiquetas que ordenan la información.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== A ===================== -->
+  <section>
+    <div class="head"><h2>A · Etiqueta</h2><span class="tag" style="color:#ff6a1a">RECOMENDADA</span><span style="color:var(--dim)">refs 1 y 2: etiquetas de envío y empaques industriales</span></div>
+    <p><b>Es la línea visual de tu portafolio</b> (su <code>DESIGN.md</code>: "workstation editorial") llevada a kuaky. Cada bloque de información es una <b>etiqueta</b>: marco de 1 px, una letra grande como índice, campos en mono mayúsculas y el valor grande al lado. Secciones con eyebrow numerada <code>// 01</code> y una tira de metadatos al estilo TP-7 en la barra de estado. Un solo <b>naranja #ff6a1a</b> con la regla 60-30-10. Azul acero para la salida de tokens. Tiene par claro (papel <code>#f4f2ed</code>) para el modo System.</p>
+    <div class="grid2">
+      <div class="mock A anim-demo">
+        <div class="bar"><b>KUAKY</b><span>/ HOME</span><span style="margin-left:auto">EXP.05 · 24/11/2026</span></div>
+        <div class="body">
+          <div class="label">
+            <div class="big">U</div>
+            <div class="fields">
+              <div class="f"><small>TOKENS · 30D</small><strong>343M</strong></div>
+              <div class="f"><small>COST</small><strong>$2,647</strong></div>
+              <div class="f"><small>SESSIONS</small><strong>934</strong></div>
+              <div class="barcode"></div>
+            </div>
+          </div>
+          <div class="sec"><em>// 01</em>WORK IN PROGRESS · 16 LINES</div>
+          <div class="row"><span class="idx">[A1]</span><span class="t">Monto de Andreina Herrera<small>LAST · no necesita desplegar backend</small></span><span class="dots" style="color:#ff6a1a"><i></i><i></i><i></i><i></i></span><span class="idx">4/4</span></div>
+          <div class="row"><span class="idx">[A2]</span><span class="t">Caché de Firebase en disco<small>LAST · caché de Firebase y tablero</small></span><span class="dots" style="color:#8099cb"><i></i><i></i><i></i></span><span class="idx">3/8</span></div>
+          <div class="row"><span class="idx">[A3]</span><span class="t">Quitar cartera de E. Santos<small>NEEDS YOU · permiso pendiente</small></span><span class="needs"></span><span class="idx">1/1</span></div>
+          <div class="btn">OPEN FOLDER →</div>
+        </div>
+        <div class="strip"><span>MAIN</span><span>OPUS 5.5</span><span>934 RESP</span><span>CLAUDE 5H 42%</span><span>WEEK 18%</span></div>
+      </div>
+      <div class="mock A light anim-demo">
+        <div class="bar"><b>KUAKY</b><span>/ HOME</span><span style="margin-left:auto">24/11/2026</span></div>
+        <div class="body">
+          <div class="label">
+            <div class="big">U</div>
+            <div class="fields">
+              <div class="f"><small>TOKENS · 30D</small><strong>343M</strong></div>
+              <div class="f"><small>COST</small><strong>$2,647</strong></div>
+              <div class="f"><small>SESSIONS</small><strong>934</strong></div>
+              <div class="barcode"></div>
+            </div>
+          </div>
+          <div class="sec"><em>// 01</em>WORK IN PROGRESS · 16 LINES</div>
+          <div class="row"><span class="idx">[A1]</span><span class="t">Monto de Andreina Herrera<small>LAST · no necesita desplegar backend</small></span><span class="dots" style="color:#e25510"><i></i><i></i><i></i><i></i></span><span class="idx">4/4</span></div>
+          <div class="row"><span class="idx">[A2]</span><span class="t">Caché de Firebase en disco<small>LAST · caché de Firebase y tablero</small></span><span class="dots" style="color:#3d5a99"><i></i><i></i><i></i></span><span class="idx">3/8</span></div>
+          <div class="row"><span class="idx">[A3]</span><span class="t">Quitar cartera de E. Santos<small>NEEDS YOU · permiso pendiente</small></span><span class="needs"></span><span class="idx">1/1</span></div>
+          <div class="btn">OPEN FOLDER →</div>
+        </div>
+        <div class="strip"><span>MAIN</span><span>OPUS 5.5</span><span>934 RESP</span><span>CLAUDE 5H 42%</span><span>WEEK 18%</span></div>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:16px">
+    </div>
+    <h3>Paleta</h3>
+    <div class="swatches">
+      <div class="sw"><i style="background:#0a0a0b"></i>background<br>#0a0a0b</div>
+      <div class="sw"><i style="background:#161616"></i>surface<br>#161616</div>
+      <div class="sw"><i style="background:#26262d"></i>border<br>#26262d</div>
+      <div class="sw"><i style="background:#e8e6e1"></i>text<br>#e8e6e1</div>
+      <div class="sw"><i style="background:#ff6a1a"></i>accent<br>#ff6a1a</div>
+      <div class="sw"><i style="background:#8099cb"></i>output<br>#8099cb</div>
+      <div class="sw"><i style="background:#f2b134"></i>warning<br>#f2b134</div>
+      <div class="sw"><i style="background:#2fbf71"></i>success<br>#2fbf71</div>
+      <div class="sw"><i style="background:#f4f2ed"></i>papel (claro)<br>#f4f2ed</div>
+      <div class="sw"><i style="background:#e25510"></i>acento (claro)<br>#e25510</div>
+    </div>
+    <h3>Estructura</h3>
+    <ul>
+      <li>Radio de 4 px, bordes de 1 px, sin sombras (igual que tu portafolio). Las secciones llevan eyebrow <code>// 01 — TÍTULO</code> en mono y una línea punteada.</li>
+      <li>Fuentes Geist y Geist Mono incluidas en la app. Títulos de campo en mono, mayúsculas, 10 px, tracking +0.08em. Números grandes en sans 800 tabulares.</li>
+      <li>Regla 60-30-10: si hay tres cosas naranjas a la vista sin jerarquía, está mal. El naranja es para el botón principal, la línea viva y la sesión activa.</li>
+      <li>Índices tipo <code>[A1]</code> en filas de sesiones y líneas. Rayas amarillas y negras de "precaución" para <i>needs you</i>.</li>
+      <li>Código de barras decorativo con datos reales (el uid de la sesión) en la tarjeta de uso y en la barra de estado.</li>
+      <li>Las líneas del metro pasan de 8 colores neón a 8 tonos apagados: acero, lila, crema, verde, ocre.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== B ===================== -->
+  <section>
+    <div class="head"><h2>B · Rejilla</h2><span style="color:var(--dim)">ref 3: monitor táctico, rejilla visible</span></div>
+    <p>La pantalla es una <b>rejilla</b>. Cada panel es una celda con línea de 1 px y una escuadra en la esquina, los números van en monoespaciada grande, las alertas son bloques naranjas sólidos, el consumo se muestra con un medidor circular y las celdas vacías con una X. Es la más llamativa, pero también la más cansada para usar 8 horas.</p>
+    <div class="grid2">
+      <div class="mock B anim-demo">
+        <div class="bar"><span class="on">KUAKY</span><span>HOME</span><span>andiani-tablero</span><span style="margin-left:auto;border:0">02:59:34 <span class="blink">▌</span></span></div>
+        <div class="body">
+          <div class="cell"><div class="k">TOKENS / 30D</div><div class="num">343<small>M</small></div><div class="k" style="margin-top:10px">COST</div><div class="num" style="font-size:26px">$2,647</div></div>
+          <div class="cell"><span class="alert">LIMIT 5H</span><div class="gauge"><div>42%</div></div></div>
+          <div class="rows">
+            <div class="r"><span class="id">701</span><span>Monto de Andreina Herrera</span><span class="bars" style="color:#f08a24"><i></i><i></i><i></i><i></i></span><span>4/4</span></div>
+            <div class="r"><span class="id">702</span><span>Caché de Firebase en disco</span><span class="bars" style="color:#4aa3df"><i></i><i></i><i></i></span><span>3/8</span></div>
+            <div class="r"><span class="id">703</span><span><span class="alert" style="margin:0 6px 0 0">NEEDS YOU</span>Quitar cartera</span><span class="bars" style="color:#ffd23f"><i></i></span><span>1/1</span></div>
+            <div class="r"><span class="id">704</span><span class="x" style="min-height:30px"></span><span></span><span>—</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <h3>Paleta</h3>
+    <div class="swatches">
+      <div class="sw"><i style="background:#050505"></i>background<br>#050505</div>
+      <div class="sw"><i style="background:#0c0c0c"></i>surface<br>#0c0c0c</div>
+      <div class="sw"><i style="background:#3a3a3a"></i>border<br>#3a3a3a</div>
+      <div class="sw"><i style="background:#f2f2f2"></i>text<br>#f2f2f2</div>
+      <div class="sw"><i style="background:#f08a24"></i>accent<br>#f08a24</div>
+      <div class="sw"><i style="background:#4aa3df"></i>output<br>#4aa3df</div>
+      <div class="sw"><i style="background:#ffd23f"></i>warning<br>#ffd23f</div>
+      <div class="sw"><i style="background:#7cc49a"></i>success<br>#7cc49a</div>
+    </div>
+    <h3>Estructura</h3>
+    <ul>
+      <li>Radio 0 en todo. La rejilla de fondo es muy tenue (4 % de blanco) y los bordes de panel son claros.</li>
+      <li>Toda la tipografía es monoespaciada. Los ids de sesión funcionan como "número de unidad" (701, 702…).</li>
+      <li>Medidor circular para los límites de 5 h y de la semana. Cursor parpadeante cuando un agente trabaja.</li>
+      <li>Riesgo: con tanta línea, el editor y el diff pueden sentirse cargados. Habría que dejar la rejilla solo en Home y en los paneles laterales.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== C ===================== -->
+  <section>
+    <div class="head"><h2>C · Sumi / Papel</h2><span style="color:var(--dim)">ref 4: carteles japoneses, versión de noche y de día</span></div>
+    <p>Cálida y editorial: <b>tinta sumi</b> y <b>papel washi</b>, un sol bermellón como marca, títulos en serif (Hiragino Mincho, incluida en macOS), una etiqueta vertical por sección y un sello para lo que necesita tu atención. Es la única que tiene par claro/oscuro natural, para el modo <i>System</i>.</p>
+    <div class="grid2">
+      <div class="mock C dark anim-demo">
+        <div class="bar"><span class="sun"></span><b>kuaky</b><span style="opacity:.6">· home</span></div>
+        <div class="halftone"></div>
+        <div class="body">
+          <div>
+            <h4>Agent usage</h4><div class="sub">26 oct — hoy</div>
+            <div class="kpis"><div>343M<small>tokens</small></div><div>$2,647<small>costo</small></div><div>934<small>respuestas</small></div></div>
+            <div class="item"><i style="background:#d1402a"></i><span><b>Monto de Andreina Herrera</b><small>no necesita desplegar backend</small></span><span>4/4</span></div>
+            <div class="item"><i style="background:#7d97c9"></i><span><b>Caché de Firebase en disco</b><small>caché de Firebase y tablero</small></span><span>3/8</span></div>
+            <div class="item"><i style="background:#e3b23c"></i><span><b>Quitar cartera de E. Santos</b><small>permiso pendiente</small></span><span class="stamp">TE TOCA</span></div>
+            <div style="margin-top:14px"><span class="btn">Open folder</span></div>
+          </div>
+          <div class="vert">進行中の作業</div>
+        </div>
+      </div>
+      <div class="mock C light anim-demo">
+        <div class="bar"><span class="sun"></span><b>kuaky</b><span style="opacity:.6">· home</span></div>
+        <div class="body">
+          <div>
+            <h4>Agent usage</h4><div class="sub">26 oct — hoy</div>
+            <div class="kpis"><div>343M<small>tokens</small></div><div>$2,647<small>costo</small></div><div>934<small>respuestas</small></div></div>
+            <div class="item"><i style="background:#c8371f"></i><span><b>Monto de Andreina Herrera</b><small>no necesita desplegar backend</small></span><span>4/4</span></div>
+            <div class="item"><i style="background:#243c74"></i><span><b>Caché de Firebase en disco</b><small>caché de Firebase y tablero</small></span><span>3/8</span></div>
+            <div class="item"><i style="background:#b7791f"></i><span><b>Quitar cartera de E. Santos</b><small>permiso pendiente</small></span><span class="stamp">TE TOCA</span></div>
+            <div style="margin-top:14px"><span class="btn">Open folder</span></div>
+          </div>
+          <div class="vert">進行中の作業</div>
+        </div>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:16px">
+      <figure><img src="capturas/sumi-home.png" alt="Tema Sumi en la app"><figcaption>Tema Sumi en la app</figcaption></figure>
+      <figure><img src="capturas/papel-proyecto.png" alt="Tema Papel en la app"><figcaption>Tema Papel en la app</figcaption></figure>
+    </div>
+    <h3>Paleta (noche · día)</h3>
+    <div class="swatches">
+      <div class="sw"><i style="background:#14120f"></i>sumi<br>#14120f</div>
+      <div class="sw"><i style="background:#efe6d4"></i>washi<br>#efe6d4</div>
+      <div class="sw"><i style="background:#d1402a"></i>shu (noche)<br>#d1402a</div>
+      <div class="sw"><i style="background:#7d97c9"></i>ai (noche)<br>#7d97c9</div>
+      <div class="sw"><i style="background:#f3ecdd"></i>papel<br>#f3ecdd</div>
+      <div class="sw"><i style="background:#1b1915"></i>tinta<br>#1b1915</div>
+      <div class="sw"><i style="background:#c8371f"></i>shu (día)<br>#c8371f</div>
+      <div class="sw"><i style="background:#243c74"></i>ai (día)<br>#243c74</div>
+    </div>
+    <h3>Estructura</h3>
+    <ul>
+      <li>Serif solo en títulos y números grandes. La interfaz sigue en la fuente del sistema para que se lea bien.</li>
+      <li>Trama de medio tono (puntos) muy tenue detrás de los números de Home, como impresión en offset.</li>
+      <li>Sello rojo girado para <i>needs you</i>. Etiqueta vertical en japonés como adorno de sección (se puede quitar).</li>
+      <li>Riesgo: el bermellón se parece al rojo de error. Por eso <code>danger</code> es carmín/beni y siempre va con icono.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== Animaciones ===================== -->
+  <section>
+    <div class="head"><h2>Animaciones sencillas (para cualquier propuesta)</h2></div>
+    <p>Corregidas con tus guías: las reglas de animación de tu <code>DESIGN.md</code> (§6) y la guía de movimiento de la skill <code>hyperframes</code>. Dos cambios frente a la primera versión: quité el pulso en bucle de la línea del metro y que todo entre con fundido y subiendo, porque son justo lo que hace que una interfaz parezca genérica.</p>
+    <table>
+      <tr><th>#</th><th>Dónde</th><th>Qué</th><th>Curva · duración</th></tr>
+      <tr><td>1</td><td>Cambiar Home ↔ proyecto</td><td>Fundido sin desplazamiento: sale en 90 ms, entra en 160 ms</td><td>salida / out-expo</td></tr>
+      <tr><td>2</td><td>Filas de sesiones y líneas al cargar</td><td>El texto pasa de gris a tinta, fila por fila, 50 ms entre filas (máx. 8). Sin moverse</td><td>out-expo · 200 ms</td></tr>
+      <tr><td>3</td><td>Números de Home al cambiar de rango</td><td>Los dígitos ruedan como un contador mecánico (tabulares, ancho fijo)</td><td>out-expo · 320 ms</td></tr>
+      <tr><td>4</td><td>Línea del metro con agente trabajando</td><td>Un segmento recorre el último tramo a velocidad constante, como una barra de progreso. Sin pulsos</td><td>lineal · 1.2 s, repite</td></tr>
+      <tr><td>5</td><td><i>Needs you</i></td><td>Las rayas de precaución entran una vez deslizándose y se quedan quietas</td><td>out-expo · 240 ms</td></tr>
+      <tr><td>6</td><td>Settings y menús</td><td>Entran con opacidad y escala de 98 % a 100 %; salen solo con opacidad, más rápido</td><td>out-expo 160 ms / salida 90 ms</td></tr>
+      <tr><td>7</td><td>Indicador de pestaña y del rango de días</td><td>Se desliza a la nueva opción con resorte amortiguado (0.85, sin rebote visible)</td><td>resorte · ~240 ms</td></tr>
+      <tr><td>8</td><td>Barras de límite (5 h / semana)</td><td>Se llenan desde 0 la primera vez que se abre Home</td><td>out-expo · 320 ms</td></tr>
+    </table>
+    <h3>Lo que no se hace</h3>
+    <ul>
+      <li>Rebotes, "respiraciones" o pulsos en bucle en la interfaz.</li>
+      <li>Hover que eleva la tarjeta con sombra (lo propone <code>design-whimsy-injector</code>, pero choca con tu estilo sin sombras).</li>
+      <li>Animar todo lo que aparece, o animar dentro del editor, el diff o la terminal.</li>
+      <li>Desenfoques: GPUI no los tiene en elementos, así que las transiciones con blur de HyperFrames se cambian por fundidos cortos.</li>
+    </ul>
+    <p>"Reducir movimiento" de macOS ya lo respeta <code>with_animation</code> de GPUI: todo se muestra quieto sin código extra. <b>Remotion y HyperFrames</b> son para videos, no para la app. Sirven si luego quieres un video de demo de kuaky (mejor HyperFrames, por licencia).</p>
+  </section>
+
+  <section>
+    <div class="head"><h2>Recomendación</h2></div>
+    <div class="reco">
+      <p><b>A · Etiqueta (oscuro) + Etiqueta Claro.</b> Es tu propia línea visual, así que kuaky queda en familia con tu portafolio. Conserva la lectura cómoda de un editor y le da identidad (marcos, índices, eyebrows numeradas, un solo naranja), lejos del look genérico. Rejilla, Sumi y Papel quedan como temas alternos porque ya funcionan. Las animaciones 1, 2, 6 y 7 son las de más impacto con menos código.</p>
+      <p style="margin:0">Las tres direcciones se pueden mezclar: por ejemplo, la estructura de Etiqueta con la paleta de Sumi. Dime cuál eliges (o qué mezcla) y en la siguiente fase meto radios, tipografía, componentes de etiqueta y animaciones.</p>
+    </div>
+  </section>
+</main>
+</body>
+</html>

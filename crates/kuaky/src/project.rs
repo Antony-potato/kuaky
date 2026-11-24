@@ -2217,7 +2217,7 @@ impl ProjectView {
                     )
                 })
                 // State dot; on hover it gives way to rename / close.
-                .child(div().size(px(7.)).flex_none().rounded_full().bg(dot_color).group_hover(group.clone(), |s| s.invisible()))
+                .child(status_dot(i, dot_color, group.clone()))
                 .child(
                     h_flex()
                         .absolute()
@@ -2313,13 +2313,7 @@ impl ProjectView {
             format!("{} subagent{} done", subs.len(), if subs.len() == 1 { "" } else { "s" })
         };
         let now = jiff::Timestamp::now();
-        let spinner = |id: SharedString, color: Hsla| {
-            icons::ui("loader-circle", px(11.), color)
-                .with_animation(id, Animation::new(Duration::from_millis(1100)).repeat(), |svg, delta| {
-                    svg.with_transformation(Transformation::rotate(percentage(delta)))
-                })
-                .into_any_element()
-        };
+        let spinner = |id: SharedString, color: Hsla| crate::motion::spinner(id, color, px(11.)).into_any_element();
         const MAX_ROWS: usize = 4;
         let shown: Vec<&crate::agent_tasks::Subagent> = subs.iter().rev().take(MAX_ROWS).collect();
         let more = subs.len().saturating_sub(MAX_ROWS);
@@ -2624,7 +2618,7 @@ impl ProjectView {
                                         .py_1()
                                         .rounded_md()
                                         .cursor_pointer()
-                                        .when_some(p.custom_color, |d, c| d.border_l_2().border_color(rgb(c)))
+                                        .when_some(p.custom_color, |d, c| d.border_l_2().border_color(style::lane(c)))
                                         .hover(|d| d.bg(style::panel_hover()))
                                         .child(harness_badge(h))
                                         .child(
@@ -2791,7 +2785,7 @@ impl ProjectView {
                     .cursor_pointer()
                     .border_r_1()
                     .border_color(style::border())
-                    .when_some(accent_color, |d, c| d.border_t_2().border_color(rgb(c)))
+                    .when_some(accent_color, |d, c| d.border_t_2().border_color(style::lane(c)))
                     .text_color(if active { style::text() } else { style::muted() })
                     .when(active, |d| d.bg(style::bg()))
                     .hover(|d| d.text_color(style::text()))
@@ -2896,7 +2890,7 @@ impl ProjectView {
                 .size_full()
                 .min_w_0()
                 .child(self.tab_bar(cx))
-                .child(div().flex_1().min_h_0().child(Self::tab_view(&self.tabs[i].kind)))
+                .child(tab_in(&self.tabs[i], div().flex_1().min_h_0().child(Self::tab_view(&self.tabs[i].kind))))
         });
         let session_pane = session.map(|i| {
             div()
@@ -2913,7 +2907,7 @@ impl ProjectView {
                         }
                     }),
                 )
-                .child(Self::tab_view(&self.tabs[i].kind))
+                .child(tab_in(&self.tabs[i], div().size_full().child(Self::tab_view(&self.tabs[i].kind))))
         });
         let content = match (session_pane, doc_pane) {
             (Some(s), Some(d)) => h_resizable("center-split")
@@ -2997,7 +2991,7 @@ impl ProjectView {
             .items_center()
             .justify_center()
             .gap_4()
-            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child(name))
+            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).when_some(style::display_font(), |d, f| d.font_family(f).text_3xl()).child(name))
             .child(div().text_sm().text_color(style::muted()).child(match &self.git.branch {
                 Some(b) => format!("{} · branch {b}", tilde(&self.root)),
                 None => tilde(&self.root),
@@ -3301,7 +3295,7 @@ impl ProjectView {
                 let color = if max_used >= 90.0 {
                     style::bad()
                 } else if max_used >= 75.0 {
-                    rgb(0xfbbf24)
+                    style::warn()
                 } else {
                     style::muted()
                 };
@@ -3463,7 +3457,7 @@ impl ProjectView {
                                                 .text_xs()
                                                 .cursor_pointer()
                                                 .bg(style::accent())
-                                                .text_color(style::bg())
+                                                .text_color(style::on_accent())
                                                 .child("Resolve conflicts")
                                                 .on_click(cx.listener(move |this, _, window, cx| {
                                                     this.open_conflicts(files.clone(), window, cx);
@@ -3888,7 +3882,7 @@ impl ProjectView {
                                     .font_weight(FontWeight::MEDIUM)
                                     .cursor_pointer()
                                     .bg(style::accent())
-                                    .text_color(style::bg())
+                                    .text_color(style::on_accent())
                                     .child(if busy { "Working…" } else { "Merge" })
                                     .on_click(cx.listener(|this, _, window, cx| this.run_merge(MergeMethod::Merge, window, cx))),
                             ),
@@ -3993,7 +3987,7 @@ impl ProjectView {
                                             .size(px(20.))
                                             .rounded_full()
                                             .cursor_pointer()
-                                            .bg(rgb(hex))
+                                            .bg(style::lane(hex))
                                             .when(active, |d| d.border_2().border_color(style::text()))
                                             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -4038,7 +4032,7 @@ impl ProjectView {
                                     .font_weight(FontWeight::MEDIUM)
                                     .cursor_pointer()
                                     .bg(style::accent())
-                                    .text_color(style::bg())
+                                    .text_color(style::on_accent())
                                     .child("Save")
                                     .on_click(cx.listener(|this, _, _, cx| this.confirm_rename(cx))),
                             ),
@@ -4162,7 +4156,8 @@ impl Render for ProjectView {
                             this.quick_open = None;
                             cx.notify();
                         }))
-                        .child(div().id("quick-open-box").on_click(|_, _, cx| cx.stop_propagation()).child(qo)),
+                        .child(div().id("quick-open-box").on_click(|_, _, cx| cx.stop_propagation()).child(qo))
+                        .with_animation("quick-open-in", crate::motion::once(crate::motion::FAST), |d, t| d.opacity(t)),
                 )
             })
             .when_some(self.rename_modal.as_ref().map(|m| self.rename_overlay(m, cx)), |d, el| d.child(el))
@@ -4192,6 +4187,25 @@ fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
     } else {
         ("idle", style::good().into())
     }
+}
+
+/// Al cambiar de pestaña, su contenido entra con un fundido corto.
+fn tab_in(tab: &Tab, content: Div) -> gpui_kit::AnimationElement<Div> {
+    crate::motion::fade_in(content, SharedString::from(format!("tab-in-{:?}", tab.id)), crate::motion::FAST)
+}
+
+/// Punto de estado de una sesión. Cuando cambia de estado entra con un fundido;
+/// si pasa a "te necesita" (rojo), destella dos veces y se queda quieto.
+fn status_dot(i: usize, color: Hsla, hover_group: SharedString) -> gpui_kit::AnimationElement<Div> {
+    let alarm = color == Hsla::from(style::bad());
+    let id = SharedString::from(format!("dot-{i}-{:.3}-{:.3}", color.h, color.l));
+    let (duration, ease) = (if alarm { Duration::from_millis(700) } else { crate::motion::NORMAL }, crate::motion::enter());
+    // Al pasar el mouse por la fila, el punto deja lugar a renombrar / cerrar.
+    let dot = div().size(px(7.)).flex_none().rounded_full().bg(color).group_hover(hover_group, |s| s.invisible());
+    dot.with_animation(id, Animation::new(duration), move |d, t| {
+        let o = if alarm { 1. - 0.75 * (t * 2. * std::f32::consts::PI).sin().abs() } else { ease(t) };
+        d.opacity(o)
+    })
 }
 
 fn chat_status(c: &ChatView) -> (&'static str, Hsla) {

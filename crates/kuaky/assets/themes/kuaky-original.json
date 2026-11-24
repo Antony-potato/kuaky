@@ -1,0 +1,51 @@
+{
+  "name": "Kuaky Original",
+  "appearance": "dark",
+  "author": "kuaky",
+  "description": "El diseño hasta noviembre de 2026: grafito azulado con acento turquesa. Se conserva tal cual.",
+  "kit": "default",
+  "primitives": {
+    "ink.950": "#0b0c0f",
+    "ink.900": "#13151a",
+    "ink.850": "#1a1d24",
+    "ink.800": "#22262e",
+    "ink.500": "#555b66",
+    "ink.400": "#8a909c",
+    "ink.50": "#e8eaee",
+    "teal.300": "#5eead4",
+    "violet.400": "#a78bfa",
+    "green.400": "#4ade80",
+    "red.400": "#f87171",
+    "amber.400": "#fbbf24",
+    "blue.400": "#60a5fa",
+    "gray.500": "#6b7280"
+  },
+  "tokens": {
+    "background": "{ink.950}",
+    "surface": "{ink.900}",
+    "surface.hover": "{ink.850}",
+    "border": "{ink.800}",
+    "text": "{ink.50}",
+    "text.muted": "{ink.400}",
+    "text.faint": "{ink.500}",
+    "accent": "{teal.300}",
+    "accent.foreground": "{ink.950}",
+    "data.output": "{violet.400}",
+    "data.other": "{gray.500}",
+    "status.success": "{green.400}",
+    "status.danger": "{red.400}",
+    "status.warning": "{amber.400}",
+    "status.info": "{blue.400}",
+    "status.merged": "{violet.400}"
+  },
+  "categorical": [],
+  "agents": {
+    "claude": "#e07a5f",
+    "codex": "#34d399",
+    "gemini": "#60a5fa",
+    "antigravity": "#fbbf24",
+    "opencode": "#d1d5db",
+    "grok": "#c4b5fd"
+  },
+  "shape": { "radius": 6, "radius.lg": 8 }
+}

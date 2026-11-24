@@ -223,7 +223,7 @@ impl Render for FileView {
                             })
                             .when(warnings > 0, |d| {
                                 let label = if warnings == 1 { "1 warning".into() } else { format!("{warnings} warnings") };
-                                d.child(div().text_color(rgb(0xfbbf24)).child(label))
+                                d.child(div().text_color(style::warn()).child(label))
                             })
                     })
                     .when(self.dirty, |d| d.child(div().text_color(style::accent()).child("● unsaved · ⌘S")))

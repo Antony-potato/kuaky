@@ -57,6 +57,30 @@ pub struct Settings {
     /// applied to every new chat session: agent label → option id → value.
     #[serde(default)]
     pub chat_prefs: HashMap<String, HashMap<String, String>>,
+    /// Tema de la interfaz (como Zed: modo + un tema claro y uno oscuro).
+    #[serde(default)]
+    pub theme: ThemeSettings,
+}
+
+/// `mode`: `system` (por defecto, sigue al sistema operativo), `light` o `dark`.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
+pub struct ThemeSettings {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub dark: String,
+    #[serde(default)]
+    pub light: String,
+}
+
+impl ThemeSettings {
+    pub fn dark_or_default(&self) -> &str {
+        if self.dark.is_empty() { crate::theme::DEFAULT_DARK } else { &self.dark }
+    }
+
+    pub fn light_or_default(&self) -> &str {
+        if self.light.is_empty() { crate::theme::DEFAULT_LIGHT } else { &self.light }
+    }
 }
 
 impl Settings {

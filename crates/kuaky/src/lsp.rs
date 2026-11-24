@@ -258,8 +258,8 @@ impl LspStore {
 
 fn diagnostic_color(severity: Option<lsp_types::DiagnosticSeverity>) -> Hsla {
     match severity {
-        Some(lsp_types::DiagnosticSeverity::WARNING) => rgb(0xfbbf24).into(),
-        Some(lsp_types::DiagnosticSeverity::INFORMATION) => rgb(0x60a5fa).into(),
+        Some(lsp_types::DiagnosticSeverity::WARNING) => style::warn().into(),
+        Some(lsp_types::DiagnosticSeverity::INFORMATION) => style::info().into(),
         Some(lsp_types::DiagnosticSeverity::HINT) => style::muted().into(),
         _ => style::bad().into(),
     }

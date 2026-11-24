@@ -1,5 +1,6 @@
 //! Paleta y formatos de kuaky.
 
+use crate::theme;
 use gpui_kit::{Hsla, Rgba, rgb, rgba};
 use kuaky_usage::{Agent, Provider};
 
@@ -14,41 +15,80 @@ pub fn mono_font() -> &'static str {
     }
 }
 
+// Colores: leen el tema activo (ver `theme.rs`). Los nombres cortos se
+// conservan para no tocar cada vista; el comentario dice qué token semántico leen.
+
+
+/// `background`
 pub fn bg() -> Rgba {
-    rgb(0x0b0c0f)
+    theme::with(|p| p.background)
 }
+/// `surface`
 pub fn panel() -> Rgba {
-    rgb(0x13151a)
+    theme::with(|p| p.surface)
 }
+/// `surface.hover`
 pub fn panel_hover() -> Rgba {
-    rgb(0x1a1d24)
+    theme::with(|p| p.surface_hover)
 }
+/// `border`
 pub fn border() -> Rgba {
-    rgb(0x22262e)
+    theme::with(|p| p.border)
 }
+/// `text`
 pub fn text() -> Rgba {
-    rgb(0xe8eaee)
+    theme::with(|p| p.text)
 }
+/// `text.muted`
 pub fn muted() -> Rgba {
-    rgb(0x8a909c)
+    theme::with(|p| p.text_muted)
 }
+/// `text.faint`
 pub fn faint() -> Rgba {
-    rgb(0x555b66)
+    theme::with(|p| p.text_faint)
 }
 
-/// Acento de kuaky: entrada de tokens.
+/// `accent`: acción principal y entrada de tokens.
 pub fn accent() -> Rgba {
-    rgb(0x5eead4)
+    theme::with(|p| p.accent)
 }
-/// Salida de tokens.
+/// `accent.foreground`: texto sobre el acento.
+pub fn on_accent() -> Rgba {
+    theme::with(|p| p.accent_foreground)
+}
+/// `data.output`: salida de tokens.
 pub fn output() -> Rgba {
-    rgb(0xa78bfa)
+    theme::with(|p| p.data_output)
 }
+/// `status.success`
 pub fn good() -> Rgba {
-    rgb(0x4ade80)
+    theme::with(|p| p.success)
 }
+/// `status.danger`
 pub fn bad() -> Rgba {
-    rgb(0xf87171)
+    theme::with(|p| p.danger)
+}
+/// `status.warning`
+pub fn warn() -> Rgba {
+    theme::with(|p| p.warning)
+}
+/// `status.info`
+pub fn info() -> Rgba {
+    theme::with(|p| p.info)
+}
+/// `status.merged`
+pub fn merged() -> Rgba {
+    theme::with(|p| p.merged)
+}
+
+/// Fuente de títulos y números grandes del tema (`None` = la de la interfaz).
+pub fn display_font() -> Option<gpui_kit::SharedString> {
+    theme::with(|p| p.display_font.clone())
+}
+
+/// El tema pide el sol de acento junto al nombre de kuaky.
+pub fn brand_mark() -> bool {
+    theme::with(|p| p.brand_mark)
 }
 
 /// El acento con una opacidad entre 0 y 1 (heatmap, fondos suaves).
@@ -64,24 +104,53 @@ pub fn soft(color: Rgba, alpha: f32) -> Hsla {
     c
 }
 
-pub fn provider_color(p: Provider) -> Rgba {
-    match p {
-        Provider::Anthropic => rgb(0xe07a5f),
-        Provider::OpenAI => rgb(0x34d399),
-        Provider::Google => rgb(0x60a5fa),
-        Provider::XAi => rgb(0xc4b5fd),
-        Provider::Other => rgb(0x6b7280),
+/// Familias de los colores categóricos que se guardan en `state.json`
+/// (líneas, sesiones, ramas del grafo). Cada tema pinta la familia `i` con
+/// su `categorical[i]`, así un color guardado cambia con el tema.
+const LANE_FAMILIES: [&[u32]; 8] = [
+    &[0x5eead4, 0x2dd4bf],           // turquesa
+    &[0xa78bfa],                     // violeta
+    &[0xe07a5f, 0xfb923c],           // coral / naranja
+    &[0x60a5fa],                     // azul
+    &[0xf472b6],                     // rosa
+    &[0x4ade80, 0xa3e635],           // verde / lima
+    &[0xfbbf24, 0xfacc15],           // ámbar
+    &[0xf87171, 0x38bdf8],           // rojo (y el celeste del grafo)
+];
+
+/// Color categórico guardado (`0xrrggbb`) pintado con el tema activo.
+pub fn lane(c: u32) -> Rgba {
+    theme::with(|p| {
+        LANE_FAMILIES
+            .iter()
+            .position(|fam| fam.contains(&c))
+            .and_then(|i| p.categorical.get(i).copied())
+            .unwrap_or_else(|| rgb(c))
+    })
+}
+
+fn agent_key(a: Agent) -> &'static str {
+    match a {
+        Agent::ClaudeCode => "claude",
+        Agent::Codex => "codex",
+        Agent::GeminiCli => "gemini",
+        Agent::Antigravity => "antigravity",
+        Agent::OpenCode => "opencode",
+        Agent::Grok => "grok",
     }
 }
 
 pub fn agent_color(a: Agent) -> Rgba {
-    match a {
-        Agent::ClaudeCode => rgb(0xe07a5f),
-        Agent::Codex => rgb(0x34d399),
-        Agent::GeminiCli => rgb(0x60a5fa),
-        Agent::Antigravity => rgb(0xfbbf24),
-        Agent::OpenCode => rgb(0xd1d5db),
-        Agent::Grok => rgb(0xc4b5fd),
+    theme::with(|p| p.agents.get(agent_key(a)).copied().unwrap_or(p.text_muted))
+}
+
+pub fn provider_color(p: Provider) -> Rgba {
+    match p {
+        Provider::Anthropic => agent_color(Agent::ClaudeCode),
+        Provider::OpenAI => agent_color(Agent::Codex),
+        Provider::Google => agent_color(Agent::GeminiCli),
+        Provider::XAi => agent_color(Agent::Grok),
+        Provider::Other => theme::with(|p| p.data_other),
     }
 }
 

@@ -115,7 +115,7 @@ impl GraphView {
                                 let c = lane_color(row.color);
                                 (style::soft(c, 0.16), c, style::soft(c, 0.45))
                             }
-                            RefKind::Tag => (style::soft(rgb(0xfbbf24), 0.15), rgb(0xfbbf24), style::soft(rgb(0xfbbf24), 0.4)),
+                            RefKind::Tag => (style::soft(style::warn(), 0.15), style::warn(), style::soft(style::warn(), 0.4)),
                             RefKind::RemoteBranch => (style::panel_hover().into(), style::muted(), style::border().into()),
                         };
                         div()
@@ -196,7 +196,7 @@ impl Render for GraphView {
 }
 
 fn lane_color(idx: usize) -> Rgba {
-    rgb(LANE_COLORS[idx % LANE_COLORS.len()])
+    style::lane(LANE_COLORS[idx % LANE_COLORS.len()])
 }
 
 fn lane_x(origin_x: Pixels, col: usize) -> Pixels {

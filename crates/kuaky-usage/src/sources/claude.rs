@@ -12,7 +12,6 @@ use std::{
     collections::HashMap,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 pub struct ClaudeCode {
@@ -77,6 +76,18 @@ mod cache {
         Some((meta.len(), modified))
     }
 
+    /// Cada cuánto se reescribe como mucho el caché.
+    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    /// `true` si el caché no existe o se guardó hace más de [`SAVE_EVERY`].
+    pub fn is_stale(path: &Path) -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age >= SAVE_EVERY)
+    }
+
     pub fn load(path: &Path) -> HashMap<PathBuf, (Stamp, Vec<Entry>)> {
         std::fs::read(path)
             .ok()
@@ -88,6 +99,7 @@ mod cache {
     pub fn decode(entries: &[Entry]) -> Vec<Keyed> {
         let mut models: HashMap<&str, Arc<str>> = HashMap::new();
         let mut sessions: HashMap<&str, Arc<str>> = HashMap::new();
+        let mut projects: HashMap<&str, Arc<str>> = HashMap::new();
         entries
             .iter()
             .filter_map(|e| {
@@ -100,7 +112,7 @@ mod cache {
                         ts: jiff::Timestamp::from_millisecond(e.t).ok()?,
                         model,
                         session,
-                        project: e.p.as_deref().map(Arc::from),
+                        project: e.p.as_deref().map(|p| projects.entry(p).or_insert_with(|| Arc::from(p)).clone()),
                         input: e.i,
                         output: e.o,
                         cache_read: e.r,
@@ -171,7 +183,10 @@ impl Source for ClaudeCode {
             })
             .collect();
         let changed = results.iter().any(|r| r.3) || results.len() != cache.len();
-        if changed {
+        // Las sesiones activas cambian en cada recarga y se releen igual, así
+        // que reescribir el caché entero (decenas de MB) cada vez no ahorra
+        // nada: basta con guardarlo de vez en cuando.
+        if changed && cache_path.as_deref().is_some_and(cache::is_stale) {
             if let Some(path) = &cache_path {
                 cache::save(path, &results);
             }
@@ -283,7 +298,7 @@ fn parse_line(line: &str, fallback_session: &str, interner: &mut Interner) -> Op
             ts,
             model: interner.get(&model),
             session: interner.get(&session),
-            project: parsed.cwd.map(|c| Arc::from(c.as_str())),
+            project: parsed.cwd.map(|c| interner.get(&c)),
             input: usage.input_tokens,
             output: usage.output_tokens,
             cache_read: usage.cache_read_input_tokens,
