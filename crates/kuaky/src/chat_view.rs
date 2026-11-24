@@ -253,6 +253,9 @@ pub struct ChatView {
     suggestion_ix: usize,
     input: Entity<TextareaState>,
     scroll: ScrollHandle,
+    /// Seguir el final mientras llega texto. Lo apaga subir con la rueda;
+    /// lo enciende volver al final, "Jump to latest" o mandar un mensaje.
+    stick_bottom: bool,
     focus: FocusHandle,
     _sub: Subscription,
 }
@@ -326,6 +329,7 @@ impl ChatView {
             suggestion_ix: 0,
             input,
             scroll: ScrollHandle::new(),
+            stick_bottom: true,
             focus: cx.focus_handle(),
             _sub: sub,
         };
@@ -440,11 +444,10 @@ impl ChatView {
                 batch.extend(events.try_iter());
                 let alive = this
                     .update(cx, |this, cx| {
-                        let at_bottom = this.at_bottom();
                         for ev in batch {
                             this.on_event(ev, cx);
                         }
-                        if at_bottom {
+                        if this.stick_bottom {
                             this.scroll.scroll_to_bottom();
                         }
                         cx.notify();
@@ -733,6 +736,7 @@ impl ChatView {
                 self.expanded.insert((ti, ii));
             }
         }
+        self.stick_bottom = false;
         self.scroll.scroll_to_top_of_item(ti);
         cx.notify();
     }
@@ -874,6 +878,7 @@ impl ChatView {
         }
         cx.emit(ChatEvent::Prompt(text));
         self.status = ChatStatus::Running;
+        self.stick_bottom = true;
         self.scroll.scroll_to_bottom();
         cx.emit(ChatEvent::Status);
         cx.notify();
@@ -1029,12 +1034,14 @@ impl ChatView {
         } else {
             prompts.iter().find(|&&i| i > top).copied().unwrap_or(*prompts.last().unwrap())
         };
+        self.stick_bottom = false;
         self.scroll.scroll_to_top_of_item(target);
         cx.notify();
     }
 
     fn go_to(&mut self, index: usize, cx: &mut Context<Self>) {
         self.prompt_list = false;
+        self.stick_bottom = false;
         self.scroll.scroll_to_top_of_item(index);
         cx.notify();
     }
@@ -1835,6 +1842,32 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// Tu mensaje del turno que lees, fijo arriba del chat (clic: ir a él).
+    fn sticky_prompt(&self, i: usize, user: &UserMsg, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .id("sticky-prompt")
+            .occlude()
+            .w_full()
+            .max_w(px(Self::COLUMN))
+            .mx_auto()
+            .px_3()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(style::border())
+            .bg(style::panel())
+            .shadow_md()
+            .text_xs()
+            .cursor_pointer()
+            .child(div().text_color(style::faint()).child(format!("#{}", user.n)))
+            .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(crate::lines::short(&user.text, 160)))
+            .child(crate::icons::ui("arrow-up", px(11.), style::faint()))
+            .on_click(cx.listener(move |this, _, _, cx| this.go_to(i, cx)))
+            .into_any_element()
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (status_label, status_color): (String, Hsla) = match &self.status {
             _ if self.is_waiting_permission() => ("needs you".into(), rgb(0xfbbf24).into()),
@@ -2236,7 +2269,21 @@ impl Render for ChatView {
             .min_w_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
+                let dy = ev.delta.pixel_delta(px(16.)).y;
+                if dy > px(0.) {
+                    // Subiste: deja de seguir el final aunque estés cerca.
+                    this.stick_bottom = false;
+                } else if dy < px(0.) {
+                    // Bajando: vuelve a seguir al llegar al final.
+                    let max = this.scroll.max_offset().y;
+                    let below = max + this.scroll.offset().y + dy;
+                    if max <= px(0.) || below <= px(8.) {
+                        this.stick_bottom = true;
+                    }
+                }
+                cx.notify();
+            }))
             .px_6()
             .pt_4()
             .when(turns.is_empty() && matches!(self.status, ChatStatus::Ready | ChatStatus::Connecting), |d| {
@@ -2269,6 +2316,7 @@ impl Render for ChatView {
                 .into_any_element(),
             _ => {
                 let away = !turns.is_empty() && !self.at_bottom();
+                let sticky_prompt = sticky.map(|(i, user)| self.sticky_prompt(i, &user, cx));
                 let running = self.status == ChatStatus::Running;
                 div()
                     .flex()
@@ -2278,6 +2326,8 @@ impl Render for ChatView {
                     .relative()
                     .child(conversation)
                     .child(self.prompt_rail(&refs, cx))
+                    // Prompt fijo flotando arriba: no cambia el alto del chat (si no, brinca).
+                    .when_some(sticky_prompt, |d, p| d.child(div().absolute().top_0().left_0().right(px(14.)).px_6().pt_1().child(p)))
                     // Flecha para bajar al final (con punto si el agente sigue trabajando).
                     .when(away, |d| {
                         d.child(
@@ -2302,6 +2352,7 @@ impl Render for ChatView {
                                         d.child(div().absolute().top(px(-2.)).right(px(-2.)).size(px(9.)).rounded_full().bg(style::accent()))
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
+                                        this.stick_bottom = true;
                                         this.scroll.scroll_to_bottom();
                                         cx.notify();
                                     })),
@@ -2666,29 +2717,6 @@ impl Render for ChatView {
                 )
             })
             .when_some(self.plan_panel(cx), |d, p| d.child(div().px_6().child(p)))
-            .when_some(sticky, |d, (i, user)| {
-                d.child(
-                    div().px_6().pt_1().child(
-                        h_flex()
-                            .id("sticky-prompt")
-                            .w_full()
-                            .max_w(px(Self::COLUMN))
-                            .mx_auto()
-                            .px_3()
-                            .py_1()
-                            .gap_2()
-                            .items_center()
-                            .rounded_lg()
-                            .bg(style::panel_hover())
-                            .text_xs()
-                            .cursor_pointer()
-                            .child(div().text_color(style::faint()).child(format!("#{}", user.n)))
-                            .child(div().flex_1().min_w_0().truncate().text_color(style::muted()).child(crate::lines::short(&user.text, 160)))
-                            .child(crate::icons::ui("arrow-up", px(11.), style::faint()))
-                            .on_click(cx.listener(move |this, _, _, cx| this.go_to(i, cx))),
-                    ),
-                )
-            })
             .child(body)
             .when_some(queue, |d, q| d.child(div().px_6().child(q)))
             .when_some(suggestions, |d, s| d.child(div().px_6().child(s)))
