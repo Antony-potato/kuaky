@@ -14,6 +14,7 @@ use crate::search_view::{SearchEvent, SearchView};
 use crate::state::{self, SavedSession};
 use crate::style::{self, human};
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::resizable::{ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -133,8 +134,33 @@ impl Harness {
     }
 }
 
+const SESSION_COLORS: &[(&str, u32)] = &[
+    ("Teal", 0x5eead4),
+    ("Violet", 0xa78bfa),
+    ("Coral", 0xe07a5f),
+    ("Blue", 0x60a5fa),
+    ("Green", 0x4ade80),
+    ("Amber", 0xfbbf24),
+    ("Pink", 0xf472b6),
+    ("Red", 0xf87171),
+];
+
+struct RenameSession {
+    tab_id: usize,
+    input: Entity<InputState>,
+    color: Option<u32>,
+    _sub: Subscription,
+}
+
 enum TabKind {
-    Terminal { view: Entity<TerminalView>, harness: Harness, worktree: Option<String>, cwd: PathBuf },
+    Terminal {
+        view: Entity<TerminalView>,
+        harness: Harness,
+        worktree: Option<String>,
+        cwd: PathBuf,
+        custom_name: Option<String>,
+        custom_color: Option<u32>,
+    },
     File(Entity<FileView>),
     Diff(Entity<DiffView>),
     #[allow(dead_code)]
@@ -235,6 +261,7 @@ pub struct ProjectView {
     /// Previous sessions from the last time this project was open.
     previous: Vec<SavedSession>,
     quick_open: Option<Entity<QuickOpen>>,
+    rename_modal: Option<RenameSession>,
     layout: Entity<ResizableState>,
     lsp: Entity<crate::lsp::LspStore>,
     _subs: Vec<Subscription>,
@@ -298,6 +325,7 @@ impl ProjectView {
             focus: cx.focus_handle(),
             previous: saved.sessions.clone(),
             quick_open: None,
+            rename_modal: None,
             layout,
             lsp,
             _subs: vec![sub, layout_sub, right_split_sub, lsp_sub],
@@ -340,12 +368,12 @@ impl ProjectView {
             .tabs
             .iter()
             .filter_map(|t| match &t.kind {
-                TabKind::Terminal { harness, worktree, cwd, view } if !view.read(cx).exited => Some(SavedSession {
+                TabKind::Terminal { harness, worktree, cwd, view, custom_name, custom_color } if !view.read(cx).exited => Some(SavedSession {
                     harness: harness.key().to_string(),
                     cwd: cwd.to_string_lossy().into_owned(),
                     worktree: worktree.clone(),
-                    custom_name: None,
-                    custom_color: None,
+                    custom_name: custom_name.clone(),
+                    custom_color: *custom_color,
                 }),
                 _ => None,
             })
@@ -369,7 +397,41 @@ impl ProjectView {
         let Some(harness) = Harness::from_key(&saved.harness) else { return };
         let cwd = PathBuf::from(&saved.cwd);
         let cwd = if cwd.is_dir() { cwd } else { self.root.clone() };
-        self.spawn_terminal(harness, cwd, saved.worktree, true, window, cx);
+        self.spawn_terminal(harness, cwd, saved.worktree, true, saved.custom_name, saved.custom_color, window, cx);
+    }
+
+    fn open_rename_modal(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let TabKind::Terminal { view, custom_name, custom_color, .. } = &tab.kind else { return };
+        let initial = custom_name.clone().unwrap_or_else(|| view.read(cx).auto_title().to_string());
+        let color = *custom_color;
+        let input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("Session name (empty = automatic)");
+            s.set_value(initial, window, cx);
+            s
+        });
+        let sub = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::PressEnter { .. }) {
+                this.confirm_rename(cx);
+            }
+        });
+        input.update(cx, |s, cx| s.focus(window, cx));
+        self.rename_modal = Some(RenameSession { tab_id, input, color, _sub: sub });
+        cx.notify();
+    }
+
+    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.rename_modal.take() else { return };
+        let raw = modal.input.read(cx).value().trim().to_string();
+        let name = (!raw.is_empty()).then_some(raw);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == modal.tab_id) {
+            if let TabKind::Terminal { custom_name, custom_color, .. } = &mut tab.kind {
+                *custom_name = name;
+                *custom_color = modal.color;
+            }
+        }
+        self.persist(cx);
+        cx.notify();
     }
 
     fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -475,6 +537,16 @@ impl ProjectView {
         if std::env::var("KUAKY_DEMO_LIMITS").is_ok() {
             self.limits = crate::home::demo_limits();
         }
+        if std::env::var("KUAKY_DEMO_RENAME").is_ok() {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| matches!(t.kind, TabKind::Terminal { .. })) {
+                let id = tab.id;
+                if let TabKind::Terminal { custom_name, custom_color, .. } = &mut tab.kind {
+                    *custom_name = Some("Refactor auth middleware".into());
+                    *custom_color = Some(0xa78bfa);
+                }
+                self.open_rename_modal(id, window, cx);
+            }
+        }
         if let Ok(file) = std::env::var("KUAKY_DEMO_FILE") {
             self.open_file(self.root.join(file), window, cx);
             if let Ok(mode) = std::env::var("KUAKY_DEMO_LSP") {
@@ -544,15 +616,18 @@ impl ProjectView {
                 }
             }
         }
-        self.spawn_terminal(harness, cwd, worktree, false, window, cx);
+        self.spawn_terminal(harness, cwd, worktree, false, None, None, window, cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_terminal(
         &mut self,
         harness: Harness,
         cwd: PathBuf,
         worktree: Option<String>,
         resume: bool,
+        custom_name: Option<String>,
+        custom_color: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -591,15 +666,18 @@ impl ProjectView {
             }
         }
         let launch = Launch { cwd, command, prefill: None, env };
-        self.add_terminal(harness, launch, worktree, status_file, window, cx);
+        self.add_terminal(harness, launch, worktree, status_file, custom_name, custom_color, window, cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_terminal(
         &mut self,
         harness: Harness,
         launch: Launch,
         worktree: Option<String>,
         status_file: Option<PathBuf>,
+        custom_name: Option<String>,
+        custom_color: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -615,7 +693,7 @@ impl ProjectView {
         });
         let obs = cx.observe(&view, |_, _, cx| cx.notify());
         self._subs.extend([sub, obs]);
-        self.push_tab(TabKind::Terminal { view, harness, worktree, cwd }, window, cx);
+        self.push_tab(TabKind::Terminal { view, harness, worktree, cwd, custom_name, custom_color }, window, cx);
     }
 
     fn open_right_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -680,7 +758,7 @@ impl ProjectView {
     /// Opens a shell with `text` prefilled (not executed until user presses Enter).
     fn prefilled_shell(&mut self, cwd: PathBuf, text: String, window: &mut Window, cx: &mut Context<Self>) {
         let launch = Launch { cwd, command: None, prefill: Some(text), env: Vec::new() };
-        self.add_terminal(Harness::Shell, launch, None, None, window, cx);
+        self.add_terminal(Harness::Shell, launch, None, None, None, None, window, cx);
     }
 
     fn worktree_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -751,6 +829,8 @@ impl ProjectView {
                                         Harness::Shell,
                                         Launch { cwd: wt2.path.clone(), command: None, prefill: None, env: Vec::new() },
                                         wt2.branch.clone(),
+                                        None,
+                                        None,
                                         None,
                                         window,
                                         cx,
@@ -1164,28 +1244,43 @@ impl ProjectView {
                     .child(
                         div().id("open-sessions").flex_1().overflow_y_scroll().child(
                             v_flex().gap_1().children(self.tabs.iter().enumerate().filter_map(|(i, tab)| {
-                                let (harness, title, status, color, worktree): (Harness, SharedString, &str, Hsla, Option<String>) =
-                                    match &tab.kind {
-                                        TabKind::Terminal { view, harness, worktree, .. } => {
-                                            let t = view.read(cx);
-                                            let (status, color) = terminal_status(t, now);
-                                            (*harness, t.title.clone().unwrap_or_else(|| t.label.clone()), status, color, worktree.clone())
-                                        }
-                                        TabKind::Chat { view, harness } => {
-                                            let (status, color) = chat_status(view.read(cx));
-                                            (*harness, format!("{} · chat", harness.label()).into(), status, color, None)
-                                        }
-                                        _ => return None,
-                                    };
+                                let (harness, title, status_line, dot_color, worktree, accent_color, can_rename): (
+                                    Harness,
+                                    SharedString,
+                                    String,
+                                    Hsla,
+                                    Option<String>,
+                                    Option<u32>,
+                                    bool,
+                                ) = match &tab.kind {
+                                    TabKind::Terminal { view, harness, worktree, custom_name, custom_color, .. } => {
+                                        let t = view.read(cx);
+                                        let (status, dot) = terminal_status(t, now);
+                                        let title = custom_name
+                                            .as_ref()
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| SharedString::from(s.clone()))
+                                            .unwrap_or_else(|| t.auto_title());
+                                        let when = ago(t.last_activity_at());
+                                        (*harness, title, format!("{status} · {when}"), dot, worktree.clone(), *custom_color, true)
+                                    }
+                                    TabKind::Chat { view, harness } => {
+                                        let (status, dot) = chat_status(view.read(cx));
+                                        (*harness, format!("{} · chat", harness.label()).into(), status.to_string(), dot, None, None, false)
+                                    }
+                                    _ => return None,
+                                };
                                 let selected = self.active == Some(i);
+                                let tab_id = tab.id;
                                 Some(
                                     h_flex()
-                                        .id(("session", tab.id))
+                                        .id(("session", tab_id))
                                         .gap_2()
                                         .px_2()
                                         .py_1p5()
                                         .rounded_md()
                                         .cursor_pointer()
+                                        .when_some(accent_color, |d, c| d.border_l_2().border_color(rgb(c)))
                                         .when(selected, |d| d.bg(style::panel_hover()))
                                         .hover(|d| d.bg(style::panel_hover()))
                                         .child(harness_badge(harness))
@@ -1200,8 +1295,8 @@ impl ProjectView {
                                                         .min_w_0()
                                                         .text_xs()
                                                         .text_color(style::muted())
-                                                        .child(div().size(px(6.)).flex_none().rounded_full().bg(color))
-                                                        .child(div().flex_1().min_w_0().truncate().child(status)),
+                                                        .child(div().size(px(6.)).flex_none().rounded_full().bg(dot_color))
+                                                        .child(div().flex_1().min_w_0().truncate().child(status_line)),
                                                 )
                                                 .when_some(worktree, |d, w| {
                                                     d.child(
@@ -1215,9 +1310,27 @@ impl ProjectView {
                                                     )
                                                 }),
                                         )
+                                        .when(can_rename, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("session-rename", tab_id))
+                                                    .flex_none()
+                                                    .p_0p5()
+                                                    .rounded_sm()
+                                                    .hover(|d| d.bg(style::bg()))
+                                                    .tooltip(|window, cx| {
+                                                        Tooltip::new("Rename & color (double-click or right-click)").build(window, cx)
+                                                    })
+                                                    .child(icons::ui("pencil", px(11.), style::faint()))
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_rename_modal(tab_id, window, cx);
+                                                    })),
+                                            )
+                                        })
                                         .child(
                                             div()
-                                                .id(("session-close", tab.id))
+                                                .id(("session-close", tab_id))
                                                 .flex_none()
                                                 .p_0p5()
                                                 .rounded_sm()
@@ -1228,7 +1341,24 @@ impl ProjectView {
                                                     this.close_tab(i, window, cx);
                                                 })),
                                         )
-                                        .on_click(cx.listener(move |this, _, window, cx| this.activate(i, window, cx))),
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                                if can_rename && ev.click_count >= 2 {
+                                                    this.open_rename_modal(tab_id, window, cx);
+                                                } else {
+                                                    this.activate(i, window, cx);
+                                                }
+                                            }),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(move |this, _, window, cx| {
+                                                if can_rename {
+                                                    this.open_rename_modal(tab_id, window, cx);
+                                                }
+                                            }),
+                                        ),
                                 )
                             })),
                         ),
@@ -1291,6 +1421,7 @@ impl ProjectView {
                         .when(expanded, |d| {
                             d.children(self.previous.iter().enumerate().filter_map(|(i, p)| {
                                 let h = Harness::from_key(&p.harness)?;
+                                let title = p.custom_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| h.label().to_string());
                                 let detail = p.worktree.clone().unwrap_or_else(|| {
                                     if h.resume_args().is_empty() { "reopen".into() } else { "resume conversation".into() }
                                 });
@@ -1302,13 +1433,14 @@ impl ProjectView {
                                         .py_1()
                                         .rounded_md()
                                         .cursor_pointer()
+                                        .when_some(p.custom_color, |d, c| d.border_l_2().border_color(rgb(c)))
                                         .hover(|d| d.bg(style::panel_hover()))
                                         .child(harness_badge(h))
                                         .child(
                                             v_flex()
                                                 .flex_1()
                                                 .min_w_0()
-                                                .child(div().text_sm().truncate().child(h.label()))
+                                                .child(div().text_sm().truncate().child(title))
                                                 .child(div().text_xs().truncate().text_color(style::faint()).child(detail)),
                                         )
                                         .child(div().flex_none().text_xs().text_color(style::accent()).child("Resume"))
@@ -1332,29 +1464,47 @@ impl ProjectView {
             .bg(style::panel())
             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                 let active = self.active == Some(i);
-                let (icon, status, title, dirty): (AnyElement, Option<Hsla>, SharedString, bool) = match &tab.kind {
-                    TabKind::Terminal { view, harness, .. } => {
+                let tab_id = tab.id;
+                let (icon, status, title, dirty, accent_color, can_rename): (
+                    AnyElement,
+                    Option<Hsla>,
+                    SharedString,
+                    bool,
+                    Option<u32>,
+                    bool,
+                ) = match &tab.kind {
+                    TabKind::Terminal { view, harness, custom_name, custom_color, .. } => {
                         let t = view.read(cx);
                         let (_, dot) = terminal_status(t, now);
-                        (harness_badge(*harness), Some(dot), t.title.clone().unwrap_or_else(|| t.label.clone()), false)
+                        let title = custom_name
+                            .as_ref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| SharedString::from(s.clone()))
+                            .unwrap_or_else(|| t.auto_title());
+                        (harness_badge(*harness), Some(dot), title, false, *custom_color, true)
                     }
                     TabKind::File(f) => {
                         let f = f.read(cx);
-                        (icons::ui("file", px(14.), style::muted()).into_any_element(), None, f.title().into(), f.dirty)
+                        (icons::ui("file", px(14.), style::muted()).into_any_element(), None, f.title().into(), f.dirty, None, false)
                     }
-                    TabKind::Diff(d) => {
-                        (icons::ui("git-compare", px(14.), style::accent()).into_any_element(), None, d.read(cx).title.clone(), false)
-                    }
+                    TabKind::Diff(d) => (
+                        icons::ui("git-compare", px(14.), style::accent()).into_any_element(),
+                        None,
+                        d.read(cx).title.clone(),
+                        false,
+                        None,
+                        false,
+                    ),
                     TabKind::Search(_) => {
-                        (icons::ui("search", px(14.), style::accent()).into_any_element(), None, "Search".into(), false)
+                        (icons::ui("search", px(14.), style::accent()).into_any_element(), None, "Search".into(), false, None, false)
                     }
                     TabKind::Chat { view, harness } => {
                         let (_, dot) = chat_status(view.read(cx));
-                        (harness_badge(*harness), Some(dot), format!("{} · chat", harness.label()).into(), false)
+                        (harness_badge(*harness), Some(dot), format!("{} · chat", harness.label()).into(), false, None, false)
                     }
                 };
                 h_flex()
-                    .id(("tab", tab.id))
+                    .id(("tab", tab_id))
                     .h_full()
                     .px_3()
                     .gap_2()
@@ -1363,6 +1513,7 @@ impl ProjectView {
                     .cursor_pointer()
                     .border_r_1()
                     .border_color(style::border())
+                    .when_some(accent_color, |d, c| d.border_t_2().border_color(rgb(c)))
                     .text_color(if active { style::text() } else { style::muted() })
                     .when(active, |d| d.bg(style::bg()))
                     .hover(|d| d.text_color(style::text()))
@@ -1372,7 +1523,7 @@ impl ProjectView {
                     .when(dirty, |d| d.child(div().text_color(style::accent()).child("●")))
                     .child(
                         div()
-                            .id(("close", tab.id))
+                            .id(("close", tab_id))
                             .flex_none()
                             .p_0p5()
                             .rounded_sm()
@@ -1383,7 +1534,24 @@ impl ProjectView {
                                 this.close_tab(i, window, cx);
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| this.activate(i, window, cx)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            if can_rename && ev.click_count >= 2 {
+                                this.open_rename_modal(tab_id, window, cx);
+                            } else {
+                                this.activate(i, window, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, window, cx| {
+                            if can_rename {
+                                this.open_rename_modal(tab_id, window, cx);
+                            }
+                        }),
+                    )
             }))
     }
 
@@ -2035,6 +2203,156 @@ impl ProjectView {
         }
         panel_message("Git commit graph ready for Part E.").into_any_element()
     }
+
+    fn rename_overlay(&self, modal: &RenameSession, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected_color = modal.color;
+        div()
+            .id("rename-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(style::soft(style::bg(), 0.55))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.rename_modal = None;
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .id("rename-box")
+                    .w(px(360.))
+                    .p_4()
+                    .gap_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(style::border())
+                    .bg(style::panel())
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                        if ev.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            this.rename_modal = None;
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Rename session"))
+                            .child(
+                                div()
+                                    .id("rename-close")
+                                    .p_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .child(icons::ui("x", px(13.), style::muted()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rename_modal = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().text_color(style::muted()).child("Name"))
+                            .child(Input::new(&modal.input)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1p5()
+                            .child(div().text_xs().text_color(style::muted()).child("Color"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .id("color-none")
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .border_1()
+                                            .border_color(if selected_color.is_none() {
+                                                style::accent()
+                                            } else {
+                                                style::border()
+                                            })
+                                            .text_color(if selected_color.is_none() { style::text() } else { style::muted() })
+                                            .child("Auto")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(m) = &mut this.rename_modal {
+                                                    m.color = None;
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                    .children(SESSION_COLORS.iter().enumerate().map(|(ci, &(name, hex))| {
+                                        let active = selected_color == Some(hex);
+                                        let tip: SharedString = name.into();
+                                        div()
+                                            .id(("swatch", ci))
+                                            .size(px(20.))
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .bg(rgb(hex))
+                                            .when(active, |d| d.border_2().border_color(style::text()))
+                                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(m) = &mut this.rename_modal {
+                                                    m.color = Some(hex);
+                                                    cx.notify();
+                                                }
+                                            }))
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .mt_1()
+                            .child(
+                                div()
+                                    .id("rename-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::border())
+                                    .text_color(style::muted())
+                                    .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rename_modal = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("rename-save")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .cursor_pointer()
+                                    .bg(style::accent())
+                                    .text_color(style::bg())
+                                    .child("Save")
+                                    .on_click(cx.listener(|this, _, _, cx| this.confirm_rename(cx))),
+                            ),
+                    ),
+            )
+    }
 }
 
 impl Render for ProjectView {
@@ -2113,6 +2431,7 @@ impl Render for ProjectView {
                         .child(div().id("quick-open-box").on_click(|_, _, cx| cx.stop_propagation()).child(qo)),
                 )
             })
+            .when_some(self.rename_modal.as_ref().map(|m| self.rename_overlay(m, cx)), |d, el| d.child(el))
     }
 }
 

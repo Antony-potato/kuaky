@@ -26,8 +26,12 @@ pub struct TerminalView {
     error: Option<String>,
     pub label: SharedString,
     pub title: Option<SharedString>,
+    /// First user prompt reported by agent hooks (fallback auto-title).
+    pub first_prompt: Option<SharedString>,
     pub exited: bool,
     pub last_output: Option<Instant>,
+    pub started_at: jiff::Timestamp,
+    pub state_changed_at: Option<jiff::Timestamp>,
     /// Estado reportado por los hooks del agente, si los tiene.
     pub agent_state: Option<AgentState>,
     pub previous_state: Option<AgentState>,
@@ -97,8 +101,11 @@ impl TerminalView {
             error,
             label: label.into(),
             title: None,
+            first_prompt: None,
             exited: false,
             last_output: None,
+            started_at: jiff::Timestamp::now(),
+            state_changed_at: None,
             agent_state: None,
             previous_state: None,
             focus,
@@ -114,6 +121,25 @@ impl TerminalView {
         }
     }
 
+    /// Automatic display title: terminal title (OSC) → first user prompt → harness label.
+    pub fn auto_title(&self) -> SharedString {
+        if let Some(t) = &self.title {
+            if !t.is_empty() {
+                return t.clone();
+            }
+        }
+        if let Some(p) = &self.first_prompt {
+            if !p.is_empty() {
+                return p.clone();
+            }
+        }
+        self.label.clone()
+    }
+
+    pub fn last_activity_at(&self) -> jiff::Timestamp {
+        self.state_changed_at.unwrap_or(self.started_at)
+    }
+
     /// Lee las líneas nuevas del archivo de estado cada 300 ms.
     fn watch_status(path: std::path::PathBuf, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -126,13 +152,29 @@ impl TerminalView {
                     // Solo líneas completas.
                     let consumed = new.rfind('\n').map(|i| i + 1).unwrap_or(0);
                     offset += consumed;
-                    let latest = new[..consumed].lines().filter_map(agent_status::parse_line).last();
-                    if let Some(state) = latest {
+                    let chunk = &new[..consumed];
+                    let prompt = chunk.lines().find_map(agent_status::parse_prompt);
+                    let latest = chunk.lines().filter_map(agent_status::parse_line).last();
+                    if prompt.is_some() || latest.is_some() {
                         let alive = this
                             .update(cx, |this, cx| {
-                                if this.agent_state.as_ref() != Some(&state) {
-                                    this.previous_state = this.agent_state.replace(state);
-                                    cx.emit(TerminalViewEvent::AgentState);
+                                let mut changed = false;
+                                if let Some(p) = prompt {
+                                    if this.first_prompt.is_none() {
+                                        this.first_prompt = Some(p.into());
+                                        cx.emit(TerminalViewEvent::TitleChanged);
+                                        changed = true;
+                                    }
+                                }
+                                if let Some(state) = latest {
+                                    if this.agent_state.as_ref() != Some(&state) {
+                                        this.previous_state = this.agent_state.replace(state);
+                                        this.state_changed_at = Some(jiff::Timestamp::now());
+                                        cx.emit(TerminalViewEvent::AgentState);
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
                                     cx.notify();
                                 }
                             })
@@ -154,14 +196,21 @@ impl TerminalView {
     fn on_term_event(&mut self, ev: kuaky_term::RawEvent, cx: &mut Context<Self>) {
         let Some(term) = &self.term else { return };
         match term.handle(ev) {
-            Some(TermEvent::Wakeup) => self.last_output = Some(Instant::now()),
+            Some(TermEvent::Wakeup) => {
+                self.last_output = Some(Instant::now());
+                if self.agent_state.is_none() {
+                    self.state_changed_at = Some(jiff::Timestamp::now());
+                }
+            }
             Some(TermEvent::Title(t)) => {
-                self.title = (!t.trim().is_empty()).then(|| t.trim().to_string().into());
+                let cleaned = clean_term_title(&t);
+                self.title = cleaned.map(Into::into);
                 cx.emit(TerminalViewEvent::TitleChanged);
             }
             Some(TermEvent::Copy(text)) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             Some(TermEvent::Exited) => {
                 self.exited = true;
+                self.state_changed_at = Some(jiff::Timestamp::now());
                 cx.emit(TerminalViewEvent::Exited);
             }
             Some(TermEvent::Bell) | None => {}
@@ -296,6 +345,14 @@ fn size_for_bounds(width: Pixels, height: Pixels, cw: Pixels, lh: Pixels) -> Opt
         cell_width: f32::from(cw) as u16,
         cell_height: f32::from(lh) as u16,
     })
+}
+
+fn clean_term_title(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches(|c: char| matches!(c, '✳' | '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧' | '⠇' | '⠏' | '⠐' | '⠂' | '⠁' | '⠈' | '⠠' | '⠄' | '•' | '·'))
+        .trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn hsla(c: Rgb) -> Hsla {

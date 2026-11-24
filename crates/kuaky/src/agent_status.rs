@@ -126,6 +126,31 @@ pub fn new_status_file() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Extracts a concise title from a `UserPromptSubmit` hook line, if present.
+pub fn parse_prompt(line: &str) -> Option<String> {
+    let (event, payload) = line.split_once('\t')?;
+    if event.trim() != "UserPromptSubmit" {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(payload).ok()?;
+    let raw = payload
+        .get("prompt")
+        .or_else(|| payload.get("user_prompt"))
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str)?;
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let mut chars = collapsed.chars();
+    let short: String = chars.by_ref().take(56).collect();
+    if chars.next().is_some() {
+        Some(format!("{short}…"))
+    } else {
+        Some(short)
+    }
+}
+
 /// Interpreta una línea `Evento<TAB>json`.
 pub fn parse_line(line: &str) -> Option<AgentState> {
     let (event, payload) = line.split_once('\t').unwrap_or((line, ""));
@@ -164,6 +189,12 @@ mod tests {
             Some(AgentState::NeedsYou("Wants to use Bash".into()))
         );
         assert_eq!(parse_line("Otro\t{}"), None);
+        assert_eq!(parse_prompt("UserPromptSubmit\t{\"prompt\":\"  Fix   sidebar   overflow  \"}"), Some("Fix sidebar overflow".into()));
+        assert_eq!(parse_prompt("Stop\t{\"prompt\":\"ignored\"}"), None);
+        let long = format!("UserPromptSubmit\t{{\"prompt\":\"{}\"}}", "a".repeat(80));
+        let parsed = parse_prompt(&long).unwrap();
+        assert!(parsed.ends_with('…'));
+        assert!(parsed.chars().count() <= 57);
     }
 
     #[test]
