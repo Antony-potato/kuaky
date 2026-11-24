@@ -1,0 +1,99 @@
+name: Release
+
+# Publica una versión de kuaky: la app de macOS (.zip) y el instalador de Windows.
+# - Con un tag:      git tag v0.2.0 && git push origin v0.2.0
+# - O a mano:        Actions → Release → Run (pide la versión; crea el tag).
+# kuaky revisa estos releases para ofrecer "Update" en la barra de título.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          V="$INPUT_VERSION"
+          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
+          V="${V#v}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Bad version: $V"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set version
+        run: sed -i '' 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+      - name: Build kuaky.app
+        run: |
+          touch assets/icon/kuaky.icns   # el ícono ya está en el repo: no regenerarlo
+          script/bundle-macos.sh
+      - name: Zip
+        run: ditto -c -k --keepParent target/release/bundle/kuaky.app "kuaky-${{ needs.version.outputs.version }}-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: kuaky-*-macos-arm64.zip
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Set version
+        shell: bash
+        run: sed -i 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+      - name: Build
+        run: cargo build --release -p kuaky
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=${{ needs.version.outputs.version }}" script\windows\kuaky.iss'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release/installer/kuaky-*-windows-x64-setup.exe
+
+  publish:
+    needs: [version, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$V" dist/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "kuaky $V" \
+            --generate-notes

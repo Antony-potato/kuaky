@@ -169,6 +169,14 @@ mod tests {
     use super::dispatch_inputs;
 
     #[test]
+    fn release_workflow_asks_for_a_version() {
+        let inputs = dispatch_inputs(include_str!("../../../.github/workflows/release.yml")).unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "version");
+        assert!(inputs[0].required);
+    }
+
+    #[test]
     fn reads_dispatch_inputs() {
         assert_eq!(dispatch_inputs("on:\n  push:\n    branches: [main]\n"), None);
         assert_eq!(dispatch_inputs("on: workflow_dispatch\n"), Some(vec![]));

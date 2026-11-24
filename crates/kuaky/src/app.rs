@@ -463,6 +463,7 @@ impl KuakyApp {
                         .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
                 )
                 .child(div().flex_1())
+                .children(crate::updater::title_button(cx))
                 .when(has_project, |d| {
                     d.child(
                         div()

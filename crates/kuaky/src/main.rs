@@ -1,3 +1,6 @@
+// En Windows, la versión release no abre una consola junto a la ventana.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod actions_panel;
 mod agent_history;
 mod agent_status;
@@ -22,6 +25,7 @@ mod settings;
 mod state;
 mod style;
 mod terminal_view;
+mod updater;
 
 use gpui_kit::component::{Theme, ThemeMode, TitleBar};
 use gpui_kit::*;
