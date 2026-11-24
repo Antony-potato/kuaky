@@ -258,6 +258,8 @@ pub struct ChatView {
     stick_bottom: bool,
     /// Reconexiones recientes (para no reintentar en bucle).
     reconnects: Vec<Instant>,
+    /// Posición del scroll la última vez que llegaron eventos.
+    last_offset: Pixels,
     focus: FocusHandle,
     _sub: Subscription,
 }
@@ -333,6 +335,7 @@ impl ChatView {
             scroll: ScrollHandle::new(),
             stick_bottom: true,
             reconnects: Vec::new(),
+            last_offset: px(0.),
             focus: cx.focus_handle(),
             _sub: sub,
         };
@@ -485,6 +488,7 @@ impl ChatView {
                 batch.extend(events.try_iter());
                 let alive = this
                     .update(cx, |this, cx| {
+                        this.check_manual_scroll();
                         for ev in batch {
                             this.on_event(ev, cx);
                         }
@@ -527,6 +531,20 @@ impl ChatView {
             let _ = this.update(cx, |this, _| this.files = Some(Arc::new(files)));
         })
         .detach();
+    }
+
+    /// Arrastrar la barra de scroll no manda eventos de rueda: si el chat subió
+    /// desde la última vez (seguir el final solo lo baja), fuiste tú.
+    /// Llegar abajo del todo vuelve a seguir el final.
+    fn check_manual_scroll(&mut self) {
+        let offset = self.scroll.offset().y;
+        let max = self.scroll.max_offset().y;
+        if self.stick_bottom && offset > self.last_offset + px(2.) && max + offset > px(8.) {
+            self.stick_bottom = false;
+        } else if !self.stick_bottom && max + offset <= px(2.) && offset < self.last_offset - px(2.) {
+            self.stick_bottom = true;
+        }
+        self.last_offset = offset;
     }
 
     fn at_bottom(&self) -> bool {
@@ -578,6 +596,10 @@ impl ChatView {
                     turn.record_file(PathBuf::from(&d.path), d.old_text.clone(), d.new_text.clone());
                 }
                 let id = call.id.clone();
+                let mut call = call;
+                if let Some(delta) = call.output_delta.take() {
+                    call.output.get_or_insert_with(String::new).push_str(&delta);
+                }
                 turn.items.push(Item::Tool(call));
                 self.track_subagent(&id);
                 self.follow_tool(&id, cx);
@@ -605,6 +627,23 @@ impl ChatView {
                         // Algunas actualizaciones pierden el padre: se conserva el primero.
                         if call.parent.is_none() {
                             call.parent = update.parent;
+                        }
+                        // Salida del comando: completa o por trozos.
+                        if let Some(out) = update.output {
+                            call.output = Some(out);
+                        }
+                        if let Some(delta) = update.output_delta {
+                            let out = call.output.get_or_insert_with(String::new);
+                            out.push_str(&delta);
+                            // Tope de memoria: se queda con lo último.
+                            if out.len() > 256 * 1024 {
+                                let cut = out.len() - 192 * 1024;
+                                let cut = (cut..out.len()).find(|&i| out.is_char_boundary(i)).unwrap_or(out.len());
+                                out.drain(..cut);
+                            }
+                        }
+                        if update.exit_code.is_some() {
+                            call.exit_code = update.exit_code;
                         }
                         if update.kind.is_some() {
                             call.kind = update.kind;
@@ -1832,6 +1871,7 @@ impl ChatView {
                         cx.emit(ChatEvent::OpenDiff { title: format!("± {}", diff.path.rsplit('/').next().unwrap_or("")), patch: unified_patch(&diff) });
                     }))
             }))
+            .when_some(call.output.clone().filter(|o| !o.trim().is_empty()), |d, out| d.child(command_output(&out, call.exit_code, verbose)))
             .when(!steps.is_empty(), |d| d.child(self.subagent_steps(key, call, steps, cx)))
             .when_some(call.text.clone().filter(|t| verbose && !t.trim().is_empty()), |d, t| {
                 let short: String = t.lines().take(20).collect::<Vec<_>>().join("\n");
@@ -2269,7 +2309,7 @@ impl ChatView {
             "Context: {} of {} tokens ({pct:.0}%){}",
             human(used),
             human(size),
-            cost.map(|c| format!(" · session cost {}", crate::style::money(c))).unwrap_or_default()
+            cost.map(|c| format!(" · session cost {}", style::money(c))).unwrap_or_default()
         )
         .into();
         let frac = (pct / 100.) as f32;
@@ -2318,6 +2358,50 @@ impl ChatView {
     }
 }
 
+/// Salida de un comando dentro de su tarjeta: las últimas líneas (todas en Verbose,
+/// hasta 200) y el código de salida si no fue 0.
+fn command_output(out: &str, exit_code: Option<i64>, verbose: bool) -> AnyElement {
+    let out = strip_ansi(out);
+    let lines: Vec<&str> = out.trim_end().lines().collect();
+    let keep = if verbose { 200 } else { 8 };
+    let hidden = lines.len().saturating_sub(keep);
+    let shown = lines[hidden..].join("\n");
+    v_flex()
+        .px_3()
+        .py_2()
+        .gap_1()
+        .border_t_1()
+        .border_color(style::border())
+        .when(hidden > 0, |d| d.child(div().text_xs().text_color(style::faint()).child(format!("… {hidden} earlier lines"))))
+        .child(div().text_xs().font_family(style::mono_font()).text_color(style::muted()).whitespace_normal().child(shown))
+        .when_some(exit_code.filter(|c| *c != 0), |d, c| d.child(div().text_xs().text_color(style::bad()).child(format!("exit {c}"))))
+        .into_any_element()
+}
+
+/// Quita los códigos de color de la terminal (`ESC[…m`).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Pasos de un subagente en un turno (herramientas cuyo padre es `id`).
 fn steps_of<'a>(turn: &'a Turn, id: &str) -> Vec<&'a ToolCall> {
     turn.items
@@ -2330,7 +2414,7 @@ fn steps_of<'a>(turn: &'a Turn, id: &str) -> Vec<&'a ToolCall> {
 }
 
 fn human(n: u64) -> String {
-    crate::style::human(n)
+    style::human(n)
 }
 
 impl Render for ChatView {
@@ -2472,7 +2556,7 @@ impl Render for ChatView {
                         .text_xs()
                         .cursor_pointer()
                         .when(selected, |d| d.bg(style::panel_hover()))
-                        .child(div().font_family(crate::style::mono_font()).child(label))
+                        .child(div().font_family(style::mono_font()).child(label))
                         .child(div().flex_1().truncate().text_color(style::faint()).child(detail))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.suggestion_ix = i;

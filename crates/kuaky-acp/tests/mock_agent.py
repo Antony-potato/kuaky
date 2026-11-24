@@ -82,7 +82,13 @@ while True:
         ]})
         update(s, {"sessionUpdate": "plan", "entries": [{"content": "Paso 1", "priority": "high", "status": "completed"}]})
         for i, cmd in enumerate(["git status --short", "cargo test -p kuaky"]):
-            update(s, {"sessionUpdate": "tool_call", "toolCallId": f"c{i}", "title": cmd, "kind": "execute", "status": "completed"})
+            update(s, {"sessionUpdate": "tool_call", "toolCallId": f"c{i}", "title": cmd, "kind": "execute", "status": "in_progress",
+                       "_meta": {"terminal_info": {"terminal_id": f"c{i}"}}})
+            for chunk in ["\x1b[32mrunning 3 tests\x1b[0m\n", "test a ... ok\ntest b ... ok\n", "test c ... FAILED\n"]:
+                update(s, {"sessionUpdate": "tool_call_update", "toolCallId": f"c{i}",
+                           "_meta": {"terminal_output_delta": {"terminal_id": f"c{i}", "data": chunk}}})
+            update(s, {"sessionUpdate": "tool_call_update", "toolCallId": f"c{i}", "status": "completed" if i == 0 else "failed",
+                       "_meta": {"terminal_exit": {"terminal_id": f"c{i}", "exit_code": 0 if i == 0 else 101}}})
         update(s, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "\n\nListo: el archivo quedó editado y los tests pasan."}})
         update(s, {"sessionUpdate": "tool_call", "toolCallId": "sa1", "title": "Find auth code", "kind": "think", "status": "in_progress",
                    "rawInput": {"subagent_type": "Explore", "description": "Find auth code"}, "_meta": {"claudeCode": {"toolName": "Agent"}}})

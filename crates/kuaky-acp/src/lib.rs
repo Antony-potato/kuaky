@@ -144,6 +144,12 @@ pub struct ToolCall {
     /// Paso de un subagente: id del `Agent`/`Task` que lo lanzó
     /// (`_meta.claudeCode.parentToolUseId`).
     pub parent: Option<String>,
+    /// Salida de un comando (`_meta.terminal_output`: reemplaza todo).
+    pub output: Option<String>,
+    /// Trozo nuevo de salida (`_meta.terminal_output_delta`: se agrega).
+    pub output_delta: Option<String>,
+    /// Código de salida del comando (`_meta.terminal_exit`).
+    pub exit_code: Option<i64>,
 }
 
 impl ToolCall {
@@ -263,7 +269,12 @@ impl Client {
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": { "fs": { "readTextFile": true, "writeTextFile": true }, "terminal": false },
+                "clientCapabilities": {
+                    "fs": { "readTextFile": true, "writeTextFile": true },
+                    "terminal": false,
+                    // Salida de comandos en vivo dentro de la herramienta (extensión de claude-agent-acp).
+                    "_meta": { "terminal_output": true, "terminal_output_delta": true }
+                },
                 "clientInfo": { "name": "kuaky", "version": env!("CARGO_PKG_VERSION") },
             }),
             Duration::from_secs(60),
@@ -637,6 +648,10 @@ fn parse_tool_call(v: &Value) -> ToolCall {
             })
             .collect();
     }
+    let data = |key: &str| v.pointer(&format!("/_meta/{key}/data")).and_then(Value::as_str).map(str::to_string);
+    call.output = data("terminal_output");
+    call.output_delta = data("terminal_output_delta").filter(|d| !d.is_empty());
+    call.exit_code = v.pointer("/_meta/terminal_exit/exit_code").and_then(Value::as_i64);
     if let Some(items) = v.get("content").and_then(Value::as_array) {
         let mut texts = Vec::new();
         for item in items {
@@ -806,6 +821,11 @@ mod unit {
         let step = parse_tool_call(&json!({ "toolCallId": "t2", "title": "Read lib.rs", "kind": "read",
             "_meta": { "claudeCode": { "toolName": "Read", "parentToolUseId": "t1" } } }));
         assert_eq!(step.parent.as_deref(), Some("t1"));
+        let out = parse_tool_call(&json!({ "toolCallId": "b1", "content": [{ "type": "terminal", "terminalId": "b1" }],
+            "_meta": { "terminal_output_delta": { "terminal_id": "b1", "data": "line 1\n" }, "terminal_exit": { "terminal_id": "b1", "exit_code": 2 } } }));
+        assert_eq!(out.output_delta.as_deref(), Some("line 1\n"));
+        assert_eq!(out.exit_code, Some(2));
+        assert!(out.text.is_none());
     }
 
     #[test]
