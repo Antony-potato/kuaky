@@ -152,13 +152,16 @@ impl Harness {
         if let Some(path) = kuaky_git::find_agent(program) {
             return Some((path, args.iter().map(|a| a.to_string()).collect()));
         }
-        // Codex: sin `codex-acp` instalado, el adaptador oficial por npx (como Zed),
-        // solo si la CLI de Codex está instalada (usa su misma sesión).
-        if self == Harness::Codex && kuaky_git::find_agent("codex").is_some() {
-            let npx = kuaky_git::find_agent("npx")?;
-            return Some((npx, vec!["-y".into(), CODEX_ACP_PACKAGE.into()]));
-        }
-        None
+        // Sin el adaptador instalado (lo normal en Windows), el oficial por npx
+        // (como Zed), solo si la CLI del agente está instalada (usa su misma sesión).
+        let package = match self {
+            Harness::Claude => CLAUDE_ACP_PACKAGE,
+            Harness::Codex => CODEX_ACP_PACKAGE,
+            _ => return None,
+        };
+        kuaky_git::find_agent(self.command()?)?;
+        let npx = kuaky_git::find_agent("npx")?;
+        Some((npx, vec!["-y".into(), package.into()]))
     }
 
     /// Stable key used for persisted state and settings.
@@ -198,6 +201,8 @@ impl Harness {
 
 /// Adaptador ACP de Codex (versión fija, la misma que ofrece el registro de Zed).
 const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.10.0";
+/// Adaptador ACP de Claude Code (versión fija, la misma que ofrece el registro de Zed).
+const CLAUDE_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.99.1";
 
 const SESSION_COLORS: &[(&str, u32)] = &[
     ("Teal", 0x5eead4),
