@@ -64,6 +64,8 @@ pub struct SettingsView {
     section: Section,
     agents: Vec<AgentRowState>,
     detected: HashMap<Harness, PathBuf>,
+    /// Instalaciones desde aquí: `None` = en curso, `Some(error)` = falló.
+    installing: HashMap<Harness, Option<String>>,
     worktrees_input: Entity<InputState>,
     hidden_panels: Vec<String>,
     merge_method: String,
@@ -126,6 +128,7 @@ impl SettingsView {
             section: if std::env::var_os("KUAKY_DEMO_APPEARANCE").is_some() { Section::Appearance } else { Section::Agents },
             agents,
             detected: HashMap::new(),
+            installing: HashMap::new(),
             worktrees_input,
             hidden_panels: saved.hidden_panels.clone(),
             merge_method: if saved.pr_merge_method.is_empty() { "merge".into() } else { saved.pr_merge_method.clone() },
@@ -148,6 +151,50 @@ impl SettingsView {
                 .await;
             this.update(cx, |this, cx| {
                 this.detected = found;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Instala el agente con su instalador oficial y vuelve a buscarlo.
+    fn install(&mut self, harness: Harness, cx: &mut Context<Self>) {
+        let Some((program, args)) = install_command(harness) else {
+            cx.open_url(ANTIGRAVITY_URL);
+            return;
+        };
+        if kuaky_git::find_program(program).is_none() {
+            let need = if program == "npm" { "Needs Node.js (nodejs.org)".into() } else { format!("Needs {program}") };
+            self.installing.insert(harness, Some(need));
+            cx.notify();
+            return;
+        }
+        self.installing.insert(harness, None);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let out = kuaky_git::command(program).args(args).output().map_err(|e| e.to_string())?;
+                    if out.status.success() {
+                        return Ok(());
+                    }
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("Install failed").trim().to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.installing.remove(&harness);
+                        this.detect(cx);
+                        cx.emit(SettingsEvent::Changed);
+                    }
+                    Err(e) => {
+                        this.installing.insert(harness, Some(e));
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -491,10 +538,18 @@ impl Render for SettingsView {
                                     .child(div().text_xs().text_color(style::muted()).child("AGENTS"))
                                     .children(self.agents.iter().enumerate().map(|(i, row)| {
                                         let detected = self.detected.get(&row.harness);
-                                        let status = match detected {
-                                            Some(p) => (crate::home::tilde(p), style::good()),
-                                            None => ("Not detected".to_string(), style::faint()),
+                                        let install = self.installing.get(&row.harness);
+                                        let status = match (detected, install) {
+                                            (Some(p), _) => (crate::home::tilde(p), style::good()),
+                                            (None, Some(None)) => ("Installing…".to_string(), style::muted()),
+                                            (None, Some(Some(err))) => (err.clone(), style::warn()),
+                                            (None, None) => ("Not detected".to_string(), style::faint()),
                                         };
+                                        // Sin detectar ni ruta propia: se puede instalar desde aquí.
+                                        let can_install = detected.is_none()
+                                            && !matches!(install, Some(None))
+                                            && row.path_input.read(cx).value().trim().is_empty();
+                                        let harness = row.harness;
                                         let on = row.visible;
                                         v_flex()
                                             .p_3()
@@ -520,6 +575,22 @@ impl Render for SettingsView {
                                                             .text_color(status.1)
                                                             .child(status.0),
                                                     )
+                                                    .when(can_install, |d| d.child(
+                                                        h_flex()
+                                                            .id(("install-agent", i))
+                                                            .gap_1()
+                                                            .px_2()
+                                                            .py_0p5()
+                                                            .rounded_md()
+                                                            .border_1()
+                                                            .border_color(style::border())
+                                                            .text_xs()
+                                                            .cursor_pointer()
+                                                            .hover(|d| d.bg(style::panel_hover()))
+                                                            .child(icons::ui("download", px(12.), style::accent()))
+                                                            .child(if install_command(harness).is_some() { "Install" } else { "Download" })
+                                                            .on_click(cx.listener(move |this, _, _, cx| this.install(harness, cx))),
+                                                    ))
                                                     .child(
                                                         h_flex()
                                                             .id(("toggle-agent", i))
@@ -721,6 +792,21 @@ fn themes_folder_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
                     cx.notify();
                 })),
         )
+}
+
+/// Antigravity no tiene instalador por terminal: se descarga de su página.
+const ANTIGRAVITY_URL: &str = "https://antigravity.google";
+
+/// Instalador oficial de cada agente (sin pedir nada en la terminal).
+fn install_command(harness: Harness) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match harness {
+        Harness::Claude if cfg!(windows) => ("powershell", &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex"]),
+        Harness::Claude => ("bash", &["-c", "curl -fsSL https://claude.ai/install.sh | bash"]),
+        Harness::Codex => ("npm", &["install", "-g", "@openai/codex"]),
+        Harness::Gemini => ("npm", &["install", "-g", "@google/gemini-cli"]),
+        Harness::OpenCode => ("npm", &["install", "-g", "opencode-ai"]),
+        Harness::Antigravity | Harness::Shell => return None,
+    })
 }
 
 fn switch(on: bool) -> impl IntoElement {

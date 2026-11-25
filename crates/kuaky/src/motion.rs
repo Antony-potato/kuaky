@@ -63,8 +63,9 @@ pub const LOOP_FPS: f32 = 8.;
 /// Brillo del verbo y barra de progreso: un poco más fluidos.
 pub const SMOOTH_FPS: f32 = 15.;
 
-/// Glifos del spinner, como el de Claude Code: ida y vuelta.
-const SPINNER: [&str; 10] = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+/// Glifos del spinner, como el de Claude Code: ida y vuelta. Sin `✳`: Windows
+/// lo pinta con la fuente de emoji (un cuadro verde); `✱` no es emoji.
+const SPINNER: [&str; 10] = ["·", "✢", "✱", "✶", "✻", "✽", "✻", "✶", "✱", "✢"];
 
 /// Spinner de "trabajando": un glifo que cambia 8 veces por segundo.
 pub fn spinner(id: impl Into<ElementId>, color: impl Into<Hsla>, size: Pixels) -> AnimationElement<Div> {

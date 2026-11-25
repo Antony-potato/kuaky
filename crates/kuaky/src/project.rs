@@ -3033,6 +3033,7 @@ impl ProjectView {
     fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let launchers = self.available_harnesses(cx);
+        let no_agents = launchers == [Harness::Shell];
         let shortcuts = if cfg!(target_os = "macos") {
             "⌘T new terminal · ⌘P quick open · ⌘⇧F search · ⌘W close tab · ⌘, settings"
         } else {
@@ -3063,8 +3064,27 @@ impl ProjectView {
                     .hover(|d| d.bg(style::panel_hover()))
                     .child(harness_badge(h))
                     .child(h.label())
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_terminal(h, window, cx)))
-            })))
+                    // Como "New session": chat o terminal según Settings → Agents.
+                    .on_click(cx.listener(move |this, _, window, cx| this.launch(h, window, cx)))
+            })).when(no_agents, |d| {
+                d.child(
+                    h_flex()
+                        .id("empty-add-agent")
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(style::border())
+                        .text_sm()
+                        .text_color(style::muted())
+                        .cursor_pointer()
+                        .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                        .child(icons::ui("plus", px(14.), style::muted()))
+                        .child("Add an agent")
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::app::OpenSettings), cx))
+                )
+            }))
             .child(div().text_xs().text_color(style::faint()).child(shortcuts))
     }
 
