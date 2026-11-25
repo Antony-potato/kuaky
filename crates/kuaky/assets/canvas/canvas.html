@@ -1,318 +1,652 @@
 <!doctype html>
-<!-- Lienzo de diagramas de kuaky: los agentes mandan texto corto (ver `apply`) y aquí se acomoda y
-     se dibuja en isométrico o plano, con trazo a mano de rough.js. -->
+<!-- Lienzo de diagramas de kuaky. Los agentes mandan texto corto (ver `parse`); aquí se acomoda
+     con dagre y se dibuja en 2D (tarjetas) o 3D (isométrico, estilo Isoflow). -->
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { margin: 0; height: 100%; background: #111214; overflow: hidden; }
-  svg { width: 100%; height: 100%; display: block; cursor: grab; user-select: none; }
-  svg:active { cursor: grabbing; }
-  text { font-family: Inter, "Segoe UI", system-ui, sans-serif; }
-  .pop { animation: pop .45s cubic-bezier(.2, .9, .3, 1.25) both; transform-box: fill-box; transform-origin: 50% 100%; }
-  @keyframes pop { from { opacity: 0; transform: translateY(14px) scale(.96); } }
+  :root { --bg: #111214; --panel: #18191e; --line: #2a2c33; --text: #ecebe8; --muted: #9a9ba3; --faint: #5f616a; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; color: var(--text);
+               font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+  #svg { width: 100%; height: 100%; display: block; cursor: grab; user-select: none; touch-action: none; }
+  #svg.drag { cursor: grabbing; }
+  #bar { position: fixed; top: 10px; left: 12px; right: 12px; display: flex; align-items: center; gap: 8px; pointer-events: none; }
+  #bar > * { pointer-events: auto; }
+  #title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%;
+           padding: 5px 10px; border-radius: 8px; background: #111214d9; }
+  #title:empty { display: none; }
+  .sp { flex: 1; pointer-events: none; }
+  .seg { display: flex; gap: 2px; padding: 2px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
+  button { font: inherit; font-size: 12px; color: var(--muted); background: none; border: 0; padding: 4px 9px; border-radius: 6px; cursor: pointer; }
+  button:hover { color: var(--text); }
+  button.on { background: #2b2d35; color: var(--text); }
+  #legend { position: fixed; left: 12px; bottom: 10px; display: flex; flex-wrap: wrap; gap: 4px 12px; max-width: 75%;
+            padding: 6px 10px; border-radius: 8px; font-size: 11px; color: var(--muted); background: #111214d9; pointer-events: none; }
+  #legend:empty { display: none; }
+  #legend i { display: inline-block; width: 8px; height: 8px; border-radius: 3px; margin-right: 5px; }
+  #empty { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--faint); font-size: 13px; pointer-events: none; }
+  .item { transition: opacity .2s; }
+  #svg.focus .item:not(.hl) { opacity: .14; }
+  .flow { stroke-dasharray: 1 13; animation: flow 1.1s linear infinite; pointer-events: none; }
+  @keyframes flow { to { stroke-dashoffset: -14; } }
+  body.still .flow { display: none; }
 </style>
 </head>
 <body>
 <svg id="svg" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <radialGradient id="fade"><stop offset=".35" stop-color="#fff"/><stop offset="1" stop-color="#000"/></radialGradient>
-    <mask id="fadeMask" maskContentUnits="objectBoundingBox"><rect width="1" height="1" fill="url(#fade)"/></mask>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#ffffff12"/></pattern>
+    <pattern id="iso" x="-34.641" width="69.282" height="40" patternUnits="userSpaceOnUse">
+      <path d="M0 20L34.641 0L69.282 20L34.641 40Z" fill="none" stroke="#ffffff0d"/>
+    </pattern>
   </defs>
-  <g id="grid" mask="url(#fadeMask)"></g>
+  <rect id="grid" x="-100000" y="-100000" width="200000" height="200000" fill="url(#dots)"/>
   <g id="scene"></g>
 </svg>
+<div id="empty">Ask an agent to draw something here.</div>
+<div id="bar">
+  <div id="title"></div><div class="sp"></div>
+  <div class="seg"><button data-view="2d">2D</button><button data-view="3d">3D</button></div>
+  <div class="seg">
+    <button id="sketch" title="Hand-drawn strokes">Sketch</button>
+    <button id="live" title="Moving dots on the arrows">Live</button>
+    <button id="fit" title="Fit to screen (double-click)">Fit</button>
+  </div>
+</div>
+<div id="legend"></div>
 <script src="rough.js"></script>
+<script src="dagre.js"></script>
 <script>
 "use strict";
-const svg = document.getElementById("svg"), grid = document.getElementById("grid"), scene = document.getElementById("scene");
-const rc = rough.svg(svg);
-const S = 44; // px por unidad del mundo
+const $ = id => document.getElementById(id);
+const svg = $("svg"), scene = $("scene"), rc = rough.svg(svg);
+const FONT = 'Inter, "Segoe UI", system-ui, sans-serif';
+const ACCENT = "#f0715a", WIRE = "#6c707d", CARD = "#17181d", INK = "#0c0d0f";
+const EASE = "cubic-bezier(.2, .8, .2, 1)";
 
-const C = { ink: "#141416", side: "#26272c", top: "#e9e7e2", wire: "#c9c7c1", grid: "#ffffff14",
-            pill: "#1c1d21", pillLine: "#6d6e73", text: "#f2f1ee", dot: "#e9e7e2" };
-// [rayas, fondo de la cara rayada]
-const PAL = { coral: ["#d4664c", "#f1d6cd"], blue: ["#4f7fd9", "#d6e1fa"], green: ["#3f9a62", "#d2ecd9"],
-              violet: ["#8a6cd9", "#e3dbf8"], amber: ["#d9962f", "#f6e5c6"], gray: ["#8b8d93", "#dedfe2"] };
-// Proyección: cada eje del mundo a un vector de pantalla. `rank` es hacia dónde fluye el acomodo
-// automático, `slot` dónde se apilan los del mismo nivel y `gap` el espacio entre niveles.
-const PROJ = {
-  iso:  { x: [.866, .5], y: [-.866, .5], z: [0, -1],      rank: [0, -1], slot: [1, 0], gap: 1.6, label: "side" },
-  flat: { x: [1, 0],     y: [0, 1],      z: [-.3, -.45],  rank: [1, 0],  slot: [0, 1], gap: 2.4, label: "top" },
+// Íconos de Lucide (ISC), solo el contenido del <svg> de 24×24.
+const ICONS = {
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  monitor: '<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  server: '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/>',
+  database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
+  zap: '<path d="M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z"/>',
+  layers: '<path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12"/><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"/>',
+  cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
+  globe: '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+  bot: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/>',
+  file: '<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5M10 9H8M16 13H8M16 17H8"/>',
+  shield: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
+  cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="8" y="8" width="8" height="8" rx="1"/><path d="M12 20v2M12 2v2M17 20v2M17 2v2M2 12h2M2 17h2M2 7h2M20 12h2M20 17h2M20 7h2M7 20v2M7 2v2"/>',
+  terminal: '<path d="M12 19h8"/><path d="m4 17 6-6-6-6"/>',
+  box: '<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/>',
+  phone: '<rect width="14" height="20" x="5" y="2" rx="2"/><path d="M12 18h.01"/>',
+  mail: '<path d="m22 7-8.991 5.727a2 2 0 0 1-2.009 0L2 7"/><rect x="2" y="4" width="20" height="16" rx="2"/>',
+  git: '<path d="M15 6a9 9 0 0 0-9 9V3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  gear: '<path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/><circle cx="12" cy="12" r="3"/>',
+  package: '<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><path d="M3.29 7 12 12 20.71 7M7.5 4.27l9 5.15"/>',
+  plug: '<path d="M12 22v-5M15 8V2M9 8V2"/><path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z"/>',
+  brain: '<path d="M12 18V5"/><path d="M15 13a4.17 4.17 0 0 1-3-4 4.17 4.17 0 0 1-3 4"/><path d="M17.598 6.5A3 3 0 1 0 12 5a3 3 0 1 0-5.598 1.5"/><path d="M17.997 5.125a4 4 0 0 1 2.526 5.77"/><path d="M18 18a4 4 0 0 0 2-7.464"/><path d="M19.967 17.483A4 4 0 1 1 12 18a4 4 0 1 1-7.967-.517"/><path d="M6 18a4 4 0 0 1-2-7.464"/><path d="M6.003 5.125a4 4 0 0 0-2.526 5.77"/>',
+  disk: '<path d="M10 16h.01M6 16h.01"/><path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M21.946 12.013H2.054"/>',
+  flow: '<rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/>',
 };
 
-const state = { view: "iso", items: new Map() };
-let seen = new Set(), animate = true, userMoved = false, vb = null;
+// Tipo de componente → color, ícono y nombre en la leyenda (como Archify/Cocoon: el tipo da el color).
+const TYPES = {
+  user:  { color: "#cbd5e1", icon: "user",     name: "User" },
+  ui:    { color: "#22d3ee", icon: "monitor",  name: "Interface" },
+  api:   { color: "#34d399", icon: "server",   name: "Service" },
+  db:    { color: "#a78bfa", icon: "database", name: "Database" },
+  cache: { color: "#fbbf24", icon: "zap",      name: "Cache" },
+  queue: { color: "#fb923c", icon: "layers",   name: "Queue" },
+  cloud: { color: "#60a5fa", icon: "cloud",    name: "Cloud" },
+  ext:   { color: "#94a3b8", icon: "globe",    name: "External" },
+  agent: { color: ACCENT,    icon: "bot",      name: "Agent" },
+  file:  { color: "#d6d3d1", icon: "file",     name: "File" },
+  auth:  { color: "#fb7185", icon: "shield",   name: "Security" },
+  job:   { color: "#2dd4bf", icon: "cpu",      name: "Job" },
+  tool:  { color: "#a3e635", icon: "terminal", name: "Tool" },
+};
+const PLAIN = { color: "#a1a5b0", icon: "box", name: "Component" };
+const ALIAS = { service: "api", backend: "api", server: "api", frontend: "ui", web: "ui", app: "ui", database: "db", storage: "db",
+                bus: "queue", external: "ext", ai: "agent", llm: "agent", doc: "file", config: "file", security: "auth",
+                worker: "job", cron: "job", cli: "tool", person: "user", actor: "user" };
+const FLAGS = ["dashed", "bold"];
+const KEYS = ["in", "icon", "color"];
+const typeOf = w => (TYPES[w] ? w : ALIAS[w]);
 
-// ---------- texto → estado ----------
+const doc = { title: "", view: "2d", dir: "auto", sketch: false, items: new Map() };
 
-// Una orden por línea:
-//   box ID ["etiqueta"] [w= d= h= x= y= z= on=PADRE color=coral|blue|green|violet|amber|gray]
-//   A -> B ["etiqueta"] [accent]
-//   note ID "texto" [at=top] [accent]
-//   rm ID...   clear   view iso|flat
-// Repetir un ID actualiza solo lo que se mande, así el agente manda cambios y no el diagrama entero.
-// `id` es la llamada de kuaky que espera la respuesta ("ok" o los errores).
-function apply(text, id) {
-  const errors = [];
+// ---------- texto → documento ----------
+
+// Una orden por línea (ver la herramienta `draw` de kuaky mcp):
+//   title "..." | view 2d|3d | dir lr|tb|auto | style sketch|clean | clear | rm ID...
+//   group ID "label" [in=GROUP] [color=TYPE]
+//   node ID "label" ["detail"] [TYPE] [in=GROUP] [icon=NAME] [color=TYPE|#hex]
+//   A -> B [-> C] ["label"] [dashed] [bold]     (A -- B: sin flecha)
+//   note ID "text"
+// Repetir un ID cambia solo lo que se mande.
+function parse(text, errors) {
   String(text).split("\n").forEach((raw, n) => {
     const line = raw.trim();
-    if (!line || line[0] === "#") return;
-    const t = [...line.matchAll(/"([^"]*)"|(\S+)/g)].map(m => ({ v: m[1] ?? m[2], q: m[1] !== undefined }));
-    const cmd = t[0].v, err = msg => errors.push(`línea ${n + 1}: ${msg}`);
-    if (cmd === "clear") return state.items.clear();
-    if (cmd === "view") return PROJ[t[1]?.v] ? (state.view = t[1].v) : err("view iso|flat");
-    if (cmd === "rm") return t.slice(1).forEach(x => state.items.delete(x.v));
-    if (cmd === "box" || cmd === "note") {
-      if (!t[1]) return err(`${cmd} sin ID`);
-      return upsert(cmd === "note" ? "note:" + t[1].v : t[1].v, { kind: cmd, target: t[1].v }, t.slice(2), err);
+    if (!line || line[0] === "#" || line.startsWith("//")) return;
+    const t = [...line.matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)].map(m => (m[1] !== undefined ? { q: m[1].replace(/\\"/g, '"') } : { w: m[2] }));
+    const err = msg => errors.push(`line ${n + 1}: ${msg}`);
+    const w = i => t[i]?.w;
+    const cmd = w(0);
+    if (cmd === "clear") return doc.items.clear();
+    if (cmd === "title") return (doc.title = t.slice(1).map(x => x.q ?? x.w).join(" "));
+    if (cmd === "view") {
+      const v = { "2d": "2d", flat: "2d", "3d": "3d", iso: "3d" }[w(1)];
+      return v ? (doc.view = v) : err("view 2d|3d");
     }
-    if (t[1]?.v === "->" && t[2]) return upsert(`${cmd}->${t[2].v}`, { kind: "edge", from: cmd, to: t[2].v }, t.slice(3), err);
-    err(`no entiendo "${line}"`);
+    if (cmd === "dir") return ["lr", "tb", "auto"].includes(w(1)) ? (doc.dir = w(1)) : err("dir lr|tb|auto");
+    if (cmd === "style") return ["sketch", "clean"].includes(w(1)) ? (doc.sketch = w(1) === "sketch") : err("style sketch|clean");
+    if (cmd === "rm") {
+      // Borrar un nodo se lleva sus flechas y su nota.
+      for (const x of t.slice(1)) {
+        const id = x.w ?? x.q;
+        doc.items.delete(id);
+        doc.items.delete("note:" + id);
+        for (const it of [...doc.items.values()]) if (it.kind === "edge" && (it.from === id || it.to === id)) doc.items.delete(it.id);
+      }
+      return;
+    }
+    if (cmd === "node" || cmd === "box" || cmd === "group") {
+      if (!w(1)) return err(`${cmd} needs an ID`);
+      return upsert(w(1), cmd === "group" ? "group" : "node", t.slice(2), err);
+    }
+    if (cmd === "note") return w(1) ? upsert("note:" + w(1), "note", t.slice(2), err, { target: w(1) }) : err("note needs an ID");
+    if (w(1) === "->" || w(1) === "--") {
+      // Cadena A -> B -> C: la etiqueta y las marcas van en el último tramo.
+      let i = 0;
+      while ((w(i + 1) === "->" || w(i + 1) === "--") && w(i + 2)) {
+        const last = !((w(i + 3) === "->" || w(i + 3) === "--") && w(i + 4));
+        const base = { from: w(i), to: w(i + 2), line: w(i + 1) === "--" || undefined };
+        upsert(`${base.from}->${base.to}`, "edge", last ? t.slice(i + 3) : [], err, base);
+        i += 2;
+      }
+      return;
+    }
+    err(`don't understand "${line}"`);
   });
-  const boxes = new Set([...state.items.values()].filter(i => i.kind === "box").map(i => i.id));
-  for (const i of state.items.values()) {
-    for (const ref of [i.on, i.kind === "edge" && i.from, i.kind === "edge" && i.to, i.kind === "note" && i.target])
-      if (ref && !boxes.has(ref)) errors.push(`${i.id}: no existe la caja "${ref}"`);
-  }
-  render();
-  const out = errors.length ? errors.join("\n") : "ok";
-  if (id) window.ipc?.postMessage(JSON.stringify({ id, out }));
-  return out;
 }
 
-function upsert(id, base, tokens, err) {
-  const item = state.items.get(id) ?? { id, ...base };
-  for (const { v, q } of tokens) {
-    if (q) { item.label = v; continue; }
-    const [k, val] = v.split("=");
-    if (val === undefined) item[k] = true;
-    else item[k] = val !== "" && !isNaN(val) ? +val : val;
+function upsert(id, kind, tokens, err, base = {}) {
+  let it = doc.items.get(id);
+  if (!it || it.kind !== kind) {
+    doc.items.delete(id);
+    doc.items.set(id, (it = { id, kind }));
   }
-  if (item.color && !PAL[item.color]) err(`color "${item.color}" no existe (${Object.keys(PAL).join(", ")})`);
-  state.items.set(id, item);
-}
-
-// ---------- acomodo ----------
-
-function layout(P) {
-  const items = [...state.items.values()];
-  const boxes = items.filter(i => i.kind === "box"), by = new Map(boxes.map(b => [b.id, b]));
-  const kids = new Map();
-  for (const b of boxes) {
-    b.parent = b.on && b.on !== b.id ? by.get(b.on) : null;
-    if (b.parent) (kids.get(b.parent) ?? kids.set(b.parent, []).get(b.parent)).push(b);
-  }
-  // Tamaños de abajo hacia arriba: un padre sin `w` crece para que quepan sus hijos.
-  const size = (b, depth = 0) => {
-    const ks = depth < 8 ? kids.get(b) ?? [] : [];
-    ks.forEach(k => size(k, depth + 1));
-    const cols = Math.ceil(Math.sqrt(ks.length)), cell = Math.max(0, ...ks.map(k => Math.max(k.W, k.D))) + .35;
-    b.grid = { cols, rows: Math.ceil(ks.length / cols || 0), cell };
-    // Los hijos se recargan hacia atrás para no tapar las caras visibles (etiqueta y notas).
-    const need = n => ks.length ? n * cell + .8 : 0;
-    b.W = b.w ?? Math.max(b.parent ? 1 : 2, need(cols));
-    b.D = b.d ?? Math.max(b.parent ? b.W : 2, need(b.grid.rows));
-    b.H = b.h ?? 1;
-  };
-  const tops = boxes.filter(b => !b.parent);
-  tops.forEach(b => size(b));
-
-  // Niveles por las flechas (camino más largo); sin flechas, todas en fila.
-  // ponytail: sin minimizar cruces; si se enredan con muchos nodos, usar dagre/elk aquí.
-  const root = b => { for (let i = 0; b.parent && i < 8; i++) b = b.parent; return b; };
-  const rank = new Map(tops.map((b, i) => [b, 0]));
-  const links = items.filter(i => i.kind === "edge").map(e => [by.get(e.from), by.get(e.to)])
-    .filter(([a, b]) => a && b).map(([a, b]) => [root(a), root(b)]).filter(([a, b]) => a !== b);
-  if (!links.length) tops.forEach((b, i) => rank.set(b, i));
-  else for (let k = 0; k < tops.length; k++) for (const [a, b] of links) rank.set(b, Math.max(rank.get(b), rank.get(a) + 1));
-
-  const along = (b, v) => Math.abs(v[0]) * b.W + Math.abs(v[1]) * b.D;
-  const levels = [];
-  for (const b of tops) (levels[rank.get(b)] ??= []).push(b);
-  let r = 0;
-  for (const level of levels.filter(Boolean)) {
-    const depth = Math.max(...level.map(b => along(b, P.rank)));
-    const total = level.reduce((s, b) => s + along(b, P.slot), 0) + (level.length - 1);
-    let s = -total / 2;
-    for (const b of level) {
-      const w = along(b, P.slot), c = r + depth / 2, m = s + w / 2;
-      const cx = P.rank[0] * c + P.slot[0] * m, cy = P.rank[1] * c + P.slot[1] * m;
-      b.X = b.x ?? cx - b.W / 2; b.Y = b.y ?? cy - b.D / 2; b.Z = b.z ?? 0;
-      s += w + 1;
+  Object.assign(it, base);
+  let quoted = 0;
+  for (const x of tokens) {
+    if (x.q !== undefined) {
+      if (quoted++ === 0) it.label = x.q;
+      else it.sub = x.q;
+      continue;
     }
-    r += depth + P.gap;
+    const eq = x.w.indexOf("=");
+    const k = eq < 0 ? x.w : x.w.slice(0, eq), v = eq < 0 ? null : x.w.slice(eq + 1);
+    if (v === null && typeOf(k) && kind !== "edge") it.type = typeOf(k);
+    else if (v === null && FLAGS.includes(k)) it[k] = true;
+    else if (v === "") delete it[k === "type" ? "type" : k];
+    else if (k === "type" && typeOf(v)) it.type = typeOf(v);
+    else if (k === "icon" && !ICONS[v]) err(`icon "${v}" doesn't exist (${Object.keys(ICONS).join(", ")})`);
+    else if (KEYS.includes(k) && v !== null) it[k] = v;
+    else if (v === null) err(`"${k}" is not a type (${Object.keys(TYPES).join(", ")}) or flag (${FLAGS.join(", ")})`);
+    else err(`unknown key "${k}" (${KEYS.join(", ")})`);
   }
-  const place = (b, depth = 0) => {
-    const ks = depth < 8 ? kids.get(b) ?? [] : [], { cols, rows, cell } = b.grid;
-    ks.forEach((k, i) => {
-      const cx = b.X + b.W / 2 - .2 + (i % cols - (cols - 1) / 2) * cell;
-      const cy = b.Y + b.D / 2 - .2 + (Math.floor(i / cols) - (rows - 1) / 2) * cell;
-      k.X = k.x ?? cx - k.W / 2; k.Y = k.y ?? cy - k.D / 2; k.Z = k.z ?? b.Z + b.H;
-      place(k, depth + 1);
-    });
+}
+
+function check(errors) {
+  const is = (id, kind) => doc.items.get(id)?.kind === kind;
+  for (const it of doc.items.values()) {
+    if (it.kind === "edge") for (const end of [it.from, it.to]) if (!is(end, "node")) errors.push(`${it.id}: "${end}" is not a node`);
+    if (it.kind === "note" && !is(it.target, "node")) errors.push(`${it.id}: "${it.target}" is not a node`);
+    if (it.in && !is(it.in, "group")) errors.push(`${it.id}: group "${it.in}" doesn't exist`);
+  }
+}
+
+function dump() {
+  const q = s => `"${String(s).replace(/"/g, '\\"')}"`;
+  const out = [];
+  if (doc.title) out.push(`title ${q(doc.title)}`);
+  if (doc.view !== "2d") out.push(`view ${doc.view}`);
+  if (doc.dir !== "auto") out.push(`dir ${doc.dir}`);
+  if (doc.sketch) out.push("style sketch");
+  for (const it of doc.items.values()) {
+    const p = it.kind === "edge" ? [it.from, it.line ? "--" : "->", it.to] : [it.kind, it.kind === "note" ? it.target : it.id];
+    if (it.label != null) p.push(q(it.label));
+    if (it.sub != null) p.push(q(it.sub));
+    if (it.type) p.push(it.type);
+    for (const f of FLAGS) if (it[f]) p.push(f);
+    for (const k of KEYS) if (it[k]) p.push(`${k}=${it[k]}`);
+    out.push(p.join(" "));
+  }
+  return out.join("\n");
+}
+
+// ---------- acomodo (dagre) ----------
+
+const ctx = document.createElement("canvas").getContext("2d");
+const measure = (s, size, weight = 400) => ((ctx.font = `${weight} ${size}px ${FONT}`), ctx.measureText(s ?? "").width);
+
+// `dir auto` prueba de izquierda a derecha y de arriba a abajo, y se queda con la que se ve más
+// grande en el panel (de izquierda a derecha si empatan).
+function layout() {
+  if (doc.view === "3d" || doc.dir !== "auto") return layoutWith(doc.view === "3d" ? "LR" : doc.dir.toUpperCase());
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 600;
+  const fit = L => { const g = L.g.graph(); return Math.min(W / (g.width || 1), H / (g.height || 1)); };
+  const lr = layoutWith("LR"), tb = layoutWith("TB");
+  return fit(tb) > fit(lr) * 1.1 ? tb : lr;
+}
+
+function layoutWith(rankdir) {
+  const is3d = doc.view === "3d";
+  const items = [...doc.items.values()];
+  const nodes = items.filter(i => i.kind === "node"), groups = items.filter(i => i.kind === "group");
+  const notes = new Map(items.filter(i => i.kind === "note").map(n => [n.target, n]));
+  const g = new dagre.graphlib.Graph({ compound: true });
+  // dagre no sabe del margen y el título de cada grupo: la separación entre nodos les deja lugar.
+  g.setGraph(is3d ? { rankdir: "LR", nodesep: 70, ranksep: 110, edgesep: 30 } : { rankdir, nodesep: 62, ranksep: 90, edgesep: 20 });
+  g.setDefaultEdgeLabel(() => ({}));
+  for (const n of nodes) {
+    const note = notes.get(n.id);
+    const w = is3d ? 120 : Math.min(250, Math.max(150, 62 + Math.max(measure(n.label ?? n.id, 13, 600), measure(n.sub, 11), note ? measure(note.label, 10.5) - 44 : 0)));
+    g.setNode(n.id, { width: w, height: is3d ? 120 : (n.sub ? 54 : 44) + (note ? 24 : 0) });
+  }
+  const groupIds = new Set(groups.map(x => x.id));
+  const parentOf = id => { const p = doc.items.get(id)?.in; return groupIds.has(p) ? p : null; };
+  const filled = new Set([...nodes, ...groups].map(i => parentOf(i.id)).filter(Boolean));
+  for (const gr of groups) g.setNode(gr.id, filled.has(gr.id) ? {} : { width: 160, height: 64 });
+  for (const it of [...nodes, ...groups]) {
+    // Sin ciclos de grupos (a dentro de b dentro de a).
+    const seen = new Set([it.id]);
+    let ok = true;
+    for (let p = parentOf(it.id); p && ok; p = parentOf(p)) ok = !seen.has(p) && !!seen.add(p);
+    if (ok && parentOf(it.id)) g.setParent(it.id, parentOf(it.id));
+  }
+  const edges = items.filter(e => e.kind === "edge" && doc.items.get(e.from)?.kind === "node" && doc.items.get(e.to)?.kind === "node");
+  for (const e of edges) g.setEdge(e.from, e.to, e.label ? { width: measure(e.label, 11, 500) + 20, height: 22, labelpos: "c" } : {});
+  dagre.layout(g);
+  // Caja de cada grupo: la de sus miembros más un margen (la de dagre es más grande y se enciman).
+  const pad = is3d ? 18 : 12, top = is3d ? 0 : 20, boxes = new Map();
+  const nodeBox = id => { const n = g.node(id); return [n.x - n.width / 2, n.y - n.height / 2, n.x + n.width / 2, n.y + n.height / 2]; };
+  const boxOf = (id, depth = 0) => {
+    if (boxes.has(id)) return boxes.get(id);
+    if (!filled.has(id) || depth > 20) return boxes.set(id, nodeBox(id)).get(id);
+    const b = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const k of g.children(id)) {
+      const kb = groupIds.has(k) ? boxOf(k, depth + 1) : nodeBox(k);
+      b[0] = Math.min(b[0], kb[0]); b[1] = Math.min(b[1], kb[1]); b[2] = Math.max(b[2], kb[2]); b[3] = Math.max(b[3], kb[3]);
+    }
+    return boxes.set(id, [b[0] - pad, b[1] - pad - top, b[2] + pad, b[3] + pad]).get(id);
   };
-  tops.forEach(b => place(b));
-  return { boxes, by, kids, tops };
+  groups.forEach(gr => boxOf(gr.id));
+  const depth = id => { let d = 0; for (let p = parentOf(id); p && d < 20; p = parentOf(p)) d++; return d; };
+  groups.sort((a, b) => depth(a.id) - depth(b.id));
+  return { g, nodes, groups, edges, notes, filled, boxes };
 }
 
 // ---------- dibujo ----------
 
+const NSVG = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NSVG, tag);
+  for (const k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+  parent?.append(e);
+  return e;
+}
 const hash = s => { let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return (h >>> 0) % 2147483646 + 1; };
-// Semilla fija por ID: el trazo a mano no "tiembla" al redibujar.
-const rough0 = id => ({ seed: hash(id), roughness: .55, bowing: .7, strokeWidth: 1.6, stroke: C.ink });
-const el = (tag, attrs = {}) => { const e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
-const norm = v => { const l = Math.hypot(v[0], v[1]) || 1; return [v[0] / l, v[1] / l]; };
+const hex = c => [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+const alpha = (c, a) => c + Math.round(a * 255).toString(16).padStart(2, "0");
+const mix = (a, b, t) => "#" + hex(a).map((v, i) => Math.round(v + (hex(b)[i] - v) * t).toString(16).padStart(2, "0")).join("");
+const colorOf = (it, fallback) => TYPES[typeOf(it.color)]?.color ?? (/^#[0-9a-f]{6}$/i.test(it.color ?? "") ? it.color : fallback);
+const typeInfo = it => TYPES[it.type] ?? PLAIN;
 
 function roundPath(p, r) {
   let d = "";
   p.forEach((b, i) => {
     const a = p[(i + p.length - 1) % p.length], c = p[(i + 1) % p.length];
-    const to = (from, dst) => { const l = Math.hypot(dst[0] - from[0], dst[1] - from[1]), k = Math.min(r, l / 2) / l; return [from[0] + (dst[0] - from[0]) * k, from[1] + (dst[1] - from[1]) * k]; };
-    const p1 = to(b, a), p2 = to(b, c);
-    d += `${i ? "L" : "M"}${p1} Q${b} ${p2}`;
+    const to = (f, t) => { const l = Math.hypot(t[0] - f[0], t[1] - f[1]) || 1, k = Math.min(r, l / 2) / l; return [f[0] + (t[0] - f[0]) * k, f[1] + (t[1] - f[1]) * k]; };
+    d += `${i ? "L" : "M"}${to(b, a)} Q${b} ${to(b, c)}`;
   });
   return d + "Z";
 }
+const rect = (x, y, w, h) => [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
 
-function hull(pts) {
-  pts = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-  const half = list => { const h = []; for (const p of list) { while (h.length > 1 && cross(h.at(-2), h.at(-1), p) <= 0) h.pop(); h.push(p); } h.pop(); return h; };
-  return [...half(pts), ...half(pts.reverse())];
+// d3.curveBasis: curva suave que pasa cerca de los puntos de dagre.
+function basis(pts) {
+  let d = "", x0, y0, x1, y1, n = 0;
+  const bez = (x, y) => (d += `C${(2 * x0 + x1) / 3},${(2 * y0 + y1) / 3} ${(x0 + 2 * x1) / 3},${(y0 + 2 * y1) / 3} ${(x0 + 4 * x1 + x) / 6},${(y0 + 4 * y1 + y) / 6}`);
+  for (const [x, y] of pts) {
+    if (n === 0) d += `M${x},${y}`;
+    else if (n === 2) { d += `L${(5 * x0 + x1) / 6},${(5 * y0 + y1) / 6}`; bez(x, y); }
+    else if (n > 2) bez(x, y);
+    n++; x0 = x1; x1 = x; y0 = y1; y1 = y;
+  }
+  if (n > 2) bez(x1, y1);
+  if (n >= 2) d += `L${x1},${y1}`;
+  return d;
 }
 
-function render() {
-  const P = PROJ[state.view];
-  const pr = (x, y, z) => [(x * P.x[0] + y * P.y[0] + z * P.z[0]) * S, (x * P.x[1] + y * P.y[1] + z * P.z[1]) * S];
-  const { boxes, by, kids, tops } = layout(P);
-  const now = new Set();
-  const group = id => { const g = el("g"); if (animate && !seen.has(id)) g.classList.add("pop"); now.add(id); scene.append(g); return g; };
+// Figura con trazo limpio o a mano (rough.js, semilla fija por ID para que no tiemble al redibujar).
+function shape(parent, id, d, { fill, stroke, width = 1.3, dash, cls, opacity } = {}) {
+  if (doc.sketch) {
+    const e = rc.path(d, { seed: hash(id), roughness: 1.1, bowing: 1.1, stroke: stroke ?? "none", strokeWidth: width,
+      fill, fillStyle: fill ? "solid" : undefined, strokeLineDash: dash, disableMultiStroke: !!fill && !stroke });
+    if (cls) e.setAttribute("class", cls);
+    if (opacity != null) e.setAttribute("opacity", opacity);
+    return parent.append(e), e;
+  }
+  return el("path", { d, fill: fill ?? "none", stroke: stroke ?? "none", "stroke-width": width, "stroke-dasharray": dash?.join(" "),
+    "stroke-linejoin": "round", "stroke-linecap": "round", class: cls, opacity }, parent);
+}
+
+function fitText(s, size, weight, max) {
+  s = String(s ?? "");
+  if (measure(s, size, weight) <= max) return s;
+  while (s.length > 1 && measure(s + "…", size, weight) > max) s = s.slice(0, -1);
+  return s + "…";
+}
+function text(parent, x, y, s, { size = 12, weight = 400, fill = "#ecebe8", anchor, spacing, max } = {}) {
+  const t = el("text", { x, y, "font-size": size, "font-weight": weight, fill, "text-anchor": anchor, "dominant-baseline": "central",
+    "letter-spacing": spacing, "font-family": FONT }, parent);
+  t.textContent = max ? fitText(s, size, weight, max) : s;
+  return t;
+}
+function icon(parent, name, transform, color, width = 2) {
+  const g = el("g", { transform, fill: "none", stroke: color, "stroke-width": width, "stroke-linecap": "round", "stroke-linejoin": "round" }, parent);
+  g.innerHTML = ICONS[name] ?? ICONS.box;
+  return g;
+}
+function pill(parent, id, cx, cy, s, { size = 11, weight = 500, color = "#d8d6d1", fill = "#141519", stroke = "#33353d" } = {}) {
+  const w = measure(s, size, weight) + 18, h = size + 11;
+  shape(parent, id + "#pill", roundPath(rect(cx - w / 2, cy - h / 2, w, h), h / 2), { fill, stroke, width: 1 });
+  text(parent, cx, cy + 0.5, s, { size, weight, fill: color, anchor: "middle" });
+}
+function arrowHead(parent, id, a, b, color) {
+  const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, d = [(b[0] - a[0]) / l, (b[1] - a[1]) / l], n = [-d[1], d[0]];
+  const back = [b[0] - d[0] * 10, b[1] - d[1] * 10];
+  shape(parent, id + "#arrow", roundPath([b, [back[0] + n[0] * 5, back[1] + n[1] * 5], [back[0] - n[0] * 5, back[1] - n[1] * 5]], 1), { fill: color, stroke: color, width: 1 });
+}
+
+let made = [], centers = new Map(), links = new Map();
+function item(id, cls, center) {
+  const g = el("g", { class: `item ${cls}`, "data-id": id }, scene);
+  made.push({ g, id, cls });
+  if (center) centers.set(id, center);
+  return g;
+}
+
+function drawEdge(e, pts, labelAt, project) {
+  const g = item(e.id, "edge"), color = e.bold ? ACCENT : WIRE, d = basis(pts);
+  shape(g, e.id, d, { stroke: color, width: e.bold ? 2.2 : 1.5, dash: e.dashed ? [6, 5] : null });
+  el("path", { d, class: "flow", fill: "none", stroke: e.bold ? "#ffd3c8" : "#dedcd6", "stroke-width": 2.4, "stroke-linecap": "round", opacity: .5 }, g);
+  if (!e.line) arrowHead(g, e.id, pts.at(-2), pts.at(-1), color);
+  if (e.label && labelAt) pill(g, e.id, ...labelAt, e.label, { color: e.bold ? "#ffd3c8" : "#cfcdc7" });
+  for (const end of [e.from, e.to]) (links.get(end) ?? links.set(end, new Set()).get(end)).add(e.id);
+  links.get(e.from).add(e.to);
+  links.get(e.to).add(e.from);
+}
+
+function draw2d(L) {
+  const P = id => L.g.node(id);
+  const titles = [];
+  for (const gr of L.groups) {
+    const [x0, y0, x1, y1] = L.boxes.get(gr.id), filled = L.filled.has(gr.id), color = colorOf(gr, "#8d919d");
+    const g = item(gr.id, "group", [(x0 + x1) / 2, (y0 + y1) / 2]);
+    shape(g, gr.id, roundPath(rect(x0, y0, x1 - x0, y1 - y0), 14), { fill: alpha(color, .045), stroke: alpha(color, .5), dash: [6, 5] });
+    titles.push(() => {
+      // Los títulos van encima de las flechas que cruzan el grupo.
+      const t = item(gr.id + "#title", "group", [(x0 + x1) / 2, (y0 + y1) / 2]);
+      text(t, x0 + 14, filled ? y0 + 16 : (y0 + y1) / 2, (gr.label ?? gr.id).toUpperCase(), { size: 10.5, weight: 700, fill: alpha(color, .95), spacing: ".07em", max: x1 - x0 - 24 });
+    });
+  }
+  for (const e of L.edges) {
+    const d = L.g.edge(e.from, e.to);
+    drawEdge(e, d.points.map(p => [p.x, p.y]), e.label ? [d.x, d.y] : null);
+  }
+  for (const nd of L.nodes) {
+    const n = P(nd.id), T = typeInfo(nd), color = colorOf(nd, T.color), note = L.notes.get(nd.id);
+    const x = n.x - n.width / 2, y = n.y - n.height / 2, w = n.width, h = n.height, body = h - (note ? 24 : 0);
+    const g = item(nd.id, "node", [n.x, n.y]);
+    shape(g, nd.id + "#base", roundPath(rect(x, y, w, h), 10), { fill: CARD });
+    shape(g, nd.id, roundPath(rect(x, y, w, h), 10), { fill: alpha(color, .08), stroke: alpha(color, .75), width: 1.3, dash: nd.type === "ext" ? [5, 4] : null });
+    const iy = y + body / 2 - 14;
+    el("rect", { x: x + 11, y: iy, width: 28, height: 28, rx: 7, fill: alpha(color, .16) }, g);
+    icon(g, nd.icon ?? T.icon, `translate(${x + 16} ${iy + 5}) scale(${18 / 24})`, color);
+    const tx = x + 49, max = w - 59;
+    if (nd.sub) {
+      text(g, tx, y + body / 2 - 8, nd.label ?? nd.id, { size: 13, weight: 600, max });
+      text(g, tx, y + body / 2 + 9, nd.sub, { size: 11, fill: "#9a9ba3", max });
+    } else text(g, tx, y + body / 2, nd.label ?? nd.id, { size: 13, weight: 600, max });
+    if (note) {
+      const ng = item(note.id, "note", [n.x, n.y]);
+      el("line", { x1: x + 1, x2: x + w - 1, y1: y + body, y2: y + body, stroke: alpha(color, .25) }, ng);
+      el("circle", { cx: x + 14, cy: y + body + 12, r: 3, fill: "#e8b45f" }, ng);
+      text(ng, x + 23, y + body + 12, note.label ?? "", { size: 10.5, fill: "#e8b45f", max: w - 32 });
+      (links.get(nd.id) ?? links.set(nd.id, new Set()).get(nd.id)).add(note.id);
+    }
+  }
+  titles.forEach(f => f());
+}
+
+// Isométrico: el flujo de dagre (x) sube hacia la derecha, así las flechas llegan por la cara visible.
+const C30 = Math.cos(Math.PI / 6);
+const iso = (x, y, z = 0) => [(x + y) * C30, (y - x) * 0.5 - z];
+
+function draw3d(L) {
+  const P = id => L.g.node(id), B = 72, H = 28;
+  for (const gr of L.groups) {
+    const color = colorOf(gr, "#8d919d"), [x0, y0, x1, y1] = L.boxes.get(gr.id);
+    const g = item(gr.id, "group", iso((x0 + x1) / 2, (y0 + y1) / 2));
+    shape(g, gr.id, roundPath([iso(x0, y0), iso(x1, y0), iso(x1, y1), iso(x0, y1)], 16), { fill: alpha(color, .07), stroke: alpha(color, .45), dash: [7, 6] });
+    const corner = iso(x1, y0);
+    text(g, corner[0], corner[1] - 12, (gr.label ?? gr.id).toUpperCase(), { size: 10.5, weight: 700, fill: alpha(color, .95), spacing: ".07em", anchor: "middle" });
+  }
+  for (const e of L.edges) {
+    const d = L.g.edge(e.from, e.to);
+    drawEdge(e, d.points.map(p => iso(p.x, p.y)), e.label ? iso(d.x, d.y) : null);
+  }
+  const labels = [];
+  for (const nd of [...L.nodes].sort((a, b) => { const p = P(a.id), q = P(b.id); return p.y - p.x - (q.y - q.x); })) {
+    const n = P(nd.id), T = typeInfo(nd), color = colorOf(nd, T.color);
+    const [x0, y0, x1, y1] = [n.x - B / 2, n.y - B / 2, n.x + B / 2, n.y + B / 2];
+    const g = item(nd.id, "node", iso(n.x, n.y));
+    const top = [iso(x0, y0, H), iso(x1, y0, H), iso(x1, y1, H), iso(x0, y1, H)];
+    const right = [iso(x0, y1, H), iso(x1, y1, H), iso(x1, y1, 0), iso(x0, y1, 0)];
+    const left = [iso(x0, y0, H), iso(x0, y1, H), iso(x0, y1, 0), iso(x0, y0, 0)];
+    const stroke = { stroke: INK, width: 1.2, dash: nd.type === "ext" ? [4, 3] : null };
+    shape(g, nd.id + "#l", roundPath(left, 3), { fill: mix(color, INK, .62), ...stroke });
+    shape(g, nd.id + "#r", roundPath(right, 3), { fill: mix(color, INK, .45), ...stroke });
+    shape(g, nd.id, roundPath(top, 5), { fill: mix(color, "#202127", .18), ...stroke });
+    // Ícono acostado sobre la tapa.
+    const k = 1.7, o = iso(n.x - 12 * k, n.y - 12 * k, H);
+    icon(g, nd.icon ?? T.icon, `matrix(${k * C30} ${-k * .5} ${k * C30} ${k * .5} ${o[0]} ${o[1]})`, alpha(INK, .8), 2);
+    labels.push([nd, iso(n.x, n.y, H), color, iso(x0 + B / 2, y1, H / 2)]);
+  }
+  // Etiquetas derechas, flotando sobre su bloque (siempre encima de todo).
+  for (const [nd, at, color, side] of labels) {
+    const g = item(nd.id + "#label", "node label", at);
+    const top = at[1] - 50, w = Math.max(measure(nd.label ?? nd.id, 14, 600), measure(nd.sub, 11.5)) + 24, h = nd.sub ? 40 : 27;
+    el("line", { x1: at[0], y1: at[1] - 4, x2: at[0], y2: top + h / 2, stroke: alpha(color, .6), "stroke-width": 1.2 }, g);
+    el("circle", { cx: at[0], cy: at[1] - 4, r: 2.5, fill: color }, g);
+    shape(g, nd.id + "#lab", roundPath(rect(at[0] - w / 2, top - h / 2, w, h), 7), { fill: "#15161add", stroke: alpha(color, .6), width: 1 });
+    if (nd.sub) {
+      text(g, at[0], top - 8, nd.label ?? nd.id, { size: 14, weight: 600, anchor: "middle" });
+      text(g, at[0], top + 9, nd.sub, { size: 11.5, fill: "#9a9ba3", anchor: "middle" });
+    } else text(g, at[0], top, nd.label ?? nd.id, { size: 14, weight: 600, anchor: "middle" });
+    (links.get(nd.id) ?? links.set(nd.id, new Set()).get(nd.id)).add(nd.id + "#label");
+    const note = L.notes.get(nd.id);
+    if (note) {
+      const ng = item(note.id, "note", side), nx = side[0] + 22;
+      el("line", { x1: side[0], y1: side[1], x2: nx, y2: side[1], stroke: "#e8b45f99", "stroke-width": 1.2 }, ng);
+      el("circle", { cx: side[0], cy: side[1], r: 3, fill: "#e8b45f" }, ng);
+      pill(ng, note.id, nx + measure(note.label, 10.5) / 2 + 9, side[1], note.label ?? "", { size: 10.5, color: "#f3d39b", stroke: "#e8b45f66" });
+      links.get(nd.id).add(note.id);
+    }
+  }
+}
+
+let seen = new Set(), prev = new Map();
+function render(animate) {
+  const L = layout();
   scene.replaceChildren();
-  grid.replaceChildren();
+  made = []; centers = new Map(); links = new Map();
+  (doc.view === "3d" ? draw3d : draw2d)(L);
+  $("grid").setAttribute("fill", doc.view === "3d" ? "url(#iso)" : "url(#dots)");
+  $("empty").style.display = doc.items.size ? "none" : "";
+  $("title").textContent = doc.title;
+  document.querySelectorAll("[data-view]").forEach(b => b.classList.toggle("on", b.dataset.view === doc.view));
+  $("sketch").classList.toggle("on", doc.sketch);
+  const used = [...new Set(L.nodes.map(n => n.type ?? ""))];
+  $("legend").innerHTML = used.length < 2 ? "" : used.map(t => { const T = TYPES[t] ?? PLAIN; return `<span><i style="background:${T.color}"></i>${T.name}</span>`; }).join("");
+  if (auto) fit(animate && seen.size > 0);
+  if (animate) play();
+  seen = new Set(made.map(m => m.id));
+  prev = centers;
+}
 
-  // Rejilla del piso, alrededor de lo dibujado.
-  const xs = boxes.flatMap(b => [b.X, b.X + b.W]), ys = boxes.flatMap(b => [b.Y, b.Y + b.D]);
-  const [x0, x1, y0, y1] = [Math.floor(Math.min(0, ...xs)) - 8, Math.ceil(Math.max(0, ...xs)) + 8, Math.floor(Math.min(0, ...ys)) - 8, Math.ceil(Math.max(0, ...ys)) + 8];
-  const line = (a, b) => grid.append(el("line", { x1: a[0], y1: a[1], x2: b[0], y2: b[1], stroke: C.grid }));
-  for (let x = x0; x <= x1; x++) line(pr(x, y0, 0), pr(x, y1, 0));
-  for (let y = y0; y <= y1; y++) line(pr(x0, y, 0), pr(x1, y, 0));
-
-  const ux = norm(P.x), uy = norm(P.y), uz = norm([-P.z[0], -P.z[1]]);
-  const faceText = (g, text, origin, u, v, w, h, opts) => {
-    const t = el("text", { transform: `matrix(${u[0]} ${u[1]} ${v[0]} ${v[1]} ${origin[0]} ${origin[1]})`,
-      "dominant-baseline": "central", fill: opts.fill, "font-weight": 600, "letter-spacing": ".02em" });
-    t.textContent = text;
-    let fs = Math.min(18, Math.max(9, h * .42));
-    t.setAttribute("font-size", fs);
-    g.append(t);
-    const len = t.getComputedTextLength();
-    if (len > w - 20) t.setAttribute("font-size", fs *= (w - 20) / len);
-    if (opts.center) t.setAttribute("text-anchor", "middle");
-    t.setAttribute("x", opts.center ? w / 2 : 12);
-    t.setAttribute("y", opts.center ? h / 2 : Math.min(h / 2, fs * .9 + 6));
-  };
-
-  const drawBox = b => {
-    const g = group(b.id), o = rough0(b.id), pal = PAL[b.color] ?? PAL.coral;
-    const { X: x, Y: y, Z: z, W, D, H } = b;
-    const top = [pr(x, y, z + H), pr(x + W, y, z + H), pr(x + W, y + D, z + H), pr(x, y + D, z + H)];
-    const fy = [pr(x, y + D, z + H), pr(x + W, y + D, z + H), pr(x + W, y + D, z), pr(x, y + D, z)];
-    const fx = [pr(x + W, y, z + H), pr(x + W, y + D, z + H), pr(x + W, y + D, z), pr(x + W, y, z)];
-    const corners = [...top, pr(x, y, z), pr(x + W, y, z), pr(x + W, y + D, z), pr(x, y + D, z)];
-    g.append(rc.path(roundPath(hull(corners), 8), { ...o, fill: C.ink, fillStyle: "solid", strokeWidth: 3 }));
-    g.append(rc.path(roundPath(fy, 5), { ...o, fill: C.side, fillStyle: "solid" }));
-    g.append(rc.path(roundPath(fx, 5), { ...o, fill: pal[1], fillStyle: "solid" }));
-    g.append(rc.path(roundPath(fx, 5), { ...o, stroke: "none", fill: pal[0], fillStyle: "hachure", hachureAngle: 60, hachureGap: 7, fillWeight: 2.6 }));
-    g.append(rc.path(roundPath(top, 7), { ...o, fill: C.top, fillStyle: "solid" }));
-    g.append(rc.line(...fx[0], ...fx[1], { ...o, strokeLineDash: [5, 4] }));
-    if (!b.label) return;
-    const faceH = H * S * Math.hypot(...P.z), faceW = W * S * Math.hypot(...P.x);
-    if (P.label === "side" && faceH >= 24) faceText(g, b.label, fy[0], ux, uz, faceW, faceH, { fill: C.text });
-    else faceText(g, b.label, top[0], ux, uy, faceW, D * S * Math.hypot(...P.y), { fill: C.ink, center: true });
-  };
-  // De atrás hacia adelante; los hijos justo después de su padre (van encima de él).
-  const order = list => [...list].sort((a, b) => a.X + a.W / 2 + a.Y + a.D / 2 - (b.X + b.W / 2 + b.Y + b.D / 2));
-  const tree = (b, depth = 0) => { drawBox(b); if (depth < 8) order(kids.get(b) ?? []).forEach(k => tree(k, depth + 1)); };
-  order(tops).forEach(b => tree(b));
-
-  const topCenter = b => pr(b.X + b.W / 2, b.Y + b.D / 2, b.Z + b.H);
-  // Punto del borde de la cara de arriba de `b` en dirección a `to`.
-  const rim = (b, to) => {
-    const dx = to.X + to.W / 2 - (b.X + b.W / 2), dy = to.Y + to.D / 2 - (b.Y + b.D / 2);
-    const k = Math.min(Math.abs(dx) > 1e-6 ? (b.W / 2 + .15) / Math.abs(dx) : Infinity, Math.abs(dy) > 1e-6 ? (b.D / 2 + .15) / Math.abs(dy) : Infinity, 1);
-    return pr(b.X + b.W / 2 + dx * k, b.Y + b.D / 2 + dy * k, b.Z + b.H);
-  };
-  const pill = (g, text, at, anchor, accent) => {
-    const t = el("text", { "font-size": 15, "font-weight": 500, fill: accent ? "#fff" : C.text, "dominant-baseline": "central" });
-    t.textContent = text;
-    g.append(t);
-    const w = t.getComputedTextLength() + 30, h = 34;
-    const left = anchor === "middle" ? at[0] - w / 2 : at[0];
-    t.setAttribute("x", left + 15);
-    t.setAttribute("y", at[1]);
-    const box = [[left, at[1] - h / 2], [left + w, at[1] - h / 2], [left + w, at[1] + h / 2], [left, at[1] + h / 2]];
-    g.insertBefore(rc.path(roundPath(box, 9), { ...rough0(text), roughness: .3, strokeWidth: 1.4,
-      fill: accent ? PAL.coral[0] : C.pill, fillStyle: "solid", stroke: accent ? PAL.coral[0] : C.pillLine }), t);
-  };
-
-  for (const e of state.items.values()) {
-    if (e.kind !== "edge" || !by.has(e.from) || !by.has(e.to)) continue;
-    const g = group(e.id), o = rough0(e.id), color = e.accent ? PAL.coral[0] : C.wire;
-    // En isométrico la flecha cae sobre la tapa del destino: en el borde taparía su etiqueta.
-    const to = by.get(e.to), p0 = rim(by.get(e.from), to), p1 = P.label === "side" ? topCenter(to) : rim(to, by.get(e.from));
-    const c = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2 - Math.min(60, Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) * .25)];
-    g.append(rc.path(`M${p0} Q${c} ${p1}`, { ...o, stroke: color, strokeWidth: 2.2 }));
-    const d = norm([p1[0] - c[0], p1[1] - c[1]]), n = [-d[1], d[0]];
-    const back = [p1[0] - d[0] * 13, p1[1] - d[1] * 13];
-    g.append(rc.polygon([p1, [back[0] + n[0] * 6, back[1] + n[1] * 6], [back[0] - n[0] * 6, back[1] - n[1] * 6]], { ...o, stroke: color, fill: color, fillStyle: "solid" }));
-    g.append(el("circle", { cx: p0[0], cy: p0[1], r: 4.5, fill: color, stroke: C.ink, "stroke-width": 1.5 }));
-    if (e.label) pill(g, e.label, [.25 * p0[0] + .5 * c[0] + .25 * p1[0], .25 * p0[1] + .5 * c[1] + .25 * p1[1]], "middle", e.accent);
+// Construcción poco a poco: los nuevos entran en orden, luego se trazan sus flechas; lo que ya
+// estaba se desliza a su nuevo lugar.
+function play() {
+  const fresh = made.filter(m => !seen.has(m.id));
+  const step = Math.min(110, 2200 / Math.max(1, fresh.filter(m => m.cls !== "edge").length));
+  const moved = made.some(m => { const p = prev.get(m.id), c = centers.get(m.id); return p && c && Math.hypot(p[0] - c[0], p[1] - c[1]) > .5; });
+  let k = 0;
+  for (const m of made) {
+    const p = prev.get(m.id), c = centers.get(m.id);
+    if (seen.has(m.id)) {
+      if (p && c && Math.hypot(p[0] - c[0], p[1] - c[1]) > .5)
+        m.g.animate([{ transform: `translate(${p[0] - c[0]}px, ${p[1] - c[1]}px)` }, { transform: "none" }], { duration: 520, easing: EASE });
+      else if (m.cls === "edge" && moved) m.g.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 400, delay: 200, easing: EASE, fill: "backwards" });
+      continue;
+    }
+    if (m.cls === "edge") continue;
+    m.g.animate([{ opacity: 0, transform: "translateY(10px)" }, { opacity: 1, transform: "none" }],
+      { duration: 420, delay: m.cls === "group" ? 0 : k++ * step, easing: EASE, fill: "backwards" });
   }
-
-  for (const n of state.items.values()) {
-    const b = n.kind === "note" && by.get(n.target);
-    if (!b) continue;
-    const g = group(n.id), o = rough0(n.id), top = n.at === "top";
-    const a = top ? topCenter(b) : pr(b.X + b.W, b.Y + b.D / 2, b.Z + b.H / 2);
-    const at = top ? [a[0] - 40, a[1] - 78] : [a[0] + 44, a[1]];
-    g.append(rc.line(...a, at[0], top ? at[1] + 17 : at[1], { ...o, stroke: n.accent ? PAL.coral[0] : C.pillLine, strokeWidth: 1.8 }));
-    g.append(el("circle", { cx: a[0], cy: a[1], r: 6.5, fill: n.accent ? PAL.coral[0] : C.dot, stroke: C.ink, "stroke-width": 2 }));
-    pill(g, n.label ?? "", at, top ? "middle" : "start", n.accent);
+  let j = 0;
+  const edges = fresh.filter(m => m.cls === "edge"), gap = Math.min(90, 1400 / Math.max(1, edges.length));
+  for (const m of edges) {
+    const delay = k * step + 150 + j++ * gap, [line, ...rest] = m.g.children;
+    const path = line.tagName === "path" ? line : line.querySelector("path");
+    const len = path?.getTotalLength?.() || 0;
+    if (len) path.animate([{ strokeDasharray: `${len} ${len}`, strokeDashoffset: len }, { strokeDasharray: `${len} ${len}`, strokeDashoffset: 0 }],
+      { duration: 520, delay, easing: "ease-out", fill: "backwards" });
+    for (const r of rest) r.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 300, delay: delay + 380, fill: "backwards" });
   }
-
-  seen = now;
-  if (!userMoved) fit();
 }
 
 // ---------- vista: ajustar, mover, zoom ----------
 
+let auto = true, vb = [0, 0, 800, 600], tween = 0;
+let resized = 0;
 function setVB(v) { vb = v; svg.setAttribute("viewBox", v.join(" ")); }
-function fit() {
-  const b = scene.getBBox(), p = 56;
-  setVB(b.width ? [b.x - p, b.y - p, b.width + 2 * p, b.height + 2 * p] : [-300, -200, 600, 400]);
+function fitBox() {
+  const b = scene.getBBox(), W = svg.clientWidth || 800, H = svg.clientHeight || 600;
+  if (!b.width && !b.height) return [-W / 2, -H / 2, W, H];
+  const top = 60, bottom = 48, side = 40;
+  const s = Math.min((W - 2 * side) / b.width, (H - top - bottom) / b.height, 1.25);
+  return [b.x + b.width / 2 - W / s / 2, b.y + b.height / 2 - (top - bottom) / 2 / s - H / s / 2, W / s, H / s];
 }
+function fit(animated) {
+  cancelAnimationFrame(tween);
+  const to = fitBox();
+  if (!animated) return setVB(to);
+  const from = vb.slice(), t0 = performance.now();
+  const step = now => {
+    const k = Math.min(1, (now - t0) / 500), e = 1 - (1 - k) ** 3;
+    setVB(from.map((f, i) => f + (to[i] - f) * e));
+    if (k < 1) tween = requestAnimationFrame(step);
+  };
+  tween = requestAnimationFrame(step);
+}
+const toUser = (x, y) => new DOMPoint(x, y).matrixTransform(svg.getScreenCTM().inverse());
 svg.addEventListener("wheel", e => {
   e.preventDefault();
-  const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(svg.getScreenCTM().inverse()), k = Math.exp(e.deltaY * .0015);
-  setVB([p.x - (p.x - vb[0]) * k, p.y - (p.y - vb[1]) * k, vb[2] * k, vb[3] * k]);
-  userMoved = true;
+  cancelAnimationFrame(tween);
+  auto = false;
+  // Pellizco del touchpad = rueda con Ctrl; la rueda del mouse avanza de a 120. Lo demás (dos dedos) mueve.
+  const wheel = e.deltaMode === 1 || (e.deltaX === 0 && Math.abs(e.wheelDeltaY) >= 120 && e.wheelDeltaY % 120 === 0);
+  if (e.ctrlKey || wheel) {
+    const p = toUser(e.clientX, e.clientY), dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+    const k = Math.exp(dy * (e.ctrlKey ? .012 : .0015));
+    setVB([p.x - (p.x - vb[0]) * k, p.y - (p.y - vb[1]) * k, vb[2] * k, vb[3] * k]);
+  } else {
+    const s = 1 / svg.getScreenCTM().a;
+    setVB([vb[0] + e.deltaX * s, vb[1] + e.deltaY * s, vb[2], vb[3]]);
+  }
 }, { passive: false });
 svg.addEventListener("pointerdown", e => {
   const start = [e.clientX, e.clientY], v0 = vb, s = 1 / svg.getScreenCTM().a;
-  const move = m => { setVB([v0[0] - (m.clientX - start[0]) * s, v0[1] - (m.clientY - start[1]) * s, v0[2], v0[3]]); userMoved = true; };
+  const move = m => {
+    if (Math.hypot(m.clientX - start[0], m.clientY - start[1]) < 3) return;
+    cancelAnimationFrame(tween);
+    auto = false;
+    svg.classList.add("drag");
+    setVB([v0[0] - (m.clientX - start[0]) * s, v0[1] - (m.clientY - start[1]) * s, v0[2], v0[3]]);
+  };
   svg.setPointerCapture(e.pointerId);
   svg.addEventListener("pointermove", move);
-  svg.addEventListener("pointerup", () => svg.removeEventListener("pointermove", move), { once: true });
+  svg.addEventListener("pointerup", () => { svg.removeEventListener("pointermove", move); svg.classList.remove("drag"); }, { once: true });
 });
-svg.addEventListener("dblclick", () => { userMoved = false; fit(); });
-addEventListener("resize", () => userMoved || fit());
+svg.addEventListener("dblclick", () => { auto = true; fit(true); });
+new ResizeObserver(() => {
+  cancelAnimationFrame(resized);
+  resized = requestAnimationFrame(() => (doc.view === "2d" && doc.dir === "auto" ? render(false) : auto && fit(false)));
+}).observe(svg);
 
-window.kuaky = { apply };
+// Al pasar sobre un componente se resaltan sus conexiones.
+svg.addEventListener("pointerover", e => {
+  const id = e.target.closest?.(".item.node")?.dataset.id?.replace(/#label$/, "");
+  if (!id) return;
+  const keep = new Set([id, id + "#label", ...(links.get(id) ?? [])]);
+  for (const k of [...keep]) if (doc.items.get(k)?.kind === "node") keep.add(k + "#label").add("note:" + k);
+  for (const m of made) m.g.classList.toggle("hl", keep.has(m.id) || m.cls === "group");
+  svg.classList.add("focus");
+});
+svg.addEventListener("pointerout", e => { if (!e.relatedTarget?.closest?.(".item.node")) svg.classList.remove("focus"); });
+
+// ---------- barra ----------
+
+const post = msg => window.ipc?.postMessage(JSON.stringify({ ...msg, src: dump(), title: doc.title }));
+document.querySelectorAll("[data-view]").forEach(b => (b.onclick = () => { doc.view = b.dataset.view; auto = true; render(false); post({}); }));
+$("sketch").onclick = () => { doc.sketch = !doc.sketch; render(false); post({}); };
+$("live").onclick = () => $("live").classList.toggle("on", !document.body.classList.toggle("still"));
+$("live").classList.add("on");
+$("fit").onclick = () => { auto = true; fit(true); };
+
+// ---------- API para kuaky ----------
+
+// `id`: la llamada de kuaky que espera la respuesta ("ok" o los errores).
+function apply(text, id) {
+  const errors = [];
+  parse(text, errors);
+  check(errors);
+  render(true);
+  const out = errors.length ? errors.join("\n") : "ok";
+  if (id) post({ id, out });
+  return out;
+}
+// Abre un artefacto guardado, sin animación de entrada.
+function load(src) {
+  Object.assign(doc, { title: "", view: "2d", dir: "auto", sketch: false });
+  doc.items.clear();
+  parse(src, []);
+  seen = new Set();
+  prev = new Map();
+  auto = true;
+  render(false);
+  seen = new Set(made.map(m => m.id));
+}
+window.kuaky = { apply, load, dump };
+render(false);
+if (location.hash.length > 1) load(decodeURIComponent(location.hash.slice(1)));
 window.ipc?.postMessage(JSON.stringify({ ready: true }));
-render();
-// Estado inicial en el hash (al reabrir el panel): sin animación de entrada.
-if (location.hash.length > 1) { animate = false; apply(decodeURIComponent(location.hash.slice(1))); animate = true; }
 </script>
 </body>
 </html>

@@ -769,6 +769,7 @@ impl ProjectView {
                             }))
                     })
                     .when(self.new_session_line.as_deref() == Some(line.id.as_str()), |d| {
+                        crate::webview::cover();
                         d.child(deferred(div().absolute().top_full().right_0().mt_1().child(self.agent_menu(Some(line.id.clone()), cx))).with_priority(1))
                     })
                     .tooltip(move |window, cx| Tooltip::new(format!("{state} · open on the map · + adds a session · drop a session here to move it")).build(window, cx))

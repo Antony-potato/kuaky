@@ -99,10 +99,12 @@ impl ProjectView {
     }
 
     /// Atiende una herramienta que llamó el agente del chat `call.session`.
-    /// `None`: la respuesta llega después, directo al buzón (`draw`).
+    /// `None`: la respuesta llega después, directo al buzón (`draw`, `preview`).
     pub(crate) fn tool_call(&mut self, call: &Call, window: &mut Window, cx: &mut Context<Self>) -> Option<Reply> {
         let result = match call.tool.as_str() {
             "draw" => return self.tool_draw(call, window, cx),
+            "preview" => return self.tool_preview(call, window, cx),
+            "artifacts" => self.tool_artifacts(&call.args),
             "open_session" => self.tool_open_session(&call.session, &call.args, window, cx),
             "list_sessions" => Ok(self.tool_list_sessions(&call.session, cx)),
             "read_session" => self.tool_read_session(&call.session, &call.args, cx),
@@ -114,27 +116,6 @@ impl ProjectView {
             Ok(text) => Reply::ok(text),
             Err(text) => Reply::error(text),
         })
-    }
-
-    /// Dibuja en el lienzo del proyecto; lo abre (y lo muestra) si hace falta.
-    fn tool_draw(&mut self, call: &Call, window: &mut Window, cx: &mut Context<Self>) -> Option<Reply> {
-        let Some(text) = call.args.get("text").and_then(Value::as_str) else {
-            return Some(Reply::error("Missing `text`."));
-        };
-        let view = match self.tabs.iter().position(|t| matches!(t.kind, TabKind::Canvas(_))) {
-            Some(i) => {
-                self.activate(i, window, cx);
-                let TabKind::Canvas(view) = &self.tabs[i].kind else { unreachable!() };
-                view.clone()
-            }
-            None => {
-                let view = cx.new(|_| crate::canvas_view::CanvasView::new(window));
-                self.push_tab(TabKind::Canvas(view.clone()), window, cx);
-                view
-            }
-        };
-        cx.notify();
-        view.update(cx, |v, cx| v.draw(call.id.clone(), text.to_string(), cx))
     }
 
     /// Abre otro agente como chat, como sub-línea de la línea de quien llama

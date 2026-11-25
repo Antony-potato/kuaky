@@ -42,6 +42,8 @@ mod metro;
 mod prs;
 #[path = "delegate.rs"]
 pub(crate) mod delegate;
+#[path = "artifacts.rs"]
+mod artifacts;
 pub(crate) use prs::pr_numbers_in;
 pub use metro::LiveSummary;
 
@@ -249,6 +251,7 @@ enum TabKind {
     Review(Entity<crate::review_view::ReviewView>),
     Pr(Entity<crate::pr_view::PrView>),
     Canvas(Entity<crate::canvas_view::CanvasView>),
+    Preview(Entity<crate::preview_view::PreviewView>),
 }
 
 struct Tab {
@@ -296,11 +299,19 @@ pub(crate) enum SidePanel {
     Prs,
     Actions,
     Graph,
+    Artifacts,
 }
 
 impl SidePanel {
-    pub(crate) const ALL: [SidePanel; 6] =
-        [SidePanel::Files, SidePanel::Changes, SidePanel::Branches, SidePanel::Prs, SidePanel::Actions, SidePanel::Graph];
+    pub(crate) const ALL: [SidePanel; 7] = [
+        SidePanel::Files,
+        SidePanel::Changes,
+        SidePanel::Branches,
+        SidePanel::Prs,
+        SidePanel::Actions,
+        SidePanel::Graph,
+        SidePanel::Artifacts,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -310,6 +321,7 @@ impl SidePanel {
             SidePanel::Prs => "Pull Requests",
             SidePanel::Actions => "Actions",
             SidePanel::Graph => "Graph",
+            SidePanel::Artifacts => "Artifacts",
         }
     }
 
@@ -321,6 +333,7 @@ impl SidePanel {
             SidePanel::Prs => "prs",
             SidePanel::Actions => "actions",
             SidePanel::Graph => "graph",
+            SidePanel::Artifacts => "artifacts",
         }
     }
 
@@ -333,6 +346,7 @@ impl SidePanel {
             SidePanel::Prs => "Open pull requests: merge, resolve conflicts, see which session made each one.",
             SidePanel::Actions => "GitHub Actions: launch a workflow by hand (branch and inputs), follow its runs, re-run or cancel.",
             SidePanel::Graph => "Commit history as a graph, like VS Code.",
+            SidePanel::Artifacts => "Diagrams the agents drew, and a preview of the running project.",
         }
     }
 
@@ -344,6 +358,7 @@ impl SidePanel {
             SidePanel::Prs => "git-pull-request",
             SidePanel::Actions => "circle-play",
             SidePanel::Graph => "git-graph",
+            SidePanel::Artifacts => "shapes",
         }
     }
 }
@@ -409,6 +424,10 @@ pub struct ProjectView {
     /// Previous sessions from the last time this project was open.
     previous: Vec<SavedSession>,
     quick_open: Option<Entity<QuickOpen>>,
+    /// Servidores locales que muestran las terminales (panel Artifacts).
+    local_urls: Vec<String>,
+    /// Artefacto con "Delete?" a la vista (el segundo clic lo borra).
+    deleting: Option<String>,
     rename_modal: Option<RenameSession>,
     merge_modal: Option<MergeModal>,
     /// Terminal currently resolving merge conflicts via an agent.
@@ -551,6 +570,8 @@ impl ProjectView {
             focus: cx.focus_handle(),
             previous,
             quick_open: None,
+            local_urls: Vec::new(),
+            deleting: None,
             rename_modal: None,
             merge_modal: None,
             conflict_agent_view: None,
@@ -1910,6 +1931,9 @@ impl ProjectView {
             if panel == SidePanel::Graph {
                 self.graph.update(cx, |g, cx| g.refresh(cx));
             }
+            if panel == SidePanel::Artifacts {
+                self.refresh_local_urls(cx);
+            }
             if panel == SidePanel::Actions {
                 let branch = self.git.branch.clone();
                 self.actions.update(cx, |a, cx| {
@@ -2816,8 +2840,11 @@ impl ProjectView {
                         None,
                         false,
                     ),
-                    TabKind::Canvas(_) => {
-                        (icons::ui("boxes", px(14.), style::accent()).into_any_element(), None, "Canvas".into(), false, None, false)
+                    TabKind::Canvas(v) => {
+                        (icons::ui("shapes", px(14.), style::accent()).into_any_element(), None, v.read(cx).title(), false, None, false)
+                    }
+                    TabKind::Preview(v) => {
+                        (icons::ui("globe", px(14.), style::accent()).into_any_element(), None, v.read(cx).title(), false, None, false)
                     }
                     TabKind::Chat { view, harness } => {
                         let v = view.read(cx);
@@ -2916,6 +2943,7 @@ impl ProjectView {
             TabKind::Review(v) => v.clone().into_any_element(),
             TabKind::Pr(v) => v.clone().into_any_element(),
             TabKind::Canvas(v) => v.clone().into_any_element(),
+            TabKind::Preview(v) => v.clone().into_any_element(),
         }
     }
 
@@ -3169,6 +3197,7 @@ impl ProjectView {
                     SidePanel::Prs => self.prs_panel(cx).into_any_element(),
                     SidePanel::Actions => self.actions.clone().into_any_element(),
                     SidePanel::Graph => self.graph_panel(cx).into_any_element(),
+                    SidePanel::Artifacts => self.artifacts_panel(cx).into_any_element(),
                 }))
         });
         // The metro mini map always sits under the active section.
@@ -4244,7 +4273,7 @@ impl Render for ProjectView {
             .when(
                 self.quick_open.is_some() || self.rename_modal.is_some() || self.board.is_some() || self.merge_modal.is_some() || self.new_session_menu,
                 |d| {
-                    crate::canvas_view::cover();
+                    crate::webview::cover();
                     d
                 },
             )

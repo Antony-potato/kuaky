@@ -21,6 +21,7 @@ mod memory;
 mod motion;
 mod project;
 mod pr_view;
+mod preview_view;
 mod quick_open;
 mod review_view;
 mod search_view;
@@ -29,6 +30,7 @@ mod state;
 mod style;
 mod terminal_view;
 mod updater;
+mod webview;
 mod theme;
 
 use gpui_kit::component::TitleBar;

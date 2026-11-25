@@ -9,6 +9,8 @@ Archivos copiados o adaptados de otros proyectos. Cada archivo adaptado indica s
 | Íconos de interfaz (Lucide) | [Lucide Icons](https://lucide.dev/) vía `gpui-kit-assets` 0.11.0 (`house`, `folder`, `git-compare`, `git-branch`, `git-pull-request`, `git-graph`, `git-merge`, `git-merge-conflict`, `terminal`, `search`, `settings`, `plus`, `x`, `chevron-*`, `check`, `pencil`, `trash`, `refresh-cw`) | ISC (derivados de Feather: MIT) |
 
 | `crates/kuaky/assets/canvas/rough.js` | [Rough.js](https://github.com/rough-stuff/rough) 4.6.6 (`bundled/rough.js`, sin cambios), trazo a mano del lienzo de diagramas | MIT |
+| `crates/kuaky/assets/canvas/dagre.js` | [dagre](https://github.com/dagrejs/dagre) 3.1.4 (`dist/dagre.min.js`, sin la línea del source map), acomodo de los diagramas | MIT |
+| Íconos del lienzo (`ICONS` en `crates/kuaky/assets/canvas/canvas.html`) | [Lucide Icons](https://lucide.dev/) vía `gpui-kit-assets` 0.11.0, solo el contenido de cada `<svg>` | ISC |
 
 | `crates/kuaky-usage/data/prices.json` | Subconjunto de la tabla de precios de [LiteLLM](https://github.com/BerriAI/litellm) (`model_prices_and_context_window.json`); kuaky también descarga la tabla completa una vez al día | MIT |
 

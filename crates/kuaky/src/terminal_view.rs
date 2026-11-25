@@ -144,6 +144,22 @@ impl TerminalView {
         self.label.clone()
     }
 
+    /// Direcciones locales que se ven en la terminal (un servidor de desarrollo, por ejemplo).
+    pub fn local_urls(&self) -> Vec<String> {
+        static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = URL.get_or_init(|| regex::Regex::new(r#"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?[^\s"'<>)]*"#).unwrap());
+        let Some(term) = &self.term else { return Vec::new() };
+        let text: String = term.snapshot().lines.iter().map(|l| l.iter().map(|c| c.ch).chain(['\n']).collect::<String>()).collect();
+        let mut out: Vec<String> = Vec::new();
+        for m in re.find_iter(&text) {
+            let url = m.as_str().trim_end_matches(['.', ',', ';', ':']).replace("0.0.0.0", "localhost");
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+        out
+    }
+
     /// Writes text into the program's input without pressing Enter.
     pub fn paste_text(&self, text: &str) {
         if let Some(term) = &self.term {

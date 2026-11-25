@@ -1,0 +1,31 @@
+<!doctype html>
+<!-- Pruebas del lienzo: abrir en el navegador (Chrome/Edge con --allow-file-access-from-files, o Firefox). Todas deben decir PASS. -->
+<meta charset="utf-8">
+<body>
+<pre id="out" style="position:fixed;inset:0;margin:0;padding:8px;background:#fff;color:#000;font:12px monospace;z-index:9;white-space:pre-wrap">running</pre>
+<iframe id="f" src="canvas.html" style="width:900px;height:700px"></iframe>
+<script>
+const f = document.getElementById("f");
+f.onload = () => {
+  const k = f.contentWindow.kuaky, log = [];
+  const t = (name, got, want) => log.push(`${got === want ? "PASS" : "FAIL"} ${name}${got === want ? "" : `\n  got:  ${JSON.stringify(got)}\n  want: ${JSON.stringify(want)}`}`);
+  t("basic", k.apply('title "T"\nnode a "A" api\nnode b "B" "detalle" db\na -> b "SQL" dashed'), "ok");
+  t("missing end", k.apply("a -> c"), 'a->c: "c" is not a node');
+  k.apply("rm a->c");
+  t("bad word", k.apply('node c "C" bogus'), 'line 1: "bogus" is not a type (user, ui, api, db, cache, queue, cloud, ext, agent, file, auth, job, tool) or flag (dashed, bold)');
+  t("alias type", (k.apply("node d \"D\" database"), k.dump().includes('node d "D" db')), true);
+  t("chain", k.apply('a -> c -> d "fin" bold'), "ok");
+  t("chain dump", k.dump().includes('a -> c\nc -> d "fin" bold'), true);
+  t("group", k.apply('group g "Grupo"\nnode e "E" in=g\nnode f2 "F" in=nope'), 'f2: group "nope" doesn\'t exist');
+  k.apply("rm f2");
+  t("partial update keeps label", (k.apply("node b cache"), k.dump().includes('node b "B" "detalle" cache')), true);
+  t("rm cascades", (k.apply("note a \"nota\"\nrm a"), /(^|\n)a ->|note a|node a /.test(k.dump())), false);
+  const src = k.dump();
+  k.load(src);
+  t("roundtrip", k.dump(), src);
+  t("view 3d", (k.apply("view 3d"), k.dump().includes("view 3d")), true);
+  t("unknown cmd", k.apply("hola mundo"), 'line 1: don\'t understand "hola mundo"');
+  t("quotes", (k.apply('node q "dice \\"hola\\""'), k.dump().includes('node q "dice \\"hola\\""')), true);
+  document.getElementById("out").textContent = log.join("\n") + "\n---\n" + k.dump();
+};
+</script>

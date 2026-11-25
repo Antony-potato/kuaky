@@ -36,7 +36,18 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INSTRUCTIONS: &str = "kuaky is the editor this session runs in. It shows every agent session on a map of goals (lines). \
 These tools let you split work with other coding agents. When the user asks you to have another agent (Antigravity, Codex, Gemini, Claude, OpenCode) \
 take part of the work, call open_session with a self-contained brief, then keep doing your own part. \
-Check on those sessions with read_session only when the user asks, or when you need their result to continue. Use draw when a quick diagram explains something better than text (architecture, flows, comparisons).";
+Check on those sessions with read_session only when the user asks, or when you need their result to continue. \
+Use draw when a diagram explains something better than text (architecture, flows, comparisons), and preview to show the running app.";
+
+/// Descripción de `draw`: enseña todo el formato en pocas líneas (se manda en cada sesión).
+const DRAW: &str = "Draw or edit a diagram in kuaky's canvas, beside the chat; the user watches it build. \
+Each line of `text` is a command. kuaky does the layout: never send positions. Re-sending an ID changes only what you send, \
+so send changes, not the whole diagram; for a big one send the main path first, then the rest. Replies ok or the failing lines.\n\
+title \"...\"\n\
+group ID \"label\" [in=GROUP]  (a boundary around nodes)\n\
+node ID \"label\" [\"detail\"] [TYPE] [in=GROUP]  TYPE: user ui api db cache queue cloud ext agent file auth job tool\n\
+A -> B [\"label\"] [dashed] [bold]  (A -> B -> C chains; A -- B: no arrow; dashed = async)\n\
+note ID \"text\" | rm ID... | clear | view 2d|3d (2d unless the user asks for 3d)";
 
 /// Llamada de un agente a una herramienta.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,15 +127,28 @@ pub fn tools() -> Value {
         },
         {
             "name": "draw",
-            "description": "Draw a quick diagram in kuaky's canvas, shown beside the chat. One command per line; kuaky lays it out,                             so don't send positions. Re-sending an ID changes only the keys you send: send changes, not the whole                             diagram. Replies ok or the lines that failed.
-                            box ID [\"label\"] [h=1 w=2 d=2 on=PARENT color=coral|blue|green|violet|amber|gray]  (on: stack on top)
-                            A -> B [\"label\"] [accent]  (boxes flow in levels along arrows)
-                            note ID \"text\" [at=top] [accent]  (callout on a box)
-                            rm ID...  |  clear  |  view iso|flat  (iso 3D is the default, flat is 2D)",
+            "description": DRAW,
             "inputSchema": {
                 "type": "object",
-                "properties": { "text": { "type": "string", "description": "Commands, one per line." } },
-                "required": ["text"]
+                "properties": {
+                    "artifact": { "type": "string", "description": "Diagram name, e.g. architecture. A new name creates one; an existing name edits it." },
+                    "text": { "type": "string", "description": "Commands, one per line." }
+                },
+                "required": ["artifact", "text"]
+            }
+        },
+        {
+            "name": "artifacts",
+            "description": "Diagrams saved in kuaky for this project. Without `name`: the list. With `name`: its commands, to edit it with draw.",
+            "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } } }
+        },
+        {
+            "name": "preview",
+            "description": "Show the running app (e.g. the dev server) in kuaky's preview beside the chat, or reload it. \
+                            Replies with the page title and its console errors once it loads.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "url": { "type": "string", "description": "e.g. http://localhost:5173. Omit to reload." } }
             }
         },
         {
@@ -373,7 +397,7 @@ mod tests {
         assert_eq!(out[0]["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(out[0]["result"]["serverInfo"]["name"], "kuaky");
         let names: Vec<&str> = out[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["open_session", "list_sessions", "read_session", "draw", "send_to_session"]);
+        assert_eq!(names, ["open_session", "list_sessions", "read_session", "draw", "artifacts", "preview", "send_to_session"]);
         assert_eq!(out[2]["result"]["content"][0]["text"], "opened s1");
         assert_eq!(out[2]["result"]["isError"], false);
         assert_eq!(out[3]["error"]["code"], -32602);

@@ -739,10 +739,10 @@ impl Render for KuakyApp {
                 )
             })
             .when(self.settings.is_some(), |d| {
-                crate::canvas_view::cover();
+                crate::webview::cover();
                 d
             })
             // Último en pintarse: decide si cada lienzo (ventana nativa) se ve en este cuadro.
-            .child(canvas(|_, _, _| {}, |_, _, _, _| crate::canvas_view::end_frame()).absolute().size_0())
+            .child(canvas(|_, _, _| {}, |_, _, _, _| crate::webview::end_frame()).absolute().size_0())
     }
 }
