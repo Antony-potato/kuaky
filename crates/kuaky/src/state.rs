@@ -60,7 +60,13 @@ pub struct Settings {
     /// Tema de la interfaz (como Zed: modo + un tema claro y uno oscuro).
     #[serde(default)]
     pub theme: ThemeSettings,
+    /// Sesiones que un agente puede tener abiertas a la vez con `open_session`,
+    /// aparte de la principal. `None` = [`DEFAULT_SESSION_LIMIT`]; `Some(0)` = sin límite.
+    #[serde(default)]
+    pub session_limit: Option<u32>,
 }
+
+pub const DEFAULT_SESSION_LIMIT: u32 = 3;
 
 /// `mode`: `system` (por defecto, sigue al sistema operativo), `light` o `dark`.
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq)]
@@ -84,6 +90,14 @@ impl ThemeSettings {
 }
 
 impl Settings {
+    /// Tope de sesiones abiertas desde una conversación (`None` = sin límite).
+    pub fn session_limit(&self) -> Option<usize> {
+        match self.session_limit.unwrap_or(DEFAULT_SESSION_LIMIT) {
+            0 => None,
+            n => Some(n as usize),
+        }
+    }
+
     pub fn agent(&self, key: &str) -> AgentConfig {
         self.agents.get(key).cloned().unwrap_or_default()
     }

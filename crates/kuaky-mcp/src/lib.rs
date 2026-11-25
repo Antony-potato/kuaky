@@ -24,9 +24,6 @@ pub const ENV_DIR: &str = "KUAKY_IPC_DIR";
 pub const ENV_TOKEN: &str = "KUAKY_IPC_TOKEN";
 pub const ENV_SESSION: &str = "KUAKY_SESSION";
 
-/// Sesiones abiertas a la vez desde una conversación, aparte de la principal.
-pub const MAX_SESSIONS: usize = 3;
-
 /// Agentes que se pueden abrir (claves de `Harness`, con `agy` como `antigravity`).
 pub const AGENTS: [&str; 5] = ["antigravity", "claude", "codex", "gemini", "opencode"];
 
@@ -86,7 +83,8 @@ pub fn tools() -> Value {
                 "Open a session of another coding agent in kuaky and start it on a task right away. By default it is a sub-line \
                  of your current goal and works in parallel while you keep doing your part. Use it when the user asks you to hand \
                  part of the work to another agent (e.g. \"have Antigravity do the tests while you do the sidebar\"). \
-                 Split the work by files so you don't both edit the same ones. At most {MAX_SESSIONS} sessions open besides the main one. \
+                 Split the work by files so you don't both edit the same ones. The user may limit how many sessions are open \
+                 at once (kuaky Settings → Agents); if the limit is reached it says so. \
                  Returns the session id for read_session and send_to_session."
             ),
             "inputSchema": {

@@ -35,9 +35,11 @@ Código: `crates/kuaky-mcp` (servidor y buzón), `crates/kuaky/src/delegate.rs`
   llama a `open_session`. Se abre en segundo plano (no cambia de pestaña ni
   quita el foco); la barra izquierda y el mapa la muestran, y avisa cuando
   termina o pide permiso.
-- **Tope de 3** sesiones abiertas a la vez aparte de la principal. Una sesión
-  abierta así también puede abrir otras, pero cuentan para el mismo tope
-  (se sigue `opened_by` hasta la principal). Cerrar una pestaña libera su lugar.
+- **Tope configurable** en Settings → Agents ("Sessions opened by agents"):
+  el número que quieras (3 por defecto; vacío o 0 = sin límite), contando las
+  sesiones abiertas a la vez aparte de la principal. Una sesión abierta así también puede abrir
+  otras, y cuentan para el mismo tope (se sigue `opened_by` hasta la
+  principal). Cerrar una pestaña libera su lugar.
 - **Misma carpeta por defecto.** Casi siempre son archivos distintos. El agente
   pide `worktree: true` solo si los dos tienen que tocar los mismos archivos;
   entonces la sub-línea recibe su rama `kuaky/<agente>-<fecha>`.

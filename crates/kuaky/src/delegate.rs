@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::lines::{StationSource, StationState, short};
-use kuaky_mcp::{AGENTS, Call, MAX_SESSIONS, Mailbox, Reply};
+use kuaky_mcp::{AGENTS, Call, Mailbox, Reply};
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -139,14 +139,15 @@ impl ProjectView {
         };
         let line = self.lines.line_of(caller).cloned().ok_or("Your session has no line in kuaky.")?;
 
-        // Tope: sesiones abiertas desde la principal que siguen abiertas.
+        // Tope (Settings → Agents): sesiones abiertas desde la principal que siguen abiertas.
         let root = self.lines.root_of(caller);
         let open: Vec<String> =
             self.lines.opened_from(&root).iter().map(|(_, s)| s.uid.clone()).filter(|uid| self.chat_view_of(uid, cx).is_some()).collect();
-        if open.len() >= MAX_SESSIONS {
+        let limit = state::get(cx).settings.session_limit();
+        if let Some(max) = limit.filter(|max| open.len() >= *max) {
             return Err(format!(
-                "There are already {MAX_SESSIONS} sessions open besides the main one ({}). Ask the user to close one, \
-                 or give the work to one of them with send_to_session.",
+                "There are already {max} sessions open besides the main one ({}), the limit set in kuaky Settings → Agents. \
+                 Ask the user to close one or raise the limit, or give the work to one of them with send_to_session.",
                 open.join(", ")
             ));
         }
@@ -223,11 +224,14 @@ impl ProjectView {
         let where_ = if handoff { format!("on your line \"{line_name}\"") } else { format!("on the sub-line \"{line_name}\"") };
         Ok(format!(
             "Opened {} as session `{uid}` {where_}, in {}. It is working on the task now{}. \
-             Use read_session with this id when the user asks how it is going. Sessions open besides the main one: {} of {MAX_SESSIONS}.",
+             Use read_session with this id when the user asks how it is going. Sessions open besides the main one: {}.",
             harness.label(),
             cwd.display(),
             if handoff { "" } else { "; keep doing your part" },
-            open.len() + 1,
+            match limit {
+                Some(max) => format!("{} of {max}", open.len() + 1),
+                None => format!("{} (no limit)", open.len() + 1),
+            },
         ))
     }
 

@@ -69,6 +69,8 @@ pub struct SettingsView {
     worktrees_input: Entity<InputState>,
     hidden_panels: Vec<String>,
     merge_method: String,
+    /// Sesiones que un agente puede abrir con `open_session` (vacío o 0 = sin límite).
+    session_limit_input: Entity<InputState>,
     scroll: crate::motion::SmoothScroll,
     _subs: Vec<Subscription>,
 }
@@ -125,6 +127,21 @@ impl SettingsView {
             }
         }));
 
+        let session_limit_input = cx.new(|cx| {
+            let mut s = InputState::new(window, cx).placeholder("No limit");
+            let n = saved.session_limit.unwrap_or(state::DEFAULT_SESSION_LIMIT);
+            if n > 0 {
+                s.set_value(n.to_string(), window, cx);
+            }
+            s
+        });
+        subs.push(cx.subscribe(&session_limit_input, |this: &mut Self, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.save(cx);
+                cx.notify();
+            }
+        }));
+
         let this = Self {
             section: if std::env::var_os("KUAKY_DEMO_APPEARANCE").is_some() { Section::Appearance } else { Section::Agents },
             agents,
@@ -133,6 +150,7 @@ impl SettingsView {
             worktrees_input,
             hidden_panels: saved.hidden_panels.clone(),
             merge_method: if saved.pr_merge_method.is_empty() { "merge".into() } else { saved.pr_merge_method.clone() },
+            session_limit_input,
             scroll: crate::motion::SmoothScroll::new(),
             _subs: subs,
         };
@@ -256,11 +274,16 @@ impl SettingsView {
         }
         let worktrees_dir = self.worktrees_input.read(cx).value().trim().to_string();
         let (hidden, method) = (self.hidden_panels.clone(), self.merge_method.clone());
+        // Si no es un número, se queda el que estaba.
+        let session_limit = parse_session_limit(&self.session_limit_input.read(cx).value());
         state::update(cx, |s| {
             s.settings.agents = map;
             s.settings.worktrees_dir = worktrees_dir;
             s.settings.hidden_panels = hidden;
             s.settings.pr_merge_method = method;
+            if let Some(n) = session_limit {
+                s.settings.session_limit = Some(n);
+            }
         });
         cx.emit(SettingsEvent::Changed);
     }
@@ -340,6 +363,36 @@ impl SettingsView {
                                     .child(div().text_xs().text_color(style::faint()).whitespace_normal().child(p.about())),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(key, cx)))
+                    })),
+            )
+    }
+
+    /// Cuántas sesiones puede abrir un agente con las herramientas de kuaky.
+    fn session_limit_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let valid = parse_session_limit(&self.session_limit_input.read(cx).value()).is_some();
+        v_flex()
+            .gap_2()
+            .child(div().text_xs().text_color(style::muted()).child("SESSIONS OPENED BY AGENTS"))
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_1p5()
+                    .rounded_lg()
+                    .bg(style::bg())
+                    .border_1()
+                    .border_color(style::border())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(style::faint())
+                            .whitespace_normal()
+                            .child("How many sessions a chat agent can have open at once when you ask it to hand work to another agent, besides the main one."),
+                    )
+                    .child(div().w(px(140.)).child(Input::new(&self.session_limit_input)))
+                    .child(div().text_xs().text_color(if valid { style::faint() } else { style::warn() }).child(if valid {
+                        "Leave it empty (or 0) for no limit."
+                    } else {
+                        "Type a whole number, or leave it empty for no limit."
                     })),
             )
     }
@@ -672,6 +725,7 @@ impl Render for SettingsView {
                                             })
                                     })),
                             ))
+                            .when(self.section == Section::Agents, |d| d.child(self.session_limit_card(cx)))
                             .when(self.section == Section::Appearance, |d| d.child(self.appearance_section(cx)))
                             .when(self.section == Section::Panel, |d| d.child(self.panels_section(cx)))
                             .when(self.section == Section::Pulls, |d| d.child(self.merge_section(cx)))
@@ -807,6 +861,12 @@ fn themes_folder_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
 const ANTIGRAVITY_URL: &str = "https://antigravity.google";
 
 /// Instalador oficial de cada agente (sin pedir nada en la terminal).
+/// Vacío = 0 (sin límite); `None` si no es un número entero.
+fn parse_session_limit(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if text.is_empty() { Some(0) } else { text.parse().ok() }
+}
+
 fn install_command(harness: Harness) -> Option<(&'static str, &'static [&'static str])> {
     Some(match harness {
         Harness::Claude if cfg!(windows) => ("powershell", &["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex"]),
@@ -827,4 +887,24 @@ fn switch(on: bool) -> impl IntoElement {
         .rounded_full()
         .bg(if on { style::accent().into() } else { style::border() })
         .child(div().size(px(11.)).rounded_full().bg(style::text()).when(on, |d| d.ml(px(11.))))
+}
+
+#[cfg(test)]
+mod tests {
+    // Sin `super::*`: gpui_kit trae su propio `#[test]`.
+    use super::parse_session_limit;
+    use crate::state::Settings;
+
+    #[test]
+    fn session_limit_is_any_number_or_none() {
+        assert_eq!(parse_session_limit(" 7 "), Some(7));
+        assert_eq!(parse_session_limit(""), Some(0));
+        assert_eq!(parse_session_limit("tres"), None);
+        let mut s = Settings::default();
+        assert_eq!(s.session_limit(), Some(3), "por defecto");
+        s.session_limit = Some(12);
+        assert_eq!(s.session_limit(), Some(12));
+        s.session_limit = Some(0);
+        assert_eq!(s.session_limit(), None, "0 = sin límite");
+    }
 }
