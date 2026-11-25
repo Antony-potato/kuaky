@@ -69,6 +69,7 @@ pub struct SettingsView {
     worktrees_input: Entity<InputState>,
     hidden_panels: Vec<String>,
     merge_method: String,
+    scroll: crate::motion::SmoothScroll,
     _subs: Vec<Subscription>,
 }
 
@@ -132,6 +133,7 @@ impl SettingsView {
             worktrees_input,
             hidden_panels: saved.hidden_panels.clone(),
             merge_method: if saved.pr_merge_method.is_empty() { "merge".into() } else { saved.pr_merge_method.clone() },
+            scroll: crate::motion::SmoothScroll::new(),
             _subs: subs,
         };
         this.detect(cx);
@@ -482,7 +484,8 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.scroll.tick(window);
         v_flex()
             .w(px(760.))
             .h(px(560.))
@@ -527,7 +530,13 @@ impl Render for SettingsView {
                     .id("settings-scroll")
                     .min_w_0()
                     .flex_1()
-                    .overflow_y_scroll()
+                    // Scroll propio (suave con la rueda), no el de overflow_y_scroll.
+                    .overflow_y_hidden()
+                    .track_scroll(&self.scroll.handle)
+                    .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                        this.scroll.wheel(ev, window, cx);
+                        cx.notify();
+                    }))
                     .child(
                         v_flex()
                             .p_4()

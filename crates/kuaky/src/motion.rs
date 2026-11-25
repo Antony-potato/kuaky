@@ -12,9 +12,10 @@
 
 use gpui_kit::base::animation::cubic_bezier;
 use gpui_kit::{
-    Animation, AnimationElement, AnimationExt as _, Div, ElementId, Hsla, IntoElement, ParentElement, Pixels, Styled, div,
+    Animation, AnimationElement, AnimationExt as _, App, Div, ElementId, Hsla, IntoElement, ParentElement, Pixels, ScrollEvent,
+    ScrollHandle, Styled, Window, div, point, px,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const FAST: Duration = Duration::from_millis(160);
 pub const NORMAL: Duration = Duration::from_millis(240);
@@ -80,6 +81,54 @@ pub fn spinner(id: impl Into<ElementId>, color: impl Into<Hsla>, size: Pixels) -
         .line_height(size)
         .text_color(color.into())
         .with_animation(id, anim, |d, t| d.child(SPINNER[((t * SPINNER.len() as f32) as usize).min(SPINNER.len() - 1)]))
+}
+
+/// Scroll vertical que se desliza con la rueda del ratón: en Windows cada
+/// clic salta 3 líneas de golpe y se ve a brincos; así llega en ~150 ms. El
+/// trackpad (píxeles) y "Reducir movimiento" se aplican tal cual.
+/// Uso: `.overflow_y_hidden().track_scroll(&s.handle)` + `on_scroll` → [`Self::wheel`],
+/// y [`Self::tick`] al principio de `render`.
+pub struct SmoothScroll {
+    pub handle: ScrollHandle,
+    target: Option<Pixels>,
+    last: Option<Instant>,
+}
+
+impl SmoothScroll {
+    pub fn new() -> Self {
+        Self { handle: ScrollHandle::new(), target: None, last: None }
+    }
+
+    pub fn wheel(&mut self, ev: &ScrollEvent, window: &Window, cx: &App) {
+        let max = self.handle.max_offset().y;
+        let dy = ev.delta.pixel_delta(window.line_height()).y;
+        if ev.delta.precise() || cx.reduce_motion() {
+            self.target = None;
+            self.handle.set_offset(point(px(0.), (self.handle.offset().y + dy).clamp(-max, px(0.))));
+        } else {
+            // Clics seguidos suman al destino pendiente, no al punto a medio camino.
+            let from = self.target.unwrap_or_else(|| self.handle.offset().y);
+            self.target = Some((from + dy).clamp(-max, px(0.)));
+            self.last = None;
+        }
+    }
+
+    /// Un paso hacia el destino; pide otro cuadro mientras no llegue.
+    pub fn tick(&mut self, window: &Window) {
+        let Some(target) = self.target else { return };
+        let now = Instant::now();
+        let dt = self.last.map_or(1. / 60., |t| now.duration_since(t).as_secs_f32().min(0.1));
+        self.last = Some(now);
+        let y = self.handle.offset().y;
+        let next = y + (target - y) * (1. - (-dt / 0.045).exp());
+        if (target - next).abs() < px(0.5) {
+            self.handle.set_offset(point(px(0.), target));
+            self.target = None;
+        } else {
+            self.handle.set_offset(point(px(0.), next));
+            window.request_animation_frame();
+        }
+    }
 }
 
 /// Parpadeo lento (un ciclo por segundo) para lo que está en curso.
