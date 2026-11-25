@@ -1,0 +1,318 @@
+<!doctype html>
+<!-- Lienzo de diagramas de kuaky: los agentes mandan texto corto (ver `apply`) y aquí se acomoda y
+     se dibuja en isométrico o plano, con trazo a mano de rough.js. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; height: 100%; background: #111214; overflow: hidden; }
+  svg { width: 100%; height: 100%; display: block; cursor: grab; user-select: none; }
+  svg:active { cursor: grabbing; }
+  text { font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+  .pop { animation: pop .45s cubic-bezier(.2, .9, .3, 1.25) both; transform-box: fill-box; transform-origin: 50% 100%; }
+  @keyframes pop { from { opacity: 0; transform: translateY(14px) scale(.96); } }
+</style>
+</head>
+<body>
+<svg id="svg" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="fade"><stop offset=".35" stop-color="#fff"/><stop offset="1" stop-color="#000"/></radialGradient>
+    <mask id="fadeMask" maskContentUnits="objectBoundingBox"><rect width="1" height="1" fill="url(#fade)"/></mask>
+  </defs>
+  <g id="grid" mask="url(#fadeMask)"></g>
+  <g id="scene"></g>
+</svg>
+<script src="rough.js"></script>
+<script>
+"use strict";
+const svg = document.getElementById("svg"), grid = document.getElementById("grid"), scene = document.getElementById("scene");
+const rc = rough.svg(svg);
+const S = 44; // px por unidad del mundo
+
+const C = { ink: "#141416", side: "#26272c", top: "#e9e7e2", wire: "#c9c7c1", grid: "#ffffff14",
+            pill: "#1c1d21", pillLine: "#6d6e73", text: "#f2f1ee", dot: "#e9e7e2" };
+// [rayas, fondo de la cara rayada]
+const PAL = { coral: ["#d4664c", "#f1d6cd"], blue: ["#4f7fd9", "#d6e1fa"], green: ["#3f9a62", "#d2ecd9"],
+              violet: ["#8a6cd9", "#e3dbf8"], amber: ["#d9962f", "#f6e5c6"], gray: ["#8b8d93", "#dedfe2"] };
+// Proyección: cada eje del mundo a un vector de pantalla. `rank` es hacia dónde fluye el acomodo
+// automático, `slot` dónde se apilan los del mismo nivel y `gap` el espacio entre niveles.
+const PROJ = {
+  iso:  { x: [.866, .5], y: [-.866, .5], z: [0, -1],      rank: [0, -1], slot: [1, 0], gap: 1.6, label: "side" },
+  flat: { x: [1, 0],     y: [0, 1],      z: [-.3, -.45],  rank: [1, 0],  slot: [0, 1], gap: 2.4, label: "top" },
+};
+
+const state = { view: "iso", items: new Map() };
+let seen = new Set(), animate = true, userMoved = false, vb = null;
+
+// ---------- texto → estado ----------
+
+// Una orden por línea:
+//   box ID ["etiqueta"] [w= d= h= x= y= z= on=PADRE color=coral|blue|green|violet|amber|gray]
+//   A -> B ["etiqueta"] [accent]
+//   note ID "texto" [at=top] [accent]
+//   rm ID...   clear   view iso|flat
+// Repetir un ID actualiza solo lo que se mande, así el agente manda cambios y no el diagrama entero.
+// `id` es la llamada de kuaky que espera la respuesta ("ok" o los errores).
+function apply(text, id) {
+  const errors = [];
+  String(text).split("\n").forEach((raw, n) => {
+    const line = raw.trim();
+    if (!line || line[0] === "#") return;
+    const t = [...line.matchAll(/"([^"]*)"|(\S+)/g)].map(m => ({ v: m[1] ?? m[2], q: m[1] !== undefined }));
+    const cmd = t[0].v, err = msg => errors.push(`línea ${n + 1}: ${msg}`);
+    if (cmd === "clear") return state.items.clear();
+    if (cmd === "view") return PROJ[t[1]?.v] ? (state.view = t[1].v) : err("view iso|flat");
+    if (cmd === "rm") return t.slice(1).forEach(x => state.items.delete(x.v));
+    if (cmd === "box" || cmd === "note") {
+      if (!t[1]) return err(`${cmd} sin ID`);
+      return upsert(cmd === "note" ? "note:" + t[1].v : t[1].v, { kind: cmd, target: t[1].v }, t.slice(2), err);
+    }
+    if (t[1]?.v === "->" && t[2]) return upsert(`${cmd}->${t[2].v}`, { kind: "edge", from: cmd, to: t[2].v }, t.slice(3), err);
+    err(`no entiendo "${line}"`);
+  });
+  const boxes = new Set([...state.items.values()].filter(i => i.kind === "box").map(i => i.id));
+  for (const i of state.items.values()) {
+    for (const ref of [i.on, i.kind === "edge" && i.from, i.kind === "edge" && i.to, i.kind === "note" && i.target])
+      if (ref && !boxes.has(ref)) errors.push(`${i.id}: no existe la caja "${ref}"`);
+  }
+  render();
+  const out = errors.length ? errors.join("\n") : "ok";
+  if (id) window.ipc?.postMessage(JSON.stringify({ id, out }));
+  return out;
+}
+
+function upsert(id, base, tokens, err) {
+  const item = state.items.get(id) ?? { id, ...base };
+  for (const { v, q } of tokens) {
+    if (q) { item.label = v; continue; }
+    const [k, val] = v.split("=");
+    if (val === undefined) item[k] = true;
+    else item[k] = val !== "" && !isNaN(val) ? +val : val;
+  }
+  if (item.color && !PAL[item.color]) err(`color "${item.color}" no existe (${Object.keys(PAL).join(", ")})`);
+  state.items.set(id, item);
+}
+
+// ---------- acomodo ----------
+
+function layout(P) {
+  const items = [...state.items.values()];
+  const boxes = items.filter(i => i.kind === "box"), by = new Map(boxes.map(b => [b.id, b]));
+  const kids = new Map();
+  for (const b of boxes) {
+    b.parent = b.on && b.on !== b.id ? by.get(b.on) : null;
+    if (b.parent) (kids.get(b.parent) ?? kids.set(b.parent, []).get(b.parent)).push(b);
+  }
+  // Tamaños de abajo hacia arriba: un padre sin `w` crece para que quepan sus hijos.
+  const size = (b, depth = 0) => {
+    const ks = depth < 8 ? kids.get(b) ?? [] : [];
+    ks.forEach(k => size(k, depth + 1));
+    const cols = Math.ceil(Math.sqrt(ks.length)), cell = Math.max(0, ...ks.map(k => Math.max(k.W, k.D))) + .35;
+    b.grid = { cols, rows: Math.ceil(ks.length / cols || 0), cell };
+    // Los hijos se recargan hacia atrás para no tapar las caras visibles (etiqueta y notas).
+    const need = n => ks.length ? n * cell + .8 : 0;
+    b.W = b.w ?? Math.max(b.parent ? 1 : 2, need(cols));
+    b.D = b.d ?? Math.max(b.parent ? b.W : 2, need(b.grid.rows));
+    b.H = b.h ?? 1;
+  };
+  const tops = boxes.filter(b => !b.parent);
+  tops.forEach(b => size(b));
+
+  // Niveles por las flechas (camino más largo); sin flechas, todas en fila.
+  // ponytail: sin minimizar cruces; si se enredan con muchos nodos, usar dagre/elk aquí.
+  const root = b => { for (let i = 0; b.parent && i < 8; i++) b = b.parent; return b; };
+  const rank = new Map(tops.map((b, i) => [b, 0]));
+  const links = items.filter(i => i.kind === "edge").map(e => [by.get(e.from), by.get(e.to)])
+    .filter(([a, b]) => a && b).map(([a, b]) => [root(a), root(b)]).filter(([a, b]) => a !== b);
+  if (!links.length) tops.forEach((b, i) => rank.set(b, i));
+  else for (let k = 0; k < tops.length; k++) for (const [a, b] of links) rank.set(b, Math.max(rank.get(b), rank.get(a) + 1));
+
+  const along = (b, v) => Math.abs(v[0]) * b.W + Math.abs(v[1]) * b.D;
+  const levels = [];
+  for (const b of tops) (levels[rank.get(b)] ??= []).push(b);
+  let r = 0;
+  for (const level of levels.filter(Boolean)) {
+    const depth = Math.max(...level.map(b => along(b, P.rank)));
+    const total = level.reduce((s, b) => s + along(b, P.slot), 0) + (level.length - 1);
+    let s = -total / 2;
+    for (const b of level) {
+      const w = along(b, P.slot), c = r + depth / 2, m = s + w / 2;
+      const cx = P.rank[0] * c + P.slot[0] * m, cy = P.rank[1] * c + P.slot[1] * m;
+      b.X = b.x ?? cx - b.W / 2; b.Y = b.y ?? cy - b.D / 2; b.Z = b.z ?? 0;
+      s += w + 1;
+    }
+    r += depth + P.gap;
+  }
+  const place = (b, depth = 0) => {
+    const ks = depth < 8 ? kids.get(b) ?? [] : [], { cols, rows, cell } = b.grid;
+    ks.forEach((k, i) => {
+      const cx = b.X + b.W / 2 - .2 + (i % cols - (cols - 1) / 2) * cell;
+      const cy = b.Y + b.D / 2 - .2 + (Math.floor(i / cols) - (rows - 1) / 2) * cell;
+      k.X = k.x ?? cx - k.W / 2; k.Y = k.y ?? cy - k.D / 2; k.Z = k.z ?? b.Z + b.H;
+      place(k, depth + 1);
+    });
+  };
+  tops.forEach(b => place(b));
+  return { boxes, by, kids, tops };
+}
+
+// ---------- dibujo ----------
+
+const hash = s => { let h = 2166136261; for (const c of s) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return (h >>> 0) % 2147483646 + 1; };
+// Semilla fija por ID: el trazo a mano no "tiembla" al redibujar.
+const rough0 = id => ({ seed: hash(id), roughness: .55, bowing: .7, strokeWidth: 1.6, stroke: C.ink });
+const el = (tag, attrs = {}) => { const e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+const norm = v => { const l = Math.hypot(v[0], v[1]) || 1; return [v[0] / l, v[1] / l]; };
+
+function roundPath(p, r) {
+  let d = "";
+  p.forEach((b, i) => {
+    const a = p[(i + p.length - 1) % p.length], c = p[(i + 1) % p.length];
+    const to = (from, dst) => { const l = Math.hypot(dst[0] - from[0], dst[1] - from[1]), k = Math.min(r, l / 2) / l; return [from[0] + (dst[0] - from[0]) * k, from[1] + (dst[1] - from[1]) * k]; };
+    const p1 = to(b, a), p2 = to(b, c);
+    d += `${i ? "L" : "M"}${p1} Q${b} ${p2}`;
+  });
+  return d + "Z";
+}
+
+function hull(pts) {
+  pts = [...pts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const half = list => { const h = []; for (const p of list) { while (h.length > 1 && cross(h.at(-2), h.at(-1), p) <= 0) h.pop(); h.push(p); } h.pop(); return h; };
+  return [...half(pts), ...half(pts.reverse())];
+}
+
+function render() {
+  const P = PROJ[state.view];
+  const pr = (x, y, z) => [(x * P.x[0] + y * P.y[0] + z * P.z[0]) * S, (x * P.x[1] + y * P.y[1] + z * P.z[1]) * S];
+  const { boxes, by, kids, tops } = layout(P);
+  const now = new Set();
+  const group = id => { const g = el("g"); if (animate && !seen.has(id)) g.classList.add("pop"); now.add(id); scene.append(g); return g; };
+  scene.replaceChildren();
+  grid.replaceChildren();
+
+  // Rejilla del piso, alrededor de lo dibujado.
+  const xs = boxes.flatMap(b => [b.X, b.X + b.W]), ys = boxes.flatMap(b => [b.Y, b.Y + b.D]);
+  const [x0, x1, y0, y1] = [Math.floor(Math.min(0, ...xs)) - 8, Math.ceil(Math.max(0, ...xs)) + 8, Math.floor(Math.min(0, ...ys)) - 8, Math.ceil(Math.max(0, ...ys)) + 8];
+  const line = (a, b) => grid.append(el("line", { x1: a[0], y1: a[1], x2: b[0], y2: b[1], stroke: C.grid }));
+  for (let x = x0; x <= x1; x++) line(pr(x, y0, 0), pr(x, y1, 0));
+  for (let y = y0; y <= y1; y++) line(pr(x0, y, 0), pr(x1, y, 0));
+
+  const ux = norm(P.x), uy = norm(P.y), uz = norm([-P.z[0], -P.z[1]]);
+  const faceText = (g, text, origin, u, v, w, h, opts) => {
+    const t = el("text", { transform: `matrix(${u[0]} ${u[1]} ${v[0]} ${v[1]} ${origin[0]} ${origin[1]})`,
+      "dominant-baseline": "central", fill: opts.fill, "font-weight": 600, "letter-spacing": ".02em" });
+    t.textContent = text;
+    let fs = Math.min(18, Math.max(9, h * .42));
+    t.setAttribute("font-size", fs);
+    g.append(t);
+    const len = t.getComputedTextLength();
+    if (len > w - 20) t.setAttribute("font-size", fs *= (w - 20) / len);
+    if (opts.center) t.setAttribute("text-anchor", "middle");
+    t.setAttribute("x", opts.center ? w / 2 : 12);
+    t.setAttribute("y", opts.center ? h / 2 : Math.min(h / 2, fs * .9 + 6));
+  };
+
+  const drawBox = b => {
+    const g = group(b.id), o = rough0(b.id), pal = PAL[b.color] ?? PAL.coral;
+    const { X: x, Y: y, Z: z, W, D, H } = b;
+    const top = [pr(x, y, z + H), pr(x + W, y, z + H), pr(x + W, y + D, z + H), pr(x, y + D, z + H)];
+    const fy = [pr(x, y + D, z + H), pr(x + W, y + D, z + H), pr(x + W, y + D, z), pr(x, y + D, z)];
+    const fx = [pr(x + W, y, z + H), pr(x + W, y + D, z + H), pr(x + W, y + D, z), pr(x + W, y, z)];
+    const corners = [...top, pr(x, y, z), pr(x + W, y, z), pr(x + W, y + D, z), pr(x, y + D, z)];
+    g.append(rc.path(roundPath(hull(corners), 8), { ...o, fill: C.ink, fillStyle: "solid", strokeWidth: 3 }));
+    g.append(rc.path(roundPath(fy, 5), { ...o, fill: C.side, fillStyle: "solid" }));
+    g.append(rc.path(roundPath(fx, 5), { ...o, fill: pal[1], fillStyle: "solid" }));
+    g.append(rc.path(roundPath(fx, 5), { ...o, stroke: "none", fill: pal[0], fillStyle: "hachure", hachureAngle: 60, hachureGap: 7, fillWeight: 2.6 }));
+    g.append(rc.path(roundPath(top, 7), { ...o, fill: C.top, fillStyle: "solid" }));
+    g.append(rc.line(...fx[0], ...fx[1], { ...o, strokeLineDash: [5, 4] }));
+    if (!b.label) return;
+    const faceH = H * S * Math.hypot(...P.z), faceW = W * S * Math.hypot(...P.x);
+    if (P.label === "side" && faceH >= 24) faceText(g, b.label, fy[0], ux, uz, faceW, faceH, { fill: C.text });
+    else faceText(g, b.label, top[0], ux, uy, faceW, D * S * Math.hypot(...P.y), { fill: C.ink, center: true });
+  };
+  // De atrás hacia adelante; los hijos justo después de su padre (van encima de él).
+  const order = list => [...list].sort((a, b) => a.X + a.W / 2 + a.Y + a.D / 2 - (b.X + b.W / 2 + b.Y + b.D / 2));
+  const tree = (b, depth = 0) => { drawBox(b); if (depth < 8) order(kids.get(b) ?? []).forEach(k => tree(k, depth + 1)); };
+  order(tops).forEach(b => tree(b));
+
+  const topCenter = b => pr(b.X + b.W / 2, b.Y + b.D / 2, b.Z + b.H);
+  // Punto del borde de la cara de arriba de `b` en dirección a `to`.
+  const rim = (b, to) => {
+    const dx = to.X + to.W / 2 - (b.X + b.W / 2), dy = to.Y + to.D / 2 - (b.Y + b.D / 2);
+    const k = Math.min(Math.abs(dx) > 1e-6 ? (b.W / 2 + .15) / Math.abs(dx) : Infinity, Math.abs(dy) > 1e-6 ? (b.D / 2 + .15) / Math.abs(dy) : Infinity, 1);
+    return pr(b.X + b.W / 2 + dx * k, b.Y + b.D / 2 + dy * k, b.Z + b.H);
+  };
+  const pill = (g, text, at, anchor, accent) => {
+    const t = el("text", { "font-size": 15, "font-weight": 500, fill: accent ? "#fff" : C.text, "dominant-baseline": "central" });
+    t.textContent = text;
+    g.append(t);
+    const w = t.getComputedTextLength() + 30, h = 34;
+    const left = anchor === "middle" ? at[0] - w / 2 : at[0];
+    t.setAttribute("x", left + 15);
+    t.setAttribute("y", at[1]);
+    const box = [[left, at[1] - h / 2], [left + w, at[1] - h / 2], [left + w, at[1] + h / 2], [left, at[1] + h / 2]];
+    g.insertBefore(rc.path(roundPath(box, 9), { ...rough0(text), roughness: .3, strokeWidth: 1.4,
+      fill: accent ? PAL.coral[0] : C.pill, fillStyle: "solid", stroke: accent ? PAL.coral[0] : C.pillLine }), t);
+  };
+
+  for (const e of state.items.values()) {
+    if (e.kind !== "edge" || !by.has(e.from) || !by.has(e.to)) continue;
+    const g = group(e.id), o = rough0(e.id), color = e.accent ? PAL.coral[0] : C.wire;
+    // En isométrico la flecha cae sobre la tapa del destino: en el borde taparía su etiqueta.
+    const to = by.get(e.to), p0 = rim(by.get(e.from), to), p1 = P.label === "side" ? topCenter(to) : rim(to, by.get(e.from));
+    const c = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2 - Math.min(60, Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) * .25)];
+    g.append(rc.path(`M${p0} Q${c} ${p1}`, { ...o, stroke: color, strokeWidth: 2.2 }));
+    const d = norm([p1[0] - c[0], p1[1] - c[1]]), n = [-d[1], d[0]];
+    const back = [p1[0] - d[0] * 13, p1[1] - d[1] * 13];
+    g.append(rc.polygon([p1, [back[0] + n[0] * 6, back[1] + n[1] * 6], [back[0] - n[0] * 6, back[1] - n[1] * 6]], { ...o, stroke: color, fill: color, fillStyle: "solid" }));
+    g.append(el("circle", { cx: p0[0], cy: p0[1], r: 4.5, fill: color, stroke: C.ink, "stroke-width": 1.5 }));
+    if (e.label) pill(g, e.label, [.25 * p0[0] + .5 * c[0] + .25 * p1[0], .25 * p0[1] + .5 * c[1] + .25 * p1[1]], "middle", e.accent);
+  }
+
+  for (const n of state.items.values()) {
+    const b = n.kind === "note" && by.get(n.target);
+    if (!b) continue;
+    const g = group(n.id), o = rough0(n.id), top = n.at === "top";
+    const a = top ? topCenter(b) : pr(b.X + b.W, b.Y + b.D / 2, b.Z + b.H / 2);
+    const at = top ? [a[0] - 40, a[1] - 78] : [a[0] + 44, a[1]];
+    g.append(rc.line(...a, at[0], top ? at[1] + 17 : at[1], { ...o, stroke: n.accent ? PAL.coral[0] : C.pillLine, strokeWidth: 1.8 }));
+    g.append(el("circle", { cx: a[0], cy: a[1], r: 6.5, fill: n.accent ? PAL.coral[0] : C.dot, stroke: C.ink, "stroke-width": 2 }));
+    pill(g, n.label ?? "", at, top ? "middle" : "start", n.accent);
+  }
+
+  seen = now;
+  if (!userMoved) fit();
+}
+
+// ---------- vista: ajustar, mover, zoom ----------
+
+function setVB(v) { vb = v; svg.setAttribute("viewBox", v.join(" ")); }
+function fit() {
+  const b = scene.getBBox(), p = 56;
+  setVB(b.width ? [b.x - p, b.y - p, b.width + 2 * p, b.height + 2 * p] : [-300, -200, 600, 400]);
+}
+svg.addEventListener("wheel", e => {
+  e.preventDefault();
+  const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(svg.getScreenCTM().inverse()), k = Math.exp(e.deltaY * .0015);
+  setVB([p.x - (p.x - vb[0]) * k, p.y - (p.y - vb[1]) * k, vb[2] * k, vb[3] * k]);
+  userMoved = true;
+}, { passive: false });
+svg.addEventListener("pointerdown", e => {
+  const start = [e.clientX, e.clientY], v0 = vb, s = 1 / svg.getScreenCTM().a;
+  const move = m => { setVB([v0[0] - (m.clientX - start[0]) * s, v0[1] - (m.clientY - start[1]) * s, v0[2], v0[3]]); userMoved = true; };
+  svg.setPointerCapture(e.pointerId);
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerup", () => svg.removeEventListener("pointermove", move), { once: true });
+});
+svg.addEventListener("dblclick", () => { userMoved = false; fit(); });
+addEventListener("resize", () => userMoved || fit());
+
+window.kuaky = { apply };
+window.ipc?.postMessage(JSON.stringify({ ready: true }));
+render();
+// Estado inicial en el hash (al reabrir el panel): sin animación de entrada.
+if (location.hash.length > 1) { animate = false; apply(decodeURIComponent(location.hash.slice(1))); animate = true; }
+</script>
+</body>
+</html>

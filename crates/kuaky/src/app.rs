@@ -407,6 +407,7 @@ impl KuakyApp {
             let calls = cx.background_executor().spawn(async move { mailbox.take() }).await;
             for call in calls {
                 let Ok(reply) = this.update_in(cx, |this, window, cx| this.tool_call(&call, window, cx)) else { return };
+                let Some(reply) = reply else { continue };
                 if let Err(err) = mailbox.answer(&call.id, &reply) {
                     tracing::warn!(%err, tool = call.tool, "no se pudo contestar la herramienta");
                 }
@@ -415,9 +416,9 @@ impl KuakyApp {
         .detach();
     }
 
-    fn tool_call(&mut self, call: &kuaky_mcp::Call, window: &mut Window, cx: &mut Context<Self>) -> kuaky_mcp::Reply {
+    fn tool_call(&mut self, call: &kuaky_mcp::Call, window: &mut Window, cx: &mut Context<Self>) -> Option<kuaky_mcp::Reply> {
         let Some(project) = self.projects.iter().find(|p| p.read(cx).has_chat(&call.session, cx)).cloned() else {
-            return kuaky_mcp::Reply::error("This session is no longer open in kuaky.");
+            return Some(kuaky_mcp::Reply::error("This session is no longer open in kuaky."));
         };
         project.update(cx, |p, cx| p.tool_call(call, window, cx))
     }
@@ -737,5 +738,11 @@ impl Render for KuakyApp {
                         .with_animation("settings-in", crate::motion::once(crate::motion::FAST), |d, t| d.opacity(t)),
                 )
             })
+            .when(self.settings.is_some(), |d| {
+                crate::canvas_view::cover();
+                d
+            })
+            // Último en pintarse: decide si cada lienzo (ventana nativa) se ve en este cuadro.
+            .child(canvas(|_, _, _| {}, |_, _, _, _| crate::canvas_view::end_frame()).absolute().size_0())
     }
 }

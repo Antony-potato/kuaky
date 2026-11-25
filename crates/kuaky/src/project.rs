@@ -248,6 +248,7 @@ enum TabKind {
     Search(Entity<SearchView>),
     Review(Entity<crate::review_view::ReviewView>),
     Pr(Entity<crate::pr_view::PrView>),
+    Canvas(Entity<crate::canvas_view::CanvasView>),
 }
 
 struct Tab {
@@ -2815,6 +2816,9 @@ impl ProjectView {
                         None,
                         false,
                     ),
+                    TabKind::Canvas(_) => {
+                        (icons::ui("boxes", px(14.), style::accent()).into_any_element(), None, "Canvas".into(), false, None, false)
+                    }
                     TabKind::Chat { view, harness } => {
                         let v = view.read(cx);
                         let (_, dot) = chat_status(v);
@@ -2911,6 +2915,7 @@ impl ProjectView {
             TabKind::Search(v) => v.clone().into_any_element(),
             TabKind::Review(v) => v.clone().into_any_element(),
             TabKind::Pr(v) => v.clone().into_any_element(),
+            TabKind::Canvas(v) => v.clone().into_any_element(),
         }
     }
 
@@ -4235,6 +4240,14 @@ impl Render for ProjectView {
             .when_some(self.rename_modal.as_ref().map(|m| self.rename_overlay(m, cx)), |d, el| d.child(el))
             .when(self.board.is_some(), |d| d.child(self.board_overlay(cx)))
             .when_some(self.merge_modal.as_ref().map(|m| self.merge_overlay(m, cx)), |d, el| d.child(el))
+            // Algo flota sobre el centro: el lienzo (ventana nativa) se esconde para no taparlo.
+            .when(
+                self.quick_open.is_some() || self.rename_modal.is_some() || self.board.is_some() || self.merge_modal.is_some() || self.new_session_menu,
+                |d| {
+                    crate::canvas_view::cover();
+                    d
+                },
+            )
     }
 }
 

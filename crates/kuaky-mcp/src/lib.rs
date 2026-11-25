@@ -36,7 +36,7 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INSTRUCTIONS: &str = "kuaky is the editor this session runs in. It shows every agent session on a map of goals (lines). \
 These tools let you split work with other coding agents. When the user asks you to have another agent (Antigravity, Codex, Gemini, Claude, OpenCode) \
 take part of the work, call open_session with a self-contained brief, then keep doing your own part. \
-Check on those sessions with read_session only when the user asks, or when you need their result to continue.";
+Check on those sessions with read_session only when the user asks, or when you need their result to continue. Use draw when a quick diagram explains something better than text (architecture, flows, comparisons).";
 
 /// Llamada de un agente a una herramienta.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +113,19 @@ pub fn tools() -> Value {
             "name": "read_session",
             "description": "Status, plan and latest answer of a session opened with open_session. Use it when the user asks how it is going or what it found.",
             "inputSchema": { "type": "object", "properties": { "session": session }, "required": ["session"] }
+        },
+        {
+            "name": "draw",
+            "description": "Draw a quick diagram in kuaky's canvas, shown beside the chat. One command per line; kuaky lays it out,                             so don't send positions. Re-sending an ID changes only the keys you send: send changes, not the whole                             diagram. Replies ok or the lines that failed.
+                            box ID [\"label\"] [h=1 w=2 d=2 on=PARENT color=coral|blue|green|violet|amber|gray]  (on: stack on top)
+                            A -> B [\"label\"] [accent]  (boxes flow in levels along arrows)
+                            note ID \"text\" [at=top] [accent]  (callout on a box)
+                            rm ID...  |  clear  |  view iso|flat  (iso 3D is the default, flat is 2D)",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "text": { "type": "string", "description": "Commands, one per line." } },
+                "required": ["text"]
+            }
         },
         {
             "name": "send_to_session",
@@ -360,7 +373,7 @@ mod tests {
         assert_eq!(out[0]["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(out[0]["result"]["serverInfo"]["name"], "kuaky");
         let names: Vec<&str> = out[1]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["open_session", "list_sessions", "read_session", "send_to_session"]);
+        assert_eq!(names, ["open_session", "list_sessions", "read_session", "draw", "send_to_session"]);
         assert_eq!(out[2]["result"]["content"][0]["text"], "opened s1");
         assert_eq!(out[2]["result"]["isError"], false);
         assert_eq!(out[3]["error"]["code"], -32602);

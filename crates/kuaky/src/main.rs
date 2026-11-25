@@ -6,6 +6,7 @@ mod agent_history;
 mod agent_status;
 mod agent_tasks;
 mod app;
+mod canvas_view;
 mod chat_view;
 mod conflict_view;
 mod diff_view;

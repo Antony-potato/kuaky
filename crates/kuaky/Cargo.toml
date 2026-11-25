@@ -34,6 +34,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Lienzo de diagramas (`canvas_view`): WebView2 en Windows, WKWebView en macOS. En Linux pide
+# GTK/WebKitGTK, así que ahí no se incluye.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+wry = { version = "0.57", default-features = false }
+
 [features]
 # Modo de desarrollo: KUAKY_SCREENSHOT=archivo.png guarda una captura de la ventana y cierra.
 screenshot = ["gpui-kit/test-support"]
