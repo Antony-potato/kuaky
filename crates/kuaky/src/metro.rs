@@ -717,8 +717,20 @@ impl ProjectView {
                 (!tabs.is_empty()).then_some((line, depth, tabs))
             })
             .collect();
-        for (k, (line, depth, tabs)) in shown.iter().enumerate() {
-            let (line, depth) = (*line, *depth);
+        let mut k = 0;
+        while k < shown.len() {
+            let (line, depth, tabs) = (&shown[k].0, shown[k].1, &shown[k].2);
+            let line = *line;
+            // Sub-líneas visibles directamente debajo de esta línea en el árbol.
+            let sub_end = shown[k + 1..]
+                .iter()
+                .position(|(_, d, _)| *d <= depth)
+                .map(|n| k + 1 + n)
+                .unwrap_or(shown.len());
+            let sub_count = sub_end - (k + 1);
+            let has_subs = sub_count > 0;
+            let collapsed = has_subs && self.collapsed_lines.contains(&line.id);
+
             // ¿Le quedan hermanos abajo en el nivel `level`? (├ / │ si sí; └ si es el último)
             let more_at = |level: usize| shown[k + 1..].iter().take_while(|(_, d, _)| *d >= level).any(|(_, d, _)| *d == level);
             let guides: Vec<bool> = (1..=depth).map(more_at).collect();
@@ -742,6 +754,30 @@ impl ProjectView {
                     .hover(|d| d.text_color(style::muted()))
                     .group(SharedString::from(format!("line-g-{}", line.id)))
                     .relative()
+                    .when(has_subs, |d| {
+                        let toggle_id = line.id.clone();
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("line-fold-{}", line.id)))
+                                .flex_none()
+                                .p_0p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(style::panel_hover()))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(if collapsed { "Expand sub-lines" } else { "Collapse sub-lines" }).build(window, cx)
+                                })
+                                .child(icons::ui(if collapsed { "chevron-right" } else { "chevron-down" }, px(11.), style::faint()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.collapsed_lines.remove(&toggle_id) {
+                                        this.collapsed_lines.insert(toggle_id.clone());
+                                    }
+                                    this.persist(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(div().min_w_0().truncate().child(line.name.clone()))
                     .when(total > 0, |d| d.child(div().flex_none().child(format!("· {done}/{total}"))))
                     .child(div().flex_1())
@@ -788,6 +824,63 @@ impl ProjectView {
                 }
             }
             out.push(if depth == 0 { block.into_any_element() } else { tree_branch(block, &guides) });
+
+            if collapsed {
+                // Plegadas: marcar sus sesiones como usadas y resumir estado con los colores del punto 1.
+                let (mut working, mut needs_you, mut unseen_done) = (0usize, 0usize, 0usize);
+                for (_, _, sub_tabs) in &shown[k + 1..sub_end] {
+                    for &ti in sub_tabs {
+                        used.push(ti);
+                        if let Some(tab) = self.tabs.get(ti) {
+                            match self.session_badge(tab, now, cx) {
+                                super::SessionBadge::Working => working += 1,
+                                super::SessionBadge::NeedsYou => needs_you += 1,
+                                super::SessionBadge::Done => unseen_done += 1,
+                                super::SessionBadge::Idle => {}
+                            }
+                        }
+                    }
+                }
+                let expand_id = line.id.clone();
+                let mut summary_guides = guides;
+                summary_guides.push(false);
+                let summary = h_flex()
+                    .id(SharedString::from(format!("line-summary-{}", line.id)))
+                    .mt_1()
+                    .px_2()
+                    .py_0p5()
+                    .gap_1()
+                    .items_center()
+                    .flex_wrap()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(style::faint())
+                    .hover(|d| d.bg(style::panel_hover()).text_color(style::muted()))
+                    .child(format!("{sub_count} sub-line{}", if sub_count == 1 { "" } else { "s" }))
+                    .when(working > 0, |d| {
+                        d.child("·")
+                            .child(crate::motion::spinner(SharedString::from(format!("fold-spin-{}", line.id)), style::accent(), px(10.)))
+                            .child(div().text_color(style::accent()).child(format!("{working} working")))
+                    })
+                    .when(needs_you > 0, |d| {
+                        d.child("·")
+                            .child(div().text_color(style::bad()).child(format!("{needs_you} needs you")))
+                    })
+                    .when(unseen_done > 0, |d| {
+                        d.child("·")
+                            .child(div().text_color(style::good()).child(format!("{unseen_done} done")))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.collapsed_lines.remove(&expand_id);
+                        this.persist(cx);
+                        cx.notify();
+                    }));
+                out.push(tree_branch(v_flex().child(summary), &summary_guides));
+                k = sub_end;
+            } else {
+                k += 1;
+            }
         }
         let rest: Vec<usize> =
             (0..self.tabs.len()).filter(|i| !used.contains(i) && self.tabs.get(*i).is_some_and(|t| super::is_session(&t.kind))).collect();

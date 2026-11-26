@@ -168,6 +168,9 @@ pub struct ProjectState {
     /// Sessions (kuaky uid) whose subagent list was left unfolded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents_open: Vec<String>,
+    /// Líneas (id) con sus sub-líneas plegadas en la barra izquierda.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_lines: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]

@@ -464,6 +464,8 @@ pub struct ProjectView {
     session_prs: HashMap<String, u64>,
     /// Sesiones (uid) con su lista de subagentes abierta; se guarda con el proyecto.
     subagents_open: std::collections::HashSet<String>,
+    /// Líneas (id) cuyas sub-líneas están plegadas en la barra izquierda; se guarda con el proyecto.
+    collapsed_lines: std::collections::HashSet<String>,
     /// Sesiones (uid) que terminaron un turno y el usuario aún no ha visto.
     unseen_done: std::collections::HashSet<String>,
     /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
@@ -598,6 +600,7 @@ impl ProjectView {
             layout_collapsed: cx.new(|_| ResizableState::default()),
             session_prs: HashMap::new(),
             subagents_open: saved.subagents_open.iter().cloned().collect(),
+            collapsed_lines: saved.collapsed_lines.iter().cloned().collect(),
             unseen_done: std::collections::HashSet::new(),
             pending_merges: HashMap::new(),
             mini_map_collapsed: false,
@@ -733,9 +736,11 @@ impl ProjectView {
         let mut subagents_open: Vec<String> =
             self.subagents_open.iter().filter(|u| sessions.iter().any(|s| s.uid.as_deref() == Some(u.as_str()))).cloned().collect();
         subagents_open.sort();
+        let mut collapsed_lines: Vec<String> = self.collapsed_lines.iter().filter(|id| self.lines.get(id).is_some()).cloned().collect();
+        collapsed_lines.sort();
         let key = self.root.to_string_lossy().into_owned();
         state::update(cx, |s| {
-            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open });
+            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open, collapsed_lines });
         });
     }
 
@@ -2256,6 +2261,20 @@ impl ProjectView {
     }
 
     // ── render ──────────────────────────────────────────────────────────
+
+    fn session_badge(&self, tab: &Tab, now: Instant, cx: &App) -> SessionBadge {
+        match &tab.kind {
+            TabKind::Terminal { view, .. } => {
+                let t = view.read(cx);
+                terminal_status(t, now, self.unseen_done.contains(&t.uid)).1
+            }
+            TabKind::Chat { view, .. } => {
+                let v = view.read(cx);
+                chat_status(v, self.unseen_done.contains(&v.uid)).1
+            }
+            _ => SessionBadge::Idle,
+        }
+    }
 
     /// One row of the open-sessions list.
     fn session_row(&self, i: usize, tab: &Tab, now: Instant, cx: &mut Context<Self>) -> Option<AnyElement> {
