@@ -597,18 +597,46 @@ impl LineStore {
         }
     }
 
-    /// Líneas visibles en orden: sin terminar primero (más recientes arriba),
-    /// cada sub-línea debajo de su padre.
+    /// Actividad más reciente de una línea y todo su subárbol (la propia línea,
+    /// sus sub-líneas a cualquier profundidad y `last_active` de sus sesiones).
+    pub fn tree_activity(&self, line: &Line) -> Timestamp {
+        let mut seen = Vec::new();
+        self.tree_activity_inner(line, &mut seen)
+    }
+
+    fn tree_activity_inner<'a>(&'a self, line: &'a Line, seen: &mut Vec<&'a str>) -> Timestamp {
+        if seen.contains(&line.id.as_str()) {
+            return line.updated;
+        }
+        seen.push(line.id.as_str());
+        let mut best = line.updated;
+        for s in &line.sessions {
+            if s.last_active > best {
+                best = s.last_active;
+            }
+        }
+        for child in self.lines.iter().filter(|l| l.parent.as_deref() == Some(line.id.as_str())) {
+            let child_best = self.tree_activity_inner(child, seen);
+            if child_best > best {
+                best = child_best;
+            }
+        }
+        best
+    }
+
+    /// Líneas visibles en orden: sin terminar primero (más recientes arriba según
+    /// la actividad más reciente de todo su árbol), cada sub-línea debajo de su padre.
     pub fn ordered(&self, include_finished: bool) -> Vec<(&Line, usize)> {
-        let mut roots: Vec<&Line> = self
+        let mut roots: Vec<(&Line, Timestamp)> = self
             .lines
             .iter()
             .filter(|l| l.parent.as_deref().is_none_or(|p| self.get(p).is_none()))
             .filter(|l| include_finished || !l.is_finished())
+            .map(|l| (l, self.tree_activity(l)))
             .collect();
-        roots.sort_by(|a, b| a.is_finished().cmp(&b.is_finished()).then(b.updated.cmp(&a.updated)));
+        roots.sort_by(|(a, ta), (b, tb)| a.is_finished().cmp(&b.is_finished()).then(tb.cmp(ta)));
         let mut out = Vec::new();
-        for root in roots {
+        for (root, _) in roots {
             self.push_tree(root, 0, include_finished, &mut out);
         }
         out
@@ -828,5 +856,45 @@ mod tests {
         let order: Vec<(&str, usize)> = store.ordered(false).into_iter().map(|(l, d)| (l.name.as_str(), d)).collect();
         assert_eq!(order, [("Plan", 0), ("Parte", 1)]);
         assert!(store.get(&part).unwrap().relay_note().contains("Still open: algo"));
+    }
+
+    #[test]
+    fn ordered_bubbles_root_by_deep_tree_and_session_activity() {
+        let ts = |s: i64| Timestamp::from_second(s).unwrap();
+        let mut store = LineStore::in_memory();
+        let root_a = store.create("Root A", LineKind::Plan, None, true);
+        let sub_1 = store.create("Sub 1", LineKind::Task, Some(root_a.clone()), true);
+        let grand = store.create("Grandchild", LineKind::Task, Some(sub_1.clone()), true);
+        let sub_2 = store.create("Sub 2", LineKind::Task, Some(root_a.clone()), true);
+        let root_b = store.create("Root B", LineKind::Plan, None, true);
+
+        // Fechas controladas: Root B es más reciente que todo el árbol de Root A.
+        store.get_mut(&root_a).unwrap().created = ts(100);
+        store.get_mut(&root_a).unwrap().updated = ts(100);
+        store.get_mut(&sub_1).unwrap().created = ts(110);
+        store.get_mut(&sub_1).unwrap().updated = ts(110);
+        store.get_mut(&grand).unwrap().created = ts(120);
+        store.get_mut(&grand).unwrap().updated = ts(120);
+        store.get_mut(&sub_2).unwrap().created = ts(130);
+        store.get_mut(&sub_2).unwrap().updated = ts(130);
+        store.get_mut(&root_b).unwrap().created = ts(200);
+        store.get_mut(&root_b).unwrap().updated = ts(200);
+
+        let before: Vec<(&str, usize)> = store.ordered(true).into_iter().map(|(l, d)| (l.name.as_str(), d)).collect();
+        assert_eq!(before, [("Root B", 0), ("Root A", 0), ("Sub 1", 1), ("Grandchild", 2), ("Sub 2", 1)]);
+
+        // Actividad reciente en una sesión dentro de la nieta: sube todo el bloque de Root A
+        // sin cambiar el orden de creación de las sub-líneas.
+        let mut s = session("deep");
+        s.last_active = ts(300);
+        store.get_mut(&grand).unwrap().sessions.push(s);
+
+        let after: Vec<(&str, usize)> = store.ordered(true).into_iter().map(|(l, d)| (l.name.as_str(), d)).collect();
+        assert_eq!(after, [("Root A", 0), ("Sub 1", 1), ("Grandchild", 2), ("Sub 2", 1), ("Root B", 0)]);
+
+        // También si Sub 2 tiene `updated` más reciente, Sub 1 sigue antes de Sub 2 por creación.
+        store.get_mut(&sub_2).unwrap().updated = ts(400);
+        let after_sub2: Vec<(&str, usize)> = store.ordered(true).into_iter().map(|(l, d)| (l.name.as_str(), d)).collect();
+        assert_eq!(after_sub2, [("Root A", 0), ("Sub 1", 1), ("Grandchild", 2), ("Sub 2", 1), ("Root B", 0)]);
     }
 }
