@@ -462,9 +462,10 @@ pub struct ProjectView {
     layout_collapsed: Entity<ResizableState>,
     /// Sesión (uid) → PR que hizo.
     session_prs: HashMap<String, u64>,
-    /// Sessions (tab id) whose subagent list is open in the sidebar.
     /// Sesiones (uid) con su lista de subagentes abierta; se guarda con el proyecto.
     subagents_open: std::collections::HashSet<String>,
+    /// Sesiones (uid) que terminaron un turno y el usuario aún no ha visto.
+    unseen_done: std::collections::HashSet<String>,
     /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
     pending_merges: HashMap<String, u64>,
     mini_map_collapsed: bool,
@@ -597,6 +598,7 @@ impl ProjectView {
             layout_collapsed: cx.new(|_| ResizableState::default()),
             session_prs: HashMap::new(),
             subagents_open: saved.subagents_open.iter().cloned().collect(),
+            unseen_done: std::collections::HashSet::new(),
             pending_merges: HashMap::new(),
             mini_map_collapsed: false,
             visible: true,
@@ -1301,9 +1303,19 @@ impl ProjectView {
                 TerminalViewEvent::AgentState => {
                     this.on_agent_state(view, harness, window, cx);
                     let v = view.read(cx);
-                    if matches!(v.agent_state, Some(AgentState::Done)) {
-                        let uid = v.uid.clone();
-                        this.lines.on_turn_done(&uid);
+                    match v.agent_state {
+                        Some(AgentState::Done) => {
+                            let uid = v.uid.clone();
+                            if !this.is_session_shown(&uid, cx) {
+                                this.unseen_done.insert(uid.clone());
+                            }
+                            this.lines.on_turn_done(&uid);
+                        }
+                        Some(AgentState::Working) => {
+                            let uid = v.uid.clone();
+                            this.unseen_done.remove(&uid);
+                        }
+                        _ => {}
                     }
                     this.persist(cx);
                 }
@@ -1313,6 +1325,7 @@ impl ProjectView {
                 }
                 TerminalViewEvent::Prompt(text) => {
                     let uid = view.read(cx).uid.clone();
+                    this.unseen_done.remove(&uid);
                     this.lines.on_prompt(&uid, text);
                 }
             }
@@ -1572,13 +1585,22 @@ impl ProjectView {
                 }
                 ChatEvent::TurnDone => {
                     let uid = view.read(cx).uid.clone();
+                    if !this.is_session_shown(&uid, cx) {
+                        this.unseen_done.insert(uid.clone());
+                    }
                     this.lines.on_turn_done(&uid);
                     this.relay_turn_done(&uid, cx);
                     this.finish_pending_merge(&uid, window, cx);
                     this.sync_session_prs(cx);
                     this.notify(format!("{} finished", harness.label()), "Your turn.".into(), is_active_tab, window, cx)
                 }
-                ChatEvent::Status => {}
+                ChatEvent::Status => {
+                    let v = view.read(cx);
+                    if v.status == ChatStatus::Running {
+                        let uid = v.uid.clone();
+                        this.unseen_done.remove(&uid);
+                    }
+                }
                 ChatEvent::Follow { path, line } => {
                     if view.read(cx).follow {
                         this.following = Some(view.clone());
@@ -1601,6 +1623,7 @@ impl ProjectView {
                 ChatEvent::OpenFile { path, line } => this.open_file_at(path.clone(), line.saturating_sub(1), 0, window, cx),
                 ChatEvent::Prompt(text) => {
                     let uid = view.read(cx).uid.clone();
+                    this.unseen_done.remove(&uid);
                     this.lines.on_prompt(&uid, text);
                 }
                 ChatEvent::Plan(entries) => {
@@ -1676,10 +1699,41 @@ impl ProjectView {
         self.persist(cx);
     }
 
+    fn tab_uid(&self, tab: &Tab, cx: &App) -> Option<String> {
+        match &tab.kind {
+            TabKind::Terminal { view, .. } => Some(view.read(cx).uid.clone()),
+            TabKind::Chat { view, .. } => Some(view.read(cx).uid.clone()),
+            _ => None,
+        }
+    }
+
+    fn is_session_shown(&self, uid: &str, cx: &App) -> bool {
+        self.visible
+            && self
+                .shown_session
+                .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+                .and_then(|t| self.tab_uid(t, cx))
+                .as_deref()
+                == Some(uid)
+    }
+
+    fn mark_session_seen(&mut self, tab_id: usize, cx: &App) {
+        if let Some(uid) = self.tabs.iter().find(|t| t.id == tab_id).and_then(|t| self.tab_uid(t, cx)) {
+            self.unseen_done.remove(&uid);
+        }
+    }
+
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = Some(index);
-        if let Some(Tab { kind: TabKind::Terminal { view, .. }, .. }) = self.tabs.get(index) {
-            let handle = view.read(cx).focus_handle(cx);
+        let seen_id = self.tabs.get(index).filter(|t| is_session(&t.kind)).map(|t| t.id);
+        let focus_handle = match self.tabs.get(index).map(|t| &t.kind) {
+            Some(TabKind::Terminal { view, .. }) => Some(view.read(cx).focus_handle(cx)),
+            _ => None,
+        };
+        if let Some(id) = seen_id {
+            self.mark_session_seen(id, cx);
+        }
+        if let Some(handle) = focus_handle {
             window.focus(&handle, cx);
         }
         cx.notify();
@@ -1692,12 +1746,16 @@ impl ProjectView {
         let removed = self.tabs.remove(index);
         // Closing the last open session of a metro line archives the line.
         match &removed.kind {
-            TabKind::Terminal { view, harness, .. } if *harness != Harness::Shell => {
+            TabKind::Terminal { view, harness, .. } => {
                 let uid = view.read(cx).uid.clone();
-                self.archive_if_last(&uid, cx);
+                self.unseen_done.remove(&uid);
+                if *harness != Harness::Shell {
+                    self.archive_if_last(&uid, cx);
+                }
             }
             TabKind::Chat { view, .. } => {
                 let uid = view.read(cx).uid.clone();
+                self.unseen_done.remove(&uid);
                 self.archive_if_last(&uid, cx);
             }
             _ => {}
@@ -2201,44 +2259,42 @@ impl ProjectView {
 
     /// One row of the open-sessions list.
     fn session_row(&self, i: usize, tab: &Tab, now: Instant, cx: &mut Context<Self>) -> Option<AnyElement> {
-                                let (harness, title, status_line, dot_color, worktree, accent_color, can_rename): (
+                                let (harness, title, status_line, badge, worktree, accent_color, can_rename, uid): (
                                     Harness,
                                     SharedString,
                                     String,
-                                    Hsla,
+                                    SessionBadge,
                                     Option<String>,
                                     Option<u32>,
                                     bool,
+                                    String,
                                 ) = match &tab.kind {
                                     TabKind::Terminal { view, harness, worktree, custom_name, custom_color, .. } => {
                                         let t = view.read(cx);
-                                        let (status, dot) = terminal_status(t, now);
+                                        let uid = t.uid.clone();
+                                        let (status, badge) = terminal_status(t, now, self.unseen_done.contains(&uid));
                                         let title = custom_name
                                             .as_ref()
                                             .filter(|s| !s.is_empty())
                                             .map(|s| SharedString::from(s.clone()))
                                             .unwrap_or_else(|| t.auto_title());
                                         let when = ago(t.last_activity_at());
-                                        (*harness, title, format!("{status} · {when}"), dot, worktree.clone(), *custom_color, true)
+                                        (*harness, title, format!("{status} · {when}"), badge, worktree.clone(), *custom_color, true, uid)
                                     }
                                     TabKind::Chat { view, harness } => {
                                         let v = view.read(cx);
-                                        let (status, dot) = chat_status(v);
+                                        let uid = v.uid.clone();
+                                        let (status, badge) = chat_status(v, self.unseen_done.contains(&uid));
                                         let title = v
                                             .title
                                             .clone()
                                             .or_else(|| v.first_prompt().map(|p| crate::lines::short(p, 40)))
                                             .unwrap_or_else(|| format!("{} · chat", harness.label()));
-                                        (*harness, title.into(), format!("chat · {status}"), dot, None, None, false)
+                                        (*harness, title.into(), format!("chat · {status}"), badge, None, None, false, uid)
                                     }
                                     _ => return None,
                                 };
                                 let tab_id = tab.id;
-                                let uid = match &tab.kind {
-                                    TabKind::Terminal { view, .. } => view.read(cx).uid.clone(),
-                                    TabKind::Chat { view, .. } => view.read(cx).uid.clone(),
-                                    _ => String::new(),
-                                };
                                 let pr = self.session_prs.get(&uid).copied().map(|n| {
                                     let conflicts = self.open_prs().iter().find(|p| p.number == n).is_some_and(|p| p.has_conflicts());
                                     (n, conflicts)
@@ -2275,26 +2331,27 @@ impl ProjectView {
                         .child(title),
                 )
                 .when_some(pr, |d, (n, conflicts)| {
-                    let color = if conflicts { style::bad() } else { style::muted() };
                     d.child(
                         h_flex()
                             .id(("session-pr", tab_id))
                             .flex_none()
                             .gap_0p5()
+                            .items_center()
                             .text_xs()
-                            .text_color(color)
+                            .text_color(style::muted())
                             .cursor_pointer()
                             .hover(|d| d.text_color(style::text()))
-                            .child(icons::ui("git-pull-request", px(11.), color))
+                            .child(icons::ui("git-pull-request", px(11.), style::muted()))
                             .child(format!("{n}"))
+                            .when(conflicts, |d| d.child(icons::ui("git-merge-conflict", px(10.), style::muted())))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.open_pr(n, window, cx);
                             })),
                     )
                 })
-                // State dot; on hover it gives way to rename / close.
-                .child(status_dot(i, dot_color, group.clone()))
+                // Indicador de estado; al pasar el mouse deja lugar a renombrar / cerrar.
+                .child(status_dot(tab_id, badge, group.clone()))
                 .child(
                     h_flex()
                         .absolute()
@@ -2533,13 +2590,13 @@ impl ProjectView {
                 let (harness, dot, title): (Harness, Hsla, String) = match &tab.kind {
                     TabKind::Terminal { view, harness, custom_name, .. } => {
                         let t = view.read(cx);
-                        let (_, dot) = terminal_status(t, now);
-                        (*harness, dot, custom_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| t.auto_title().to_string()))
+                        let (_, badge) = terminal_status(t, now, self.unseen_done.contains(&t.uid));
+                        (*harness, badge.dot_color(), custom_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| t.auto_title().to_string()))
                     }
                     TabKind::Chat { view, harness } => {
                         let v = view.read(cx);
-                        let (_, dot) = chat_status(v);
-                        (*harness, dot, v.title.clone().or_else(|| v.first_prompt().map(|p| crate::lines::short(p, 40))).unwrap_or_default())
+                        let (_, badge) = chat_status(v, self.unseen_done.contains(&v.uid));
+                        (*harness, badge.dot_color(), v.title.clone().or_else(|| v.first_prompt().map(|p| crate::lines::short(p, 40))).unwrap_or_default())
                     }
                     _ => return div().into_any_element(),
                 };
@@ -2793,13 +2850,13 @@ impl ProjectView {
                 ) = match &tab.kind {
                     TabKind::Terminal { view, harness, custom_name, custom_color, .. } => {
                         let t = view.read(cx);
-                        let (_, dot) = terminal_status(t, now);
+                        let (_, badge) = terminal_status(t, now, self.unseen_done.contains(&t.uid));
                         let title = custom_name
                             .as_ref()
                             .filter(|s| !s.is_empty())
                             .map(|s| SharedString::from(s.clone()))
                             .unwrap_or_else(|| t.auto_title());
-                        (harness_badge(*harness), Some(dot), title, false, *custom_color, true)
+                        (harness_badge(*harness), Some(badge.dot_color()), title, false, *custom_color, true)
                     }
                     TabKind::File(f) => {
                         let f = f.read(cx);
@@ -2848,14 +2905,14 @@ impl ProjectView {
                     }
                     TabKind::Chat { view, harness } => {
                         let v = view.read(cx);
-                        let (_, dot) = chat_status(v);
+                        let (_, badge) = chat_status(v, self.unseen_done.contains(&v.uid));
                         let title = v
                             .title
                             .clone()
                             .or_else(|| v.first_prompt().map(str::to_string))
                             .map(|t| crate::lines::short(&t, 28))
                             .unwrap_or_else(|| format!("{} · chat", harness.label()));
-                        (harness_badge(*harness), Some(dot), title.into(), false, None, false)
+                        (harness_badge(*harness), Some(badge.dot_color()), title.into(), false, None, false)
                     }
                 };
                 h_flex()
@@ -2948,7 +3005,7 @@ impl ProjectView {
     }
 
     /// Keeps track of what each side of the center shows (called from render).
-    fn update_shown(&mut self) {
+    fn update_shown(&mut self, cx: &App) {
         if let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) {
             if is_session(&tab.kind) {
                 self.shown_session = Some(tab.id);
@@ -2964,6 +3021,12 @@ impl ProjectView {
         }
         if self.shown_doc.is_some_and(|id| !self.tabs.iter().any(|t| t.id == id)) {
             self.shown_doc = self.tabs.iter().rev().find(|t| !is_session(&t.kind)).map(|t| t.id);
+        }
+        // Al mostrar la sesión, se quita el aviso verde de "ya quedó listo".
+        if self.visible {
+            if let Some(id) = self.shown_session {
+                self.mark_session_seen(id, cx);
+            }
         }
     }
 
@@ -4149,7 +4212,7 @@ impl ProjectView {
 
 impl Render for ProjectView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_shown();
+        self.update_shown(cx);
         v_flex()
             .key_context("Project")
             .track_focus(&self.focus)
@@ -4282,24 +4345,56 @@ impl Render for ProjectView {
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-fn terminal_status(t: &TerminalView, now: Instant) -> (&'static str, Hsla) {
+/// Estado visual de una sesión en la barra izquierda (solo 3 estados llevan color o movimiento).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionBadge {
+    /// Pide permiso o pregunta: rojo con pulso lento.
+    NeedsYou,
+    /// Terminó un turno y el usuario aún no la abre: verde.
+    Done,
+    /// Trabajando: spinner pequeño girando.
+    Working,
+    /// Todo lo demás (quieta ya vista, conectando, cerrada): gris.
+    Idle,
+}
+
+impl SessionBadge {
+    fn dot_color(self) -> Hsla {
+        match self {
+            SessionBadge::NeedsYou => style::bad().into(),
+            SessionBadge::Done => style::good().into(),
+            SessionBadge::Working => style::accent().into(),
+            SessionBadge::Idle => style::faint().into(),
+        }
+    }
+}
+
+fn terminal_status(t: &TerminalView, now: Instant, unseen_done: bool) -> (&'static str, SessionBadge) {
     if !t.exited {
         if let Some(state) = &t.agent_state {
-            let color: Hsla = match state {
-                AgentState::Working => style::accent().into(),
-                AgentState::NeedsYou(_) => style::bad().into(),
-                AgentState::Done => style::good().into(),
-                AgentState::Ended => style::faint().into(),
+            let badge = match state {
+                AgentState::Working => SessionBadge::Working,
+                AgentState::NeedsYou(_) => SessionBadge::NeedsYou,
+                AgentState::Done => {
+                    if unseen_done {
+                        SessionBadge::Done
+                    } else {
+                        SessionBadge::Idle
+                    }
+                }
+                AgentState::Ended => SessionBadge::Idle,
             };
-            return (state.label(), color);
+            return (state.label(), badge);
         }
     }
     if t.exited {
-        ("exited", style::faint().into())
+        ("exited", SessionBadge::Idle)
     } else if t.last_output.is_some_and(|o| now.duration_since(o) < Duration::from_secs(2)) {
-        ("working", style::accent().into())
+        ("working", SessionBadge::Working)
+    } else if unseen_done {
+        ("idle", SessionBadge::Done)
     } else {
-        ("idle", style::good().into())
+        ("idle", SessionBadge::Idle)
     }
 }
 
@@ -4308,30 +4403,61 @@ fn tab_in(tab: &Tab, content: Div) -> gpui_kit::AnimationElement<Div> {
     crate::motion::fade_in(content, SharedString::from(format!("tab-in-{:?}", tab.id)), crate::motion::FAST)
 }
 
-/// Punto de estado de una sesión. Cuando cambia de estado entra con un fundido;
-/// si pasa a "te necesita" (rojo), destella dos veces y se queda quieto.
-fn status_dot(i: usize, color: Hsla, hover_group: SharedString) -> gpui_kit::AnimationElement<Div> {
-    let alarm = color == Hsla::from(style::bad());
-    let id = SharedString::from(format!("dot-{i}-{:.3}-{:.3}", color.h, color.l));
-    let (duration, ease) = (if alarm { Duration::from_millis(700) } else { crate::motion::NORMAL }, crate::motion::enter());
-    // Al pasar el mouse por la fila, el punto deja lugar a renombrar / cerrar.
-    let dot = div().size(px(7.)).flex_none().rounded_full().bg(color).group_hover(hover_group, |s| s.invisible());
-    dot.with_animation(id, Animation::new(duration), move |d, t| {
-        let o = if alarm { 1. - 0.75 * (t * 2. * std::f32::consts::PI).sin().abs() } else { ease(t) };
-        d.opacity(o)
-    })
+/// Indicador de estado de una sesión: rojo con pulso si te espera, verde si
+/// quedó lista sin ver, spinner pequeño si trabaja, gris en el resto.
+fn status_dot(tab_id: usize, state: SessionBadge, hover_group: SharedString) -> AnyElement {
+    match state {
+        SessionBadge::Working => div()
+            .flex_none()
+            .group_hover(hover_group, |s| s.invisible())
+            .child(crate::motion::spinner(SharedString::from(format!("session-spin-{tab_id}")), style::accent(), px(11.)))
+            .into_any_element(),
+        SessionBadge::NeedsYou => {
+            let anim = Animation::new(Duration::from_millis(1800))
+                .repeat_synced()
+                .with_max_fps(crate::motion::LOOP_FPS);
+            div()
+                .size(px(7.))
+                .flex_none()
+                .rounded_full()
+                .bg(style::bad())
+                .group_hover(hover_group, |s| s.invisible())
+                .with_animation(SharedString::from(format!("dot-pulse-{tab_id}")), anim, |d, t| {
+                    // Pulso lento entre 0.35 y 1.0 de opacidad.
+                    let o = 0.35 + 0.65 * (0.5 + 0.5 * (t * 2. * std::f32::consts::PI).cos());
+                    d.opacity(o)
+                })
+                .into_any_element()
+        }
+        SessionBadge::Done | SessionBadge::Idle => {
+            let color = state.dot_color();
+            let tag = if state == SessionBadge::Done { "done" } else { "idle" };
+            let id = SharedString::from(format!("dot-{tab_id}-{tag}"));
+            div()
+                .size(px(7.))
+                .flex_none()
+                .rounded_full()
+                .bg(color)
+                .group_hover(hover_group, |s| s.invisible())
+                .with_animation(id, crate::motion::once(crate::motion::NORMAL), |d, t| d.opacity(t))
+                .into_any_element()
+        }
+    }
 }
 
-fn chat_status(c: &ChatView) -> (&'static str, Hsla) {
+fn chat_status(c: &ChatView, unseen_done: bool) -> (&'static str, SessionBadge) {
     if c.is_waiting_permission() {
-        return ("needs permission", style::bad().into());
+        return ("needs permission", SessionBadge::NeedsYou);
     }
     match &c.status {
-        ChatStatus::Connecting => ("connecting", style::faint().into()),
-        ChatStatus::Ready => ("your turn", style::good().into()),
-        ChatStatus::Running => ("working", style::accent().into()),
-        ChatStatus::Error(_) => ("error", style::bad().into()),
-        ChatStatus::Exited => ("exited", style::faint().into()),
+        ChatStatus::Connecting => ("connecting", SessionBadge::Idle),
+        ChatStatus::Ready => (
+            "your turn",
+            if unseen_done { SessionBadge::Done } else { SessionBadge::Idle },
+        ),
+        ChatStatus::Running => ("working", SessionBadge::Working),
+        ChatStatus::Error(_) => ("error", SessionBadge::Idle),
+        ChatStatus::Exited => ("exited", SessionBadge::Idle),
     }
 }
 
