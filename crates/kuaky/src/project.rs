@@ -475,6 +475,14 @@ pub struct ProjectView {
     unseen_done: std::collections::HashSet<String>,
     /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
     pending_merges: HashMap<String, u64>,
+    /// Filtros y menús del panel de PRs (por fecha y autor, y menú de agentes para un PR).
+    pr_date_filter: DateFilter,
+    pr_author_filter: Option<String>,
+    pr_filter_menu: Option<prs::PrFilterMenu>,
+    pr_filter_pick_day: bool,
+    pr_filter_closed: Option<Instant>,
+    pr_session_menu: Option<u64>,
+    pr_session_closed: Option<Instant>,
     mini_map_collapsed: bool,
     /// Shown in the window (other projects stay open in the background).
     visible: bool,
@@ -612,6 +620,13 @@ impl ProjectView {
             session_filter_closed: None,
             unseen_done: std::collections::HashSet::new(),
             pending_merges: HashMap::new(),
+            pr_date_filter: DateFilter::All,
+            pr_author_filter: None,
+            pr_filter_menu: None,
+            pr_filter_pick_day: false,
+            pr_filter_closed: None,
+            pr_session_menu: None,
+            pr_session_closed: None,
             mini_map_collapsed: false,
             visible: true,
             _subs: vec![sub, graph_sub, layout_sub, right_split_sub, lsp_sub],
@@ -1077,12 +1092,28 @@ impl ProjectView {
     /// Lista de agentes para empezar una sesión (como el + de Zed). Con `line`,
     /// la sesión se suma a esa línea, en su carpeta.
     pub(crate) fn agent_menu(&self, line: Option<String>, cx: &mut Context<Self>) -> AnyElement {
+        self.agent_menu_for(line.map(AgentMenuTarget::Line).unwrap_or(AgentMenuTarget::NewSession), cx)
+    }
+
+    /// Mismo menú de agentes reutilizado para iniciar una sesión con el contexto de un PR.
+    pub(super) fn agent_menu_for_pr(&self, number: u64, cx: &mut Context<Self>) -> AnyElement {
+        self.agent_menu_for(AgentMenuTarget::Pr(number), cx)
+    }
+
+    fn agent_menu_for(&self, target: AgentMenuTarget, cx: &mut Context<Self>) -> AnyElement {
         let harnesses = self.available_harnesses(cx);
+        let is_line = matches!(target, AgentMenuTarget::Line(_));
+        let is_pr = matches!(target, AgentMenuTarget::Pr(_));
+        let target_tag = match &target {
+            AgentMenuTarget::NewSession => String::new(),
+            AgentMenuTarget::Line(id) => id.clone(),
+            AgentMenuTarget::Pr(n) => format!("pr-{n}"),
+        };
         let item = |h: Harness, this: &Self, cx: &mut Context<Self>| {
-            let hint = (h != Harness::Shell && !this.opens_as_chat(h, cx)).then_some("terminal");
-            let line = line.clone();
+            let hint = (h != Harness::Shell && !this.opens_as_chat(h, cx) && !is_pr).then_some("terminal");
+            let target = target.clone();
             h_flex()
-                .id(SharedString::from(format!("launch-{}-{}", h.label(), line.as_deref().unwrap_or(""))))
+                .id(SharedString::from(format!("launch-{}-{target_tag}", h.label())))
                 .gap_2()
                 .px_2()
                 .py_1()
@@ -1095,19 +1126,23 @@ impl ProjectView {
                 .when_some(hint, |d, t| d.child(div().text_xs().text_color(style::faint()).child(t)))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    match line.clone() {
-                        Some(line) if this.new_session_branch => this.branch_off_line(line, h, window, cx),
-                        Some(line) => this.new_session_on_line(line, h, window, cx),
-                        None => this.launch(h, window, cx),
+                    match target.clone() {
+                        AgentMenuTarget::Line(line) if this.new_session_branch => this.branch_off_line(line, h, window, cx),
+                        AgentMenuTarget::Line(line) => this.new_session_on_line(line, h, window, cx),
+                        AgentMenuTarget::NewSession => this.launch(h, window, cx),
+                        AgentMenuTarget::Pr(n) => {
+                            this.pr_session_menu = None;
+                            this.start_pr_session(n, h, None, window, cx);
+                        }
                     }
                 }))
                 .into_any_element()
         };
         let agents: Vec<AnyElement> = harnesses.iter().filter(|h| **h != Harness::Shell).map(|h| item(*h, self, cx)).collect();
-        let shell = item(Harness::Shell, self, cx);
+        let shell = (!is_pr).then(|| item(Harness::Shell, self, cx));
         let sep = || div().my_1().h(px(1.)).bg(style::border());
         v_flex()
-            .id("agent-menu")
+            .id(SharedString::from(format!("agent-menu-{target_tag}")))
             .occlude()
             .w(px(220.))
             .p_1()
@@ -1118,7 +1153,7 @@ impl ProjectView {
             .shadow_lg()
             .text_color(style::text())
             // En una línea: seguir en ella o bifurcar una sub-línea (trabajo aparte del mismo tema).
-            .when(line.is_some(), |d| {
+            .when(is_line, |d| {
                 let branch = self.new_session_branch;
                 let chip = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
                     div()
@@ -1155,12 +1190,11 @@ impl ProjectView {
             })
             .when(agents.is_empty(), |d| d.child(div().px_2().py_1().text_xs().text_color(style::faint()).child("No agents found")))
             .children(agents)
-            .child(sep())
-            .child(shell)
+            .when_some(shell, |d, shell| d.child(sep()).child(shell))
             .child(sep())
             .child(
                 h_flex()
-                    .id("agent-menu-settings")
+                    .id(SharedString::from(format!("agent-menu-settings-{target_tag}")))
                     .gap_2()
                     .px_2()
                     .py_1()
@@ -1174,12 +1208,19 @@ impl ProjectView {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.new_session_menu = false;
                         this.new_session_line = None;
+                        this.pr_session_menu = None;
                         window.dispatch_action(Box::new(crate::app::OpenSettings), cx);
                         cx.notify();
                     })),
             )
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                if this.new_session_menu || this.new_session_line.is_some() {
+            .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                if is_pr {
+                    if this.pr_session_menu.is_some() {
+                        this.pr_session_menu = None;
+                        this.pr_session_closed = Some(Instant::now());
+                        cx.notify();
+                    }
+                } else if this.new_session_menu || this.new_session_line.is_some() {
                     this.new_session_menu = false;
                     this.new_session_line = None;
                     this.new_session_closed = Some(Instant::now());
@@ -4023,38 +4064,7 @@ impl ProjectView {
     }
 
     fn prs_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.repo.is_none() {
-            return panel_message("This folder is not a git repository.").into_any_element();
-        }
-        let body = match &self.git.prs {
-            None => panel_message("Loading PRs…").into_any_element(),
-            Some(Err(e)) => panel_message(e.clone()).into_any_element(),
-            Some(Ok(prs)) if prs.is_empty() => panel_message("No open PRs.").into_any_element(),
-            Some(Ok(prs)) => v_flex()
-                .gap_0p5()
-                .children(prs.iter().map(|pr| self.pr_row(pr, cx)))
-                .into_any_element(),
-        };
-        div()
-            .id("prs")
-            .size_full()
-            .overflow_y_scroll()
-            .child(
-                v_flex()
-                    .p_2()
-                    .gap_1()
-                    .child(panel_button(if self.git.prs_loading { "Refreshing…" } else { "Refresh" }).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.load_prs(cx);
-                            cx.notify();
-                        }),
-                    ))
-                    .when_some(self.git.pr_action_error.clone(), |d, e| {
-                        d.child(div().px_2().py_1().text_xs().text_color(style::bad()).child(e))
-                    })
-                    .child(body),
-            )
-            .into_any_element()
+        self.prs_panel_view(cx)
     }
 
     fn graph_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4533,7 +4543,9 @@ impl Render for ProjectView {
                     || self.board.is_some()
                     || self.merge_modal.is_some()
                     || self.new_session_menu
-                    || self.session_filter_menu,
+                    || self.session_filter_menu
+                    || self.pr_filter_menu.is_some()
+                    || self.pr_session_menu.is_some(),
                 |d| {
                     crate::webview::cover();
                     d
@@ -4764,8 +4776,16 @@ fn system_notification(title: &str, message: &str) {
 }
 
 
+/// Destino de una acción elegida en `agent_menu_for`.
+#[derive(Clone)]
+enum AgentMenuTarget {
+    NewSession,
+    Line(String),
+    Pr(u64),
+}
+
 /// Agent logo, or Lucide terminal icon for plain shell.
-fn harness_badge(h: Harness) -> AnyElement {
+pub(crate) fn harness_badge(h: Harness) -> AnyElement {
     match h.agent() {
         Some(agent) => icons::logo(icons::agent(agent), px(18.)).into_any_element(),
         None => div()

@@ -240,7 +240,7 @@ impl Repo {
                 "--limit",
                 "50",
                 "--json",
-                "number,title,author,headRefName,baseRefName,isDraft,updatedAt,url,reviewDecision,additions,deletions,mergeable,mergeStateStatus",
+                "number,title,author,headRefName,baseRefName,isDraft,updatedAt,url,body,reviewDecision,additions,deletions,mergeable,mergeStateStatus",
             ],
         )?;
         parse::pull_requests(&out)

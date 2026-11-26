@@ -76,6 +76,8 @@ pub struct PullRequest {
     #[serde(default)]
     pub url: String,
     #[serde(default)]
+    pub body: String,
+    #[serde(default)]
     pub review_decision: Option<String>,
     #[serde(default)]
     pub additions: u64,

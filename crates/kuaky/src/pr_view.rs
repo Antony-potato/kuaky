@@ -1,6 +1,7 @@
 //! Un pull request en una pestaña: solo **Overview** (descripción y estado) y
 //! **Files changed**, con un botón: *Merge*, o *Resolve & merge* si tiene conflictos.
 
+use crate::project::Harness;
 use crate::style;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::text::TextView;
@@ -9,12 +10,15 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kuaky_git::{PrDetail, PullRequest, Repo};
+use std::time::{Duration, Instant};
 
 pub enum PrEvent {
     Merge(u64),
     ResolveAndMerge(u64),
-    /// Abrir la sesión que hizo este PR.
+    /// Abrir la sesión ligada a este PR.
     OpenSession(String),
+    /// Empezar una sesión nueva para trabajar en este PR con el agente elegido.
+    StartSession { number: u64, harness: Harness, body: Option<String> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,8 +34,12 @@ pub struct PrView {
     files: Option<Result<usize, String>>,
     diff: Entity<DiffState>,
     tab: Tab,
-    /// Sesión que hizo el PR: (uid, nombre).
+    /// Sesión que hizo o trabaja en el PR: (uid, nombre).
     session: Option<(String, String)>,
+    /// Agentes disponibles para "Start session…".
+    agents: Vec<Harness>,
+    session_menu: bool,
+    session_menu_closed: Option<Instant>,
     /// "Merging…" / "Resolving…" mientras corre.
     pub busy: Option<String>,
     pub error: Option<String>,
@@ -40,10 +48,29 @@ pub struct PrView {
 impl EventEmitter<PrEvent> for PrView {}
 
 impl PrView {
-    pub fn new(repo: Repo, pr: PullRequest, session: Option<(String, String)>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        repo: Repo,
+        pr: PullRequest,
+        session: Option<(String, String)>,
+        agents: Vec<Harness>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let number = pr.number;
         let diff = cx.new(|cx| DiffState::new([], cx).with_mode(DiffMode::Unified));
-        let this = PrView { number, pr, detail: None, files: None, diff, tab: Tab::Overview, session, busy: None, error: None };
+        let this = PrView {
+            number,
+            pr,
+            detail: None,
+            files: None,
+            diff,
+            tab: Tab::Overview,
+            session,
+            agents,
+            session_menu: false,
+            session_menu_closed: None,
+            busy: None,
+            error: None,
+        };
         this.load(repo, cx);
         this
     }
@@ -52,10 +79,27 @@ impl PrView {
         self.load(repo, cx);
     }
 
-    pub fn set_pr(&mut self, pr: PullRequest, session: Option<(String, String)>, cx: &mut Context<Self>) {
+    pub fn set_pr(&mut self, pr: PullRequest, session: Option<(String, String)>, agents: Vec<Harness>, cx: &mut Context<Self>) {
         self.pr = pr;
         self.session = session;
+        self.agents = agents;
+        if self.session.is_some() {
+            self.session_menu = false;
+        }
         cx.notify();
+    }
+
+    fn menu_just_closed(&self) -> bool {
+        self.session_menu_closed.is_some_and(|t| t.elapsed() < Duration::from_millis(300))
+    }
+
+    fn current_body(&self) -> Option<String> {
+        self.detail
+            .as_ref()
+            .and_then(|d| d.as_ref().ok())
+            .map(|d| d.body.clone())
+            .filter(|b| !b.trim().is_empty())
+            .or_else(|| (!self.pr.body.trim().is_empty()).then(|| self.pr.body.clone()))
     }
 
     fn load(&self, repo: Repo, cx: &mut Context<Self>) {
@@ -196,22 +240,107 @@ impl Render for PrView {
                     )
                     .child(div().text_color(style::good()).child(format!("+{}", self.pr.additions)))
                     .child(div().text_color(style::bad()).child(format!("−{}", self.pr.deletions)))
-                    .when_some(self.session.clone(), |d, (uid, name)| {
-                        d.child(
-                            h_flex()
-                                .id("pr-session")
-                                .gap_1()
-                                .px_1p5()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .bg(style::accent_alpha(0.1))
-                                .text_color(style::accent())
-                                .hover(|d| d.bg(style::accent_alpha(0.2)))
-                                .tooltip(|window, cx| Tooltip::new("Open the session that made this PR").build(window, cx))
-                                .child(crate::icons::ui("message-square", px(11.), style::accent()))
-                                .child(crate::lines::short(&name, 40))
-                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(PrEvent::OpenSession(uid.clone())))),
-                        )
+                    .map(|d| match self.session.clone() {
+                        Some((uid, name)) => {
+                            let tip: SharedString = format!("Open session: {}", crate::lines::short(&name, 60)).into();
+                            d.child(
+                                h_flex()
+                                    .id("pr-session")
+                                    .gap_1()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::border())
+                                    .bg(style::panel())
+                                    .text_color(style::text())
+                                    .hover(|d| d.bg(style::panel_hover()))
+                                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                                    .child(crate::icons::ui("message-square", px(11.), style::accent()))
+                                    .child("Open session")
+                                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(PrEvent::OpenSession(uid.clone())))),
+                            )
+                        }
+                        None => {
+                            let menu_open = self.session_menu;
+                            let agents = self.agents.clone();
+                            let body = self.current_body();
+                            d.child(
+                                h_flex()
+                                    .id("pr-start-session")
+                                    .relative()
+                                    .gap_1()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(style::border())
+                                    .when(menu_open, |d| d.bg(style::panel_hover()).text_color(style::text()))
+                                    .when(!menu_open, |d| d.bg(style::panel()).text_color(style::muted()))
+                                    .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                                    .tooltip(|window, cx| Tooltip::new("Start an agent session with this PR's context").build(window, cx))
+                                    .child(crate::icons::ui("plus", px(11.), style::muted()))
+                                    .child("Start session…")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.session_menu = !this.session_menu && !this.menu_just_closed();
+                                        cx.notify();
+                                    }))
+                                    .when(menu_open, |d| {
+                                        crate::webview::cover();
+                                        d.child(
+                                            deferred(
+                                                div().absolute().top_full().left_0().mt_1().child(
+                                                    v_flex()
+                                                        .id("pr-view-agent-menu")
+                                                        .occlude()
+                                                        .w(px(200.))
+                                                        .p_1()
+                                                        .rounded_lg()
+                                                        .border_1()
+                                                        .border_color(style::border())
+                                                        .bg(style::panel())
+                                                        .shadow_lg()
+                                                        .text_color(style::text())
+                                                        .when(agents.is_empty(), |d| {
+                                                            d.child(div().px_2().py_1().text_xs().text_color(style::faint()).child("No agents found"))
+                                                        })
+                                                        .children(agents.into_iter().map(|h| {
+                                                            let body = body.clone();
+                                                            h_flex()
+                                                                .id(SharedString::from(format!("pr-view-launch-{}", h.key())))
+                                                                .gap_2()
+                                                                .px_2()
+                                                                .py_1()
+                                                                .rounded_md()
+                                                                .text_sm()
+                                                                .cursor_pointer()
+                                                                .hover(|d| d.bg(style::panel_hover()))
+                                                                .child(crate::project::harness_badge(h))
+                                                                .child(div().flex_1().min_w_0().truncate().child(h.label()))
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.session_menu = false;
+                                                                    cx.emit(PrEvent::StartSession { number, harness: h, body: body.clone() });
+                                                                    cx.notify();
+                                                                }))
+                                                        }))
+                                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                                            if this.session_menu {
+                                                                this.session_menu = false;
+                                                                this.session_menu_closed = Some(Instant::now());
+                                                                cx.notify();
+                                                            }
+                                                        })),
+                                                ),
+                                            )
+                                            .with_priority(1),
+                                        )
+                                    }),
+                            )
+                        }
                     })
                     .child(
                         div()
