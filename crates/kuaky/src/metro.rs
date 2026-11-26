@@ -12,6 +12,8 @@ const TRUNK_X: f32 = 18.;
 const SPACING: f32 = 112.;
 const MAX_ON_BOARD: usize = 12;
 const LABEL_W: f32 = 236.;
+const MIN_ZOOM: f32 = 0.4;
+const MAX_ZOOM: f32 = 2.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum BoardFilter {
@@ -91,8 +93,49 @@ pub(super) struct Board {
     selected: Option<String>,
     menu: Option<BoardMenu>,
     name_input: Option<(String, Entity<InputState>)>,
+    /// Desplazamiento libre del mapa en pantalla.
+    pan_x: f32,
+    pan_y: f32,
+    /// Escala del mapa (`MIN_ZOOM..=MAX_ZOOM`).
+    zoom: f32,
+    /// Arrastre activo con el ratón (última posición en ventana).
+    dragging: Option<Point<Pixels>>,
+    /// Última región visible del track (para zoom al cursor y Fit).
+    viewport: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     focus: FocusHandle,
     _sub: Option<Subscription>,
+}
+
+impl Board {
+    /// Aplica un factor de zoom manteniendo fijo el punto `anchor` (en coordenadas del viewport).
+    fn zoom_at(&mut self, factor: f32, anchor: (f32, f32)) {
+        let old = self.zoom;
+        let next = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        if (next - old).abs() < 1e-4 {
+            return;
+        }
+        let wx = (anchor.0 - self.pan_x) / old;
+        let wy = (anchor.1 - self.pan_y) / old;
+        self.zoom = next;
+        self.pan_x = anchor.0 - wx * next;
+        self.pan_y = anchor.1 - wy * next;
+    }
+
+    /// Ajusta zoom y desplazamiento para ver todo el contenido dentro del viewport.
+    fn fit(&mut self, content_w: f32, content_h: f32) {
+        self.zoom = fit_zoom(self.viewport.get().map(|b| (f32::from(b.size.width), f32::from(b.size.height))), content_w, content_h);
+        self.pan_x = 0.;
+        self.pan_y = 0.;
+        self.dragging = None;
+    }
+}
+
+fn fit_zoom(viewport: Option<(f32, f32)>, content_w: f32, content_h: f32) -> f32 {
+    let Some((vw, vh)) = viewport else { return 1.0 };
+    if vw <= 32. || vh <= 32. || content_w <= 1. || content_h <= 1. {
+        return 1.0;
+    }
+    ((vw - 24.) / content_w).min((vh - 24.) / content_h).min(1.0).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
 /// Sesión viva sobre una línea.
@@ -320,6 +363,11 @@ impl ProjectView {
             selected: None,
             menu: None,
             name_input: None,
+            pan_x: 0.,
+            pan_y: 0.,
+            zoom: 1.0,
+            dragging: None,
+            viewport: std::rc::Rc::new(std::cell::Cell::new(None)),
             focus,
             _sub: None,
         });
@@ -1083,9 +1131,12 @@ impl ProjectView {
             })
             .collect();
         let selected = board.selected.clone();
+        let (pan_x, pan_y, zoom, dragging) = (board.pan_x, board.pan_y, board.zoom, board.dragging.is_some());
+        let viewport_cell = board.viewport.clone();
         let longest = rows.iter().map(|(l, _)| l.stations.len().min(MAX_ON_BOARD)).max().unwrap_or(0);
         let track_w = TRUNK_X + 80. + longest as f32 * SPACING + 160.;
         let height = TOP + rows.len().max(1) as f32 * ROW + 40.;
+        let zoom_pct = (zoom * 100.).round() as i32;
 
         let header = h_flex()
             .px_4()
@@ -1114,14 +1165,102 @@ impl ProjectView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(b) = &mut this.board {
                             b.filter = f;
+                            b.pan_x = 0.;
+                            b.pan_y = 0.;
+                            b.zoom = 1.0;
+                            b.dragging = None;
                         }
                         cx.notify();
                     }))
             }))
+            .child(div().w(px(1.)).h(px(14.)).mx_1().bg(style::border()))
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .items_center()
+                    .child(
+                        div()
+                            .id("board-zoom-out")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(style::muted())
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                            .tooltip(|window, cx| Tooltip::new("Zoom out").build(window, cx))
+                            .child("−")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(b) = &mut this.board {
+                                    let anchor = b
+                                        .viewport
+                                        .get()
+                                        .map(|v| (f32::from(v.size.width) * 0.5, f32::from(v.size.height) * 0.5))
+                                        .unwrap_or((0., 0.));
+                                    b.zoom_at(1. / 1.15, anchor);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .text_center()
+                            .text_xs()
+                            .text_color(style::faint())
+                            .child(format!("{zoom_pct}%")),
+                    )
+                    .child(
+                        div()
+                            .id("board-zoom-in")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(style::muted())
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                            .tooltip(|window, cx| Tooltip::new("Zoom in").build(window, cx))
+                            .child("+")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(b) = &mut this.board {
+                                    let anchor = b
+                                        .viewport
+                                        .get()
+                                        .map(|v| (f32::from(v.size.width) * 0.5, f32::from(v.size.height) * 0.5))
+                                        .unwrap_or((0., 0.));
+                                    b.zoom_at(1.15, anchor);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("board-fit")
+                            .ml_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(style::border())
+                            .text_xs()
+                            .text_color(style::muted())
+                            .cursor_pointer()
+                            .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                            .tooltip(|window, cx| Tooltip::new("Fit all lines in view").build(window, cx))
+                            .child("Fit")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(b) = &mut this.board {
+                                    b.fit(track_w, height);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(
                 div()
                     .id("board-close")
-                    .ml_2()
+                    .ml_1()
                     .p_1()
                     .rounded_md()
                     .cursor_pointer()
@@ -1160,59 +1299,112 @@ impl ProjectView {
             .collect();
         let paint_geom = geometry.clone();
 
-        let labels = v_flex().w(px(LABEL_W)).flex_none().pt(px(TOP)).children(rows.iter().map(|(line, depth)| {
-            let id = line.id.clone();
-            let is_sel = selected.as_deref() == Some(line.id.as_str());
-            let dim = selected.is_some() && !is_sel;
-            let (state, state_color) = self.line_state(line, &trains);
-            let c = line_color(line.color);
-            v_flex()
-                .id(SharedString::from(format!("board-label-{}", line.id)))
-                .h(px(ROW - 8.))
-                .my(px(4.))
-                .ml_1()
-                .justify_center()
-                .pl(px(12. + *depth as f32 * 14.))
-                .pr_2()
-                .cursor_pointer()
-                .rounded_l(px(10.))
-                .when(is_sel, |d| d.bg(style::panel_hover()))
-                .when(dim, |d| d.opacity(0.55))
-                .hover(|d| d.bg(style::panel_hover()).opacity(1.))
-                .on_click(cx.listener(move |this, _, window, cx| this.toggle_line(id.clone(), window, cx)))
-                .child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .child(div().size(px(9.)).flex_none().rounded_full().bg(c))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .when(is_sel, |d| d.font_weight(FontWeight::SEMIBOLD))
-                                .child(line.name.clone()),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_1p5()
-                        .text_xs()
-                        .text_color(style::faint())
-                        .child(line.kind.label())
-                        .child("·")
-                        .child(format!("{}/{}", line.done_count(), line.stations.len()))
-                        .child("·")
-                        .child(div().text_color(state_color).child(state)),
-                )
-        }));
+        let row_h = ROW * zoom;
+        let pad_v = (4. * zoom).min(4.);
+        let show_meta = row_h >= 44.;
+        let labels_inner = v_flex()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(pan_y + TOP * zoom))
+            .children(rows.iter().map(|(line, depth)| {
+                let id = line.id.clone();
+                let is_sel = selected.as_deref() == Some(line.id.as_str());
+                let dim = selected.is_some() && !is_sel;
+                let (state, state_color) = self.line_state(line, &trains);
+                let c = line_color(line.color);
+                v_flex()
+                    .id(SharedString::from(format!("board-label-{}", line.id)))
+                    .h(px((row_h - pad_v * 2.).max(18.)))
+                    .my(px(pad_v))
+                    .ml_1()
+                    .justify_center()
+                    .pl(px(12. + *depth as f32 * 14.))
+                    .pr_2()
+                    .cursor_pointer()
+                    .rounded_l(px(10.))
+                    .when(is_sel, |d| d.bg(style::panel_hover()))
+                    .when(dim, |d| d.opacity(0.55))
+                    .hover(|d| d.bg(style::panel_hover()).opacity(1.))
+                    .on_click(cx.listener(move |this, _, window, cx| this.toggle_line(id.clone(), window, cx)))
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(div().size(px(9.)).flex_none().rounded_full().bg(c))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .when(is_sel, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    .child(line.name.clone()),
+                            ),
+                    )
+                    .when(show_meta, |d| {
+                        d.child(
+                            h_flex()
+                                .gap_1p5()
+                                .text_xs()
+                                .text_color(style::faint())
+                                .child(line.kind.label())
+                                .child("·")
+                                .child(format!("{}/{}", line.done_count(), line.stations.len()))
+                                .child("·")
+                                .child(div().text_color(state_color).child(state)),
+                        )
+                    })
+            }));
+        // Columna de nombres fija a la izquierda; solo se mueve en vertical con el track.
+        let labels = div()
+            .id("board-labels")
+            .relative()
+            .w(px(LABEL_W))
+            .h_full()
+            .flex_none()
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(style::border())
+            .bg(style::bg())
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                let Some(b) = &mut this.board else { return };
+                let delta = ev.delta.pixel_delta(window.line_height());
+                if ev.modifiers.platform || ev.modifiers.control {
+                    let factor = (1. + f32::from(delta.y) * 0.004).clamp(0.75, 1.35);
+                    let anchor = b
+                        .viewport
+                        .get()
+                        .map(|v| (0., f32::from(ev.position.y - v.origin.y)))
+                        .unwrap_or((0., 0.));
+                    b.zoom_at(factor, anchor);
+                } else {
+                    b.pan_y += f32::from(delta.y);
+                }
+                cx.notify();
+            }))
+            .on_pinch(cx.listener(|this, ev: &PinchEvent, _, cx| {
+                let Some(b) = &mut this.board else { return };
+                let factor = (1. + ev.delta).clamp(0.5, 2.0);
+                let anchor = b
+                    .viewport
+                    .get()
+                    .map(|v| (0., f32::from(ev.position.y - v.origin.y)))
+                    .unwrap_or((0., 0.));
+                b.zoom_at(factor, anchor);
+                cx.notify();
+            }))
+            .child(labels_inner);
 
         let mut overlay: Vec<AnyElement> = Vec::new();
+        let sx = |x: f32| pan_x + x * zoom;
+        let sy = |y: f32| pan_y + y * zoom;
+        let show_station_labels = zoom >= 0.55;
         for ((line, _), g) in rows.iter().zip(&geometry) {
             let mine = self.line_trains(line, &trains);
             for (k, st) in g.stations.iter().enumerate() {
-                let x = g.start + k as f32 * SPACING;
+                let x = sx(g.start + k as f32 * SPACING);
+                let y = sy(g.y);
                 let tip = if st.detail.is_empty() || st.detail.starts_with("git:") {
                     st.title.clone()
                 } else {
@@ -1229,41 +1421,48 @@ impl ProjectView {
                 };
                 let tip: SharedString = format!("{tip}\n{source} · {when}").into();
                 let id = line.id.clone();
+                let hit = (24. * zoom).clamp(14., 32.);
                 overlay.push(
                     div()
                         .id(SharedString::from(format!("st-{}-{}", line.id, st.id)))
                         .absolute()
-                        .left(px(x - 12.))
-                        .top(px(g.y - 12.))
-                        .size(px(24.))
+                        .left(px(x - hit * 0.5))
+                        .top(px(y - hit * 0.5))
+                        .size(px(hit))
                         .rounded_full()
                         .cursor_pointer()
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                         .on_click(cx.listener(move |this, _, window, cx| this.toggle_line(id.clone(), window, cx)))
                         .into_any_element(),
                 );
-                overlay.push(
-                    div()
-                        .absolute()
-                        .left(px(x - SPACING * 0.5 + 4.))
-                        .top(px(g.y + 13.))
-                        .w(px(SPACING - 8.))
-                        .text_size(px(10.))
-                        .text_center()
-                        .truncate()
-                        .text_color(if st.state == StationState::Active || g.selected { style::text() } else { style::faint() })
-                        .when(g.dim, |d| d.opacity(0.5))
-                        .child(st.title.clone())
-                        .into_any_element(),
-                );
+                if show_station_labels {
+                    let label_w = (SPACING * zoom - 8.).max(32.);
+                    overlay.push(
+                        div()
+                            .absolute()
+                            .left(px(x - label_w * 0.5))
+                            .top(px(y + 13. * zoom))
+                            .w(px(label_w))
+                            .text_size(px((10. * zoom).clamp(8.5, 13.)))
+                            .text_center()
+                            .truncate()
+                            .text_color(if st.state == StationState::Active || g.selected { style::text() } else { style::faint() })
+                            .when(g.dim, |d| d.opacity(0.5))
+                            .child(st.title.clone())
+                            .into_any_element(),
+                    );
+                }
             }
             // Trenes: logo del agente sobre la estación en curso (o al final).
-            let active_x = g
+            let active_wx = g
                 .stations
                 .iter()
                 .rposition(|s| s.state == StationState::Active)
                 .map(|k| g.start + k as f32 * SPACING)
                 .unwrap_or(g.start + g.stations.len().saturating_sub(1) as f32 * SPACING);
+            let active_x = sx(active_wx);
+            let active_y = sy(g.y);
+            let icon_sz = (16. * zoom).clamp(11., 22.);
             for (n, (uid, t)) in mine.iter().enumerate() {
                 let Some(agent) = t.harness.agent() else { continue };
                 let uid = (*uid).clone();
@@ -1272,8 +1471,8 @@ impl ProjectView {
                     div()
                         .id(SharedString::from(format!("train-{uid}")))
                         .absolute()
-                        .left(px(active_x - 11. + n as f32 * 22.))
-                        .top(px(g.y - 36.))
+                        .left(px(active_x - 11. * zoom + n as f32 * 22. * zoom))
+                        .top(px(active_y - 36. * zoom))
                         .p(px(2.))
                         .rounded_md()
                         .bg(style::panel())
@@ -1282,7 +1481,7 @@ impl ProjectView {
                         .cursor_pointer()
                         .hover(|d| d.bg(style::panel_hover()))
                         .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                        .child(icons::logo(icons::agent(agent), px(16.)))
+                        .child(icons::logo(icons::agent(agent), px(icon_sz)))
                         .on_click(cx.listener(move |this, _, window, cx| this.focus_session(&uid, window, cx)))
                         .into_any_element(),
                 );
@@ -1291,9 +1490,9 @@ impl ProjectView {
                 overlay.push(
                     div()
                         .absolute()
-                        .left(px(g.start - 46.))
-                        .top(px(g.y - 22.))
-                        .text_size(px(10.))
+                        .left(px(sx(g.start - 46.)))
+                        .top(px(sy(g.y - 22.)))
+                        .text_size(px((10. * zoom).clamp(8.5, 13.)))
                         .text_color(style::faint())
                         .child(format!("+{}", g.hidden))
                         .into_any_element(),
@@ -1302,12 +1501,103 @@ impl ProjectView {
         }
 
         let track = div()
+            .id("board-track")
             .relative()
-            .w(px(track_w))
-            .h(px(height))
-            .flex_none()
-            .child(canvas(|_, _, _| {}, move |bounds, _, window, _| paint_board(bounds, &paint_geom, window)).absolute().left_0().top_0().w(px(track_w)).h(px(height)))
-            .child(div().absolute().left(px(TRUNK_X - 12.)).top(px(height - 22.)).text_xs().text_color(style::muted()).child("main"))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .cursor(if dragging { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    if let Some(b) = &mut this.board {
+                        b.dragging = Some(ev.position);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                let Some(b) = &mut this.board else { return };
+                if let Some(last) = b.dragging {
+                    if ev.dragging() {
+                        b.pan_x += f32::from(ev.position.x - last.x);
+                        b.pan_y += f32::from(ev.position.y - last.y);
+                        b.dragging = Some(ev.position);
+                        cx.notify();
+                    } else {
+                        b.dragging = None;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(b) = &mut this.board {
+                        if b.dragging.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(b) = &mut this.board {
+                        if b.dragging.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                let Some(b) = &mut this.board else { return };
+                let delta = ev.delta.pixel_delta(window.line_height());
+                if ev.modifiers.platform || ev.modifiers.control {
+                    let factor = (1. + f32::from(delta.y) * 0.004).clamp(0.75, 1.35);
+                    let anchor = b
+                        .viewport
+                        .get()
+                        .map(|v| (f32::from(ev.position.x - v.origin.x), f32::from(ev.position.y - v.origin.y)))
+                        .unwrap_or((0., 0.));
+                    b.zoom_at(factor, anchor);
+                } else {
+                    b.pan_x += f32::from(delta.x);
+                    b.pan_y += f32::from(delta.y);
+                }
+                cx.notify();
+            }))
+            .on_pinch(cx.listener(|this, ev: &PinchEvent, _, cx| {
+                let Some(b) = &mut this.board else { return };
+                let factor = (1. + ev.delta).clamp(0.5, 2.0);
+                let anchor = b
+                    .viewport
+                    .get()
+                    .map(|v| (f32::from(ev.position.x - v.origin.x), f32::from(ev.position.y - v.origin.y)))
+                    .unwrap_or((0., 0.));
+                b.zoom_at(factor, anchor);
+                cx.notify();
+            }))
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        viewport_cell.set(Some(bounds));
+                    },
+                    move |bounds, _, window, _| paint_board(bounds, &paint_geom, pan_x, pan_y, zoom, window),
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(sx(TRUNK_X - 12.)))
+                    .top(px(sy(height - 22.)))
+                    .text_xs()
+                    .text_color(style::muted())
+                    .child("main"),
+            )
             .children(overlay);
 
         let body = if rows.is_empty() {
@@ -1325,12 +1615,15 @@ impl ProjectView {
                 })
                 .into_any_element()
         } else {
-            div()
+            h_flex()
                 .id("board-scroll")
                 .flex_1()
                 .min_w_0()
-                .overflow_scroll()
-                .child(h_flex().items_start().child(labels).child(track))
+                .h_full()
+                .items_start()
+                .overflow_hidden()
+                .child(labels)
+                .child(track)
                 .into_any_element()
         };
 
@@ -1779,15 +2072,16 @@ struct RowGeom {
     dim: bool,
 }
 
-fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
+fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], pan_x: f32, pan_y: f32, zoom: f32, window: &mut Window) {
     let ox = bounds.origin.x;
     let oy = bounds.origin.y;
-    let pt = |x: f32, y: f32| point(ox + px(x), oy + px(y));
+    let pt = |x: f32, y: f32| point(ox + px(pan_x + x * zoom), oy + px(pan_y + y * zoom));
+    let sc = |v: f32| v * zoom;
 
     // Vía principal (main), vertical a la izquierda.
     if !rows.is_empty() {
         let bottom = rows.iter().map(|r| r.y).fold(0., f32::max) + ROW * 0.5 + 4.;
-        let mut p = PathBuilder::stroke(px(5.));
+        let mut p = PathBuilder::stroke(px(sc(5.).max(2.)));
         p.move_to(pt(TRUNK_X, TOP - 6.));
         p.line_to(pt(TRUNK_X, bottom));
         if let Ok(path) = p.build() {
@@ -1795,10 +2089,14 @@ fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
         }
     }
 
-    // Franja detrás de la línea elegida, de lado a lado.
+    // Franja detrás de la línea elegida, de lado a lado del viewport.
     for row in rows.iter().filter(|r| r.selected) {
+        let pad = sc(4.).min(4.);
         window.paint_quad(PaintQuad {
-            bounds: Bounds { origin: pt(0., row.y - ROW * 0.5 + 4.), size: size(bounds.size.width, px(ROW - 8.)) },
+            bounds: Bounds {
+                origin: point(ox, oy + px(pan_y + (row.y - ROW * 0.5) * zoom + pad)),
+                size: size(bounds.size.width, px((ROW * zoom - pad * 2.).max(18.))),
+            },
             corner_radii: Corners::all(px(10.)),
             background: style::soft(line_color(row.color), 0.10).into(),
             border_widths: Edges::all(px(1.)),
@@ -1811,7 +2109,7 @@ fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
         let base: Hsla = if row.finished && !row.merged { style::soft(line_color(row.color), 0.45) } else { line_color(row.color).into() };
         // Con una línea elegida, las demás quedan atenuadas.
         let color = if row.dim { Hsla { a: base.a * 0.35, ..base } } else { base };
-        let width = if row.selected { 6. } else { 4. };
+        let width = sc(if row.selected { 6. } else { 4. }).max(1.5);
         let n = row.stations.len();
         let last_x = row.start + n.saturating_sub(1) as f32 * SPACING;
 
@@ -1837,7 +2135,7 @@ fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
         if !row.finished {
             let mut x = tail_start;
             while x < tail_start + 70. {
-                let mut d = PathBuilder::stroke(px(3.));
+                let mut d = PathBuilder::stroke(px(sc(3.).max(1.5)));
                 d.move_to(pt(x, row.y));
                 d.line_to(pt(x + 7., row.y));
                 if let Ok(path) = d.build() {
@@ -1846,28 +2144,28 @@ fn paint_board(bounds: Bounds<Pixels>, rows: &[RowGeom], window: &mut Window) {
                 x += 13.;
             }
         } else if row.merged {
-            let mut d = PathBuilder::stroke(px(4.));
+            let mut d = PathBuilder::stroke(px(sc(4.).max(1.5)));
             d.move_to(pt(last_x, row.y));
             d.line_to(pt(last_x + 48., row.y));
             if let Ok(path) = d.build() {
                 window.paint_path(path, color);
             }
-            dot(window, pt(last_x + 56., row.y), 8., style::bg().into(), style::muted().into(), 3.);
+            dot(window, pt(last_x + 56., row.y), sc(8.).max(3.), style::bg().into(), style::muted().into(), sc(3.).max(1.));
         }
         // Empalme con main.
         if row.depth == 0 || row.parent_y.is_none() {
-            dot(window, pt(TRUNK_X, row.y), 5., style::muted().into(), style::muted().into(), 0.);
+            dot(window, pt(TRUNK_X, row.y), sc(5.).max(2.5), style::muted().into(), style::muted().into(), 0.);
         }
 
         for (k, st) in row.stations.iter().enumerate() {
             let c = pt(row.start + k as f32 * SPACING, row.y);
             match st.state {
-                StationState::Done => dot(window, c, 7., color, color, 0.),
-                StationState::Pending => dot(window, c, 6., style::bg().into(), color, 2.5),
+                StationState::Done => dot(window, c, sc(7.).max(3.), color, color, 0.),
+                StationState::Pending => dot(window, c, sc(6.).max(2.5), style::bg().into(), color, sc(2.5).max(1.)),
                 StationState::Active => {
                     let ring: Hsla = if row.needs { amber().into() } else { color };
-                    dot(window, c, 11., style::bg().into(), ring, 2.5);
-                    dot(window, c, 5., color, color, 0.);
+                    dot(window, c, sc(11.).max(4.5), style::bg().into(), ring, sc(2.5).max(1.));
+                    dot(window, c, sc(5.).max(2.), color, color, 0.);
                 }
             }
         }
@@ -1888,8 +2186,20 @@ fn dot(window: &mut Window, center: Point<Pixels>, r: f32, fill: Hsla, border: H
 
 #[cfg(test)]
 mod tests {
-    use super::{meaningful_title, reviewer_is_done};
+    use super::{MAX_ZOOM, MIN_ZOOM, fit_zoom, meaningful_title, reviewer_is_done};
     use crate::project::Harness;
+
+    #[test]
+    fn fit_zoom_scales_large_boards_and_caps_at_one() {
+        // Contenido chico: no agranda por encima de 100%.
+        assert_eq!(fit_zoom(Some((1000., 800.)), 500., 300.), 1.0);
+        // Contenido ancho: ajusta para que quepa todo el ancho.
+        let z = fit_zoom(Some((824., 600.)), 1600., 300.);
+        assert!((z - 0.5).abs() < 1e-3);
+        // Contenido enorme: respeta el mínimo.
+        assert_eq!(fit_zoom(Some((400., 300.)), 5000., 3000.), MIN_ZOOM);
+        assert!(MAX_ZOOM > 1.0);
+    }
 
     #[test]
     fn skips_generic_terminal_titles() {
