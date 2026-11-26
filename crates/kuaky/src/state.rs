@@ -171,6 +171,9 @@ pub struct ProjectState {
     /// Líneas (id) con sus sub-líneas plegadas en la barra izquierda.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_lines: Vec<String>,
+    /// Filtro de actividad activo en la lista de sesiones (`""` = All).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_filter: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]

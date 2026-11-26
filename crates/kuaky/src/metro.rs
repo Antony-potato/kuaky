@@ -705,18 +705,51 @@ impl ProjectView {
 
     pub(super) fn grouped_sessions(&self, now: Instant, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let trains = self.trains(cx);
+        let tz = jiff::tz::TimeZone::system();
+        let today = jiff::Zoned::now().date();
+        let allowed: std::collections::HashSet<usize> = (0..self.tabs.len())
+            .filter(|&i| {
+                self.tabs.get(i).is_some_and(|tab| {
+                    super::is_session(&tab.kind)
+                        && (self.session_filter == super::DateFilter::All
+                            || self.session_filter.matches(self.session_last_active(tab, cx), today, &tz))
+                })
+            })
+            .collect();
         let mut used: Vec<usize> = Vec::new();
         let mut out: Vec<AnyElement> = Vec::new();
-        // Solo las líneas con sesiones abiertas; las sub-líneas cuelgan de su línea como árbol.
-        let shown: Vec<(&Line, usize, Vec<usize>)> = self
+        // Solo las líneas con sesiones visibles tras el filtro; si una sub-línea queda visible,
+        // sus líneas padre también se muestran como contexto.
+        let entries: Vec<(&Line, usize, Vec<usize>)> = self
             .lines
             .ordered(true)
             .into_iter()
-            .filter_map(|(line, depth)| {
-                let tabs: Vec<usize> = self.line_trains(line, &trains).into_iter().map(|(_, t)| t.tab).collect();
-                (!tabs.is_empty()).then_some((line, depth, tabs))
+            .map(|(line, depth)| {
+                let tabs: Vec<usize> = self
+                    .line_trains(line, &trains)
+                    .into_iter()
+                    .map(|(_, t)| t.tab)
+                    .filter(|i| allowed.contains(i))
+                    .collect();
+                (line, depth, tabs)
             })
             .collect();
+        let mut keep = vec![false; entries.len()];
+        for (idx, (_, _, tabs)) in entries.iter().enumerate() {
+            if !tabs.is_empty() {
+                keep[idx] = true;
+                let mut d = entries[idx].1;
+                let mut p = idx;
+                while d > 0 && p > 0 {
+                    p -= 1;
+                    if entries[p].1 < d {
+                        keep[p] = true;
+                        d = entries[p].1;
+                    }
+                }
+            }
+        }
+        let shown: Vec<(&Line, usize, Vec<usize>)> = entries.into_iter().zip(keep).filter_map(|(e, k)| k.then_some(e)).collect();
         let mut k = 0;
         while k < shown.len() {
             let (line, depth, tabs) = (&shown[k].0, shown[k].1, &shown[k].2);
@@ -882,8 +915,7 @@ impl ProjectView {
                 k += 1;
             }
         }
-        let rest: Vec<usize> =
-            (0..self.tabs.len()).filter(|i| !used.contains(i) && self.tabs.get(*i).is_some_and(|t| super::is_session(&t.kind))).collect();
+        let rest: Vec<usize> = (0..self.tabs.len()).filter(|i| !used.contains(i) && allowed.contains(i)).collect();
         if !rest.is_empty() && !used.is_empty() {
             out.push(div().mt_2().px_2().text_xs().text_color(style::faint()).child("Other").into_any_element());
         }
@@ -891,6 +923,35 @@ impl ProjectView {
             if let Some(row) = self.tabs.get(i).and_then(|tab| self.session_row(i, tab, now, cx)) {
                 out.push(row);
             }
+        }
+        if out.is_empty()
+            && self.session_filter != super::DateFilter::All
+            && self.tabs.iter().any(|t| super::is_session(&t.kind))
+        {
+            out.push(
+                h_flex()
+                    .px_2()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(style::faint())
+                    .child("No sessions match this filter.")
+                    .child(
+                        div()
+                            .id("session-filter-reset")
+                            .cursor_pointer()
+                            .text_color(style::accent())
+                            .hover(|d| d.text_color(style::text()))
+                            .child("Show all")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.session_filter = super::DateFilter::All;
+                                this.persist(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
         }
         out
     }

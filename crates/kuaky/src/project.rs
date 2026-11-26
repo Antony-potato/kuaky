@@ -466,6 +466,11 @@ pub struct ProjectView {
     subagents_open: std::collections::HashSet<String>,
     /// Líneas (id) cuyas sub-líneas están plegadas en la barra izquierda; se guarda con el proyecto.
     collapsed_lines: std::collections::HashSet<String>,
+    /// Filtro de fecha en la barra izquierda de sesiones; se guarda con el proyecto.
+    session_filter: DateFilter,
+    session_filter_menu: bool,
+    session_filter_pick_day: bool,
+    session_filter_closed: Option<Instant>,
     /// Sesiones (uid) que terminaron un turno y el usuario aún no ha visto.
     unseen_done: std::collections::HashSet<String>,
     /// Sesión resolviendo conflictos de un PR → se une cuando termine su turno.
@@ -601,6 +606,10 @@ impl ProjectView {
             session_prs: HashMap::new(),
             subagents_open: saved.subagents_open.iter().cloned().collect(),
             collapsed_lines: saved.collapsed_lines.iter().cloned().collect(),
+            session_filter: DateFilter::from_key(&saved.session_filter),
+            session_filter_menu: false,
+            session_filter_pick_day: false,
+            session_filter_closed: None,
             unseen_done: std::collections::HashSet::new(),
             pending_merges: HashMap::new(),
             mini_map_collapsed: false,
@@ -738,9 +747,10 @@ impl ProjectView {
         subagents_open.sort();
         let mut collapsed_lines: Vec<String> = self.collapsed_lines.iter().filter(|id| self.lines.get(id).is_some()).cloned().collect();
         collapsed_lines.sort();
+        let session_filter = self.session_filter.to_key();
         let key = self.root.to_string_lossy().into_owned();
         state::update(cx, |s| {
-            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open, collapsed_lines });
+            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open, collapsed_lines, session_filter });
         });
     }
 
@@ -2276,6 +2286,166 @@ impl ProjectView {
         }
     }
 
+    /// Última actividad conocida de una sesión abierta (entre `LineSession::last_active`,
+    /// la terminal y el chat).
+    fn session_last_active(&self, tab: &Tab, cx: &App) -> jiff::Timestamp {
+        let (uid, live_ts) = match &tab.kind {
+            TabKind::Terminal { view, .. } => {
+                let t = view.read(cx);
+                (t.uid.clone(), Some(t.last_activity_at()))
+            }
+            TabKind::Chat { view, .. } => {
+                let v = view.read(cx);
+                (v.uid.clone(), v.last_activity_at())
+            }
+            _ => return jiff::Timestamp::now(),
+        };
+        let line_ts = self.lines.session(&uid).map(|s| s.last_active);
+        match (line_ts, live_ts) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => jiff::Timestamp::now(),
+        }
+    }
+
+    fn session_filter_menu_just_closed(&self) -> bool {
+        self.session_filter_closed.is_some_and(|t| t.elapsed() < Duration::from_millis(300))
+    }
+
+    /// Botón y menú de filtros de actividad junto al título SESSIONS.
+    fn session_filter_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.session_filter != DateFilter::All;
+        let open = self.session_filter_menu;
+        let label = self.session_filter.label();
+        let today = jiff::Zoned::now().date();
+        let item = |id: SharedString, text: String, target: DateFilter, cx: &mut Context<Self>| {
+            let selected = self.session_filter == target;
+            h_flex()
+                .id(id)
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .text_color(if selected { style::text() } else { style::muted() })
+                .when(selected, |d| d.bg(style::panel_hover()))
+                .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                .child(div().w(px(12.)).flex_none().when(selected, |d| d.child(icons::ui("check", px(11.), style::accent()))))
+                .child(div().flex_1().min_w_0().truncate().child(text))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.session_filter = target.clone();
+                    this.session_filter_menu = false;
+                    this.session_filter_pick_day = false;
+                    this.left_peek = false;
+                    this.persist(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        let day_selected = matches!(self.session_filter, DateFilter::Day(_));
+        let pick_open = self.session_filter_pick_day || day_selected;
+        h_flex()
+            .id("session-filter-btn")
+            .relative()
+            .gap_1()
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(if active || open { style::text() } else { style::faint() })
+            .when(active || open, |d| d.bg(style::panel_hover()))
+            .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+            .tooltip(|window, cx| Tooltip::new("Filter sessions by last activity").build(window, cx))
+            .child(div().max_w(px(110.)).truncate().child(label))
+            .child(icons::ui("chevron-down", px(10.), if active || open { style::muted() } else { style::faint() }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.new_session_menu = false;
+                this.new_session_line = None;
+                this.session_filter_menu = !this.session_filter_menu && !this.session_filter_menu_just_closed();
+                if !this.session_filter_menu {
+                    this.session_filter_pick_day = false;
+                }
+                cx.notify();
+            }))
+            .when(open, |d| {
+                let days = DateFilter::last_14_days(today);
+                d.child(
+                    deferred(
+                        div().absolute().top_full().left_0().mt_1().child(
+                            v_flex()
+                                .id("session-filter-menu")
+                                .occlude()
+                                .w(px(196.))
+                                .p_1()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(style::border())
+                                .bg(style::panel())
+                                .shadow_lg()
+                                .text_color(style::text())
+                                .child(item("sf-all".into(), "All".into(), DateFilter::All, cx))
+                                .child(item("sf-today".into(), "Today".into(), DateFilter::Today, cx))
+                                .child(item("sf-yesterday".into(), "Yesterday".into(), DateFilter::Yesterday, cx))
+                                .child(item("sf-week".into(), "This week".into(), DateFilter::ThisWeek, cx))
+                                .child(
+                                    h_flex()
+                                        .id("sf-pick-day")
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .text_color(if day_selected { style::text() } else { style::muted() })
+                                        .hover(|d| d.bg(style::panel_hover()).text_color(style::text()))
+                                        .child(
+                                            div()
+                                                .w(px(12.))
+                                                .flex_none()
+                                                .child(icons::ui(if pick_open { "chevron-down" } else { "chevron-right" }, px(11.), style::faint())),
+                                        )
+                                        .child("Pick a day…")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.session_filter_pick_day = !this.session_filter_pick_day;
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(pick_open, |d| {
+                                    d.child(
+                                        div()
+                                            .id("sf-days-list")
+                                            .max_h(px(210.))
+                                            .overflow_y_scroll()
+                                            .pl_3()
+                                            .child(v_flex().children(days.into_iter().map(|(ymd, text)| {
+                                                item(SharedString::from(format!("sf-day-{ymd}")), text, DateFilter::Day(ymd), cx)
+                                            }))),
+                                    )
+                                })
+                                .child(div().my_1().h(px(1.)).bg(style::border()))
+                                .child(item("sf-inactive".into(), "No activity today".into(), DateFilter::NoActivityToday, cx))
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    if this.session_filter_menu {
+                                        this.session_filter_menu = false;
+                                        this.session_filter_pick_day = false;
+                                        this.session_filter_closed = Some(Instant::now());
+                                        this.left_peek = false;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                    )
+                    .with_priority(1),
+                )
+            })
+            .into_any_element()
+    }
+
     /// One row of the open-sessions list.
     fn session_row(&self, i: usize, tab: &Tab, now: Instant, cx: &mut Context<Self>) -> Option<AnyElement> {
                                 let (harness, title, status_line, badge, worktree, accent_color, can_rename, uid): (
@@ -2555,6 +2725,8 @@ impl ProjectView {
         state::update(cx, |s| s.left_collapsed = collapsed);
         if collapsed {
             self.new_session_menu = false;
+            self.session_filter_menu = false;
+            self.session_filter_pick_day = false;
         }
         cx.notify();
     }
@@ -2653,8 +2825,11 @@ impl ProjectView {
                     .child(
                         h_flex()
                             .pl_2()
+                            .gap_1p5()
                             .items_center()
-                            .child(div().flex_1().text_xs().text_color(style::faint()).child("SESSIONS"))
+                            .child(div().text_xs().text_color(style::faint()).child("SESSIONS"))
+                            .child(self.session_filter_button(cx))
+                            .child(div().flex_1())
                             .child(
                                 div()
                                     .id("new-session-btn")
@@ -4290,7 +4465,7 @@ impl Render for ProjectView {
                                         .shadow_lg()
                                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                                             // Con un menú suyo abierto no se pliega (el menú sale fuera de la barra).
-                                            if !*hovered && !this.new_session_menu && this.new_session_line.is_none() {
+                                            if !*hovered && !this.new_session_menu && this.new_session_line.is_none() && !this.session_filter_menu {
                                                 this.left_peek = false;
                                                 this.rail_hovered = false;
                                                 cx.notify();
@@ -4353,7 +4528,12 @@ impl Render for ProjectView {
             .when_some(self.merge_modal.as_ref().map(|m| self.merge_overlay(m, cx)), |d, el| d.child(el))
             // Algo flota sobre el centro: el lienzo (ventana nativa) se esconde para no taparlo.
             .when(
-                self.quick_open.is_some() || self.rename_modal.is_some() || self.board.is_some() || self.merge_modal.is_some() || self.new_session_menu,
+                self.quick_open.is_some()
+                    || self.rename_modal.is_some()
+                    || self.board.is_some()
+                    || self.merge_modal.is_some()
+                    || self.new_session_menu
+                    || self.session_filter_menu,
                 |d| {
                     crate::webview::cover();
                     d
@@ -4363,6 +4543,95 @@ impl Render for ProjectView {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
+
+/// Filtro por fecha de última actividad (usado en la lista de sesiones y en la lista de PRs).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum DateFilter {
+    #[default]
+    All,
+    Today,
+    Yesterday,
+    ThisWeek,
+    /// Un día concreto (`YYYY-MM-DD`) de los últimos 14 días.
+    Day(String),
+    /// Última actividad anterior a hoy.
+    NoActivityToday,
+}
+
+impl DateFilter {
+    pub(crate) fn label(&self) -> String {
+        match self {
+            DateFilter::All => "All".into(),
+            DateFilter::Today => "Today".into(),
+            DateFilter::Yesterday => "Yesterday".into(),
+            DateFilter::ThisWeek => "This week".into(),
+            DateFilter::NoActivityToday => "No activity today".into(),
+            DateFilter::Day(ymd) => ymd
+                .parse::<jiff::civil::Date>()
+                .map(|d| d.strftime("%b %d").to_string())
+                .unwrap_or_else(|_| ymd.clone()),
+        }
+    }
+
+    pub(crate) fn to_key(&self) -> String {
+        match self {
+            DateFilter::All => String::new(),
+            DateFilter::Today => "today".into(),
+            DateFilter::Yesterday => "yesterday".into(),
+            DateFilter::ThisWeek => "week".into(),
+            DateFilter::NoActivityToday => "inactive_today".into(),
+            DateFilter::Day(ymd) => format!("day:{ymd}"),
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Self {
+        match key {
+            "today" => DateFilter::Today,
+            "yesterday" => DateFilter::Yesterday,
+            "week" => DateFilter::ThisWeek,
+            "inactive_today" => DateFilter::NoActivityToday,
+            s if s.starts_with("day:") && s.len() > 4 => DateFilter::Day(s[4..].to_string()),
+            _ => DateFilter::All,
+        }
+    }
+
+    pub(crate) fn matches_date(&self, date: jiff::civil::Date, today: jiff::civil::Date) -> bool {
+        match self {
+            DateFilter::All => true,
+            DateFilter::Today => date == today,
+            DateFilter::Yesterday => today.yesterday().is_ok_and(|y| date == y),
+            DateFilter::ThisWeek => {
+                let start = today.checked_sub(jiff::Span::new().days(6)).unwrap_or(today);
+                date >= start && date <= today
+            }
+            DateFilter::Day(ymd) => date.to_string() == *ymd,
+            DateFilter::NoActivityToday => date < today,
+        }
+    }
+
+    pub(crate) fn matches(&self, ts: jiff::Timestamp, today: jiff::civil::Date, tz: &jiff::tz::TimeZone) -> bool {
+        if *self == DateFilter::All {
+            return true;
+        }
+        self.matches_date(ts.to_zoned(tz.clone()).date(), today)
+    }
+
+    /// Lista de los últimos 14 días como `(YYYY-MM-DD, etiqueta legible)`.
+    pub(crate) fn last_14_days(today: jiff::civil::Date) -> Vec<(String, String)> {
+        (0..14)
+            .filter_map(|offset| {
+                let d = today.checked_sub(jiff::Span::new().days(offset)).ok()?;
+                let ymd = d.to_string();
+                let label = match offset {
+                    0 => format!("Today · {}", d.strftime("%b %d")),
+                    1 => format!("Yesterday · {}", d.strftime("%b %d")),
+                    _ => d.strftime("%a, %b %d").to_string(),
+                };
+                Some((ymd, label))
+            })
+            .collect()
+    }
+}
 
 /// Estado visual de una sesión en la barra izquierda (solo 3 estados llevan color o movimiento).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4625,4 +4894,43 @@ pub(crate) fn sidebar_toggle(collapsed: bool) -> Stateful<Div> {
         .hover(|d| d.bg(style::panel_hover()))
         .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
         .child(icons::ui(if collapsed { "panel-left-open" } else { "panel-left-close" }, px(15.), style::muted()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DateFilter;
+
+    #[test]
+    fn date_filter_matches_and_roundtrips() {
+        let today = jiff::civil::date(2026, 11, 26);
+        let yesterday = jiff::civil::date(2026, 11, 25);
+        let four_days_ago = jiff::civil::date(2026, 11, 22);
+        let two_weeks_ago = jiff::civil::date(2026, 11, 12);
+
+        assert!(DateFilter::Today.matches_date(today, today));
+        assert!(!DateFilter::Today.matches_date(yesterday, today));
+        assert!(DateFilter::Yesterday.matches_date(yesterday, today));
+        assert!(!DateFilter::Yesterday.matches_date(today, today));
+        assert!(DateFilter::ThisWeek.matches_date(four_days_ago, today));
+        assert!(!DateFilter::ThisWeek.matches_date(two_weeks_ago, today));
+        assert!(DateFilter::NoActivityToday.matches_date(yesterday, today));
+        assert!(!DateFilter::NoActivityToday.matches_date(today, today));
+        assert!(DateFilter::Day("2026-11-22".into()).matches_date(four_days_ago, today));
+
+        let days = DateFilter::last_14_days(today);
+        assert_eq!(days.len(), 14);
+        assert_eq!(days[0].0, "2026-11-26");
+        assert_eq!(days[13].0, "2026-11-13");
+
+        for f in [
+            DateFilter::All,
+            DateFilter::Today,
+            DateFilter::Yesterday,
+            DateFilter::ThisWeek,
+            DateFilter::Day("2026-11-22".into()),
+            DateFilter::NoActivityToday,
+        ] {
+            assert_eq!(DateFilter::from_key(&f.to_key()), f);
+        }
+    }
 }

@@ -447,6 +447,11 @@ impl ChatView {
         self.turns.iter().find_map(|t| t.user.as_ref()).map(|u| u.text.as_str())
     }
 
+    /// Fecha de la última actividad del chat (último mensaje del usuario, si existe).
+    pub fn last_activity_at(&self) -> Option<jiff::Timestamp> {
+        self.turns.iter().rev().find_map(|t| t.user.as_ref().map(|u| u.at))
+    }
+
     fn connect(&self, cx: &mut Context<Self>) {
         self.connect_with(false, cx);
     }
