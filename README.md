@@ -5,13 +5,26 @@ Editor de escritorio ligero, escrito en Rust con [GPUI](https://github.com/zed-i
 - **Inicio:** dashboard de consumo de tokens de todos tus agentes.
 - **Proyecto:** árbol de archivos, terminales con tus agentes, ramas, diffs y PRs.
 
-Plataformas: macOS y Windows.
+Plataformas: macOS (Apple Silicon) y Windows (x64).
 
-## Instalar en macOS
+## Instalar
+
+Descarga la última versión en [Releases](https://github.com/Antony-potato/kuaky/releases/latest). kuaky se actualiza sola después: avisa en la barra de título cuando hay una versión nueva.
+
+**Windows:** corre `kuaky-X.Y.Z-windows-x64-setup.exe`. Se instala para tu usuario, sin permisos de administrador. El instalador todavía no está firmado: si Windows muestra "Windows protegió tu PC", da clic en **Más información → Ejecutar de todas formas**.
+
+**macOS:** descomprime `kuaky-X.Y.Z-macos-arm64.zip` y mueve `kuaky.app` a Aplicaciones. La app todavía no está firmada por Apple; la primera vez quítale la cuarentena:
 
 ```bash
-script/bundle-macos.sh             # crea target/release/bundle/kuaky.app
+xattr -dr com.apple.quarantine /Applications/kuaky.app
+```
+
+### Compilar desde el código
+
+```bash
+script/bundle-macos.sh             # macOS: crea target/release/bundle/kuaky.app
 script/bundle-macos.sh --install   # y la copia a ~/Applications
+cargo build --release -p kuaky     # Windows: target/release/kuaky.exe
 ```
 
 ## Desarrollo
@@ -23,3 +36,5 @@ cargo run --release -p kuaky-usage --example resumen   # consumo local en la ter
 ```
 
 Documentación de diseño en [`docs/`](docs/): investigación, stack, competencia y plan.
+
+¿Encontraste un problema de seguridad? Ve [`SECURITY.md`](SECURITY.md). Código de terceros: [`THIRD_PARTY.md`](THIRD_PARTY.md).

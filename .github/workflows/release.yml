@@ -15,7 +15,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -82,6 +82,8 @@ jobs:
   publish:
     needs: [version, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # solo este job crea el release
     steps:
       - uses: actions/download-artifact@v4
         with:
