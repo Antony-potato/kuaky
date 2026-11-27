@@ -1,81 +1,81 @@
 <p align="center">
-  <img src="./assets/icon/kuaky.svg" width="80" height="80" alt="kuaky logo" />
+  <img src="./assets/icon/kuaky.svg" width="80" height="80" alt="Logo de kuaky" />
 </p>
 
 <h1 align="center">kuaky</h1>
 
-<p align="center">A light, native desktop editor for working with coding agents.</p>
+<p align="center">Un editor de escritorio ligero y nativo para trabajar con agentes de código.</p>
 
 <p align="center">
-  <a href="https://github.com/Antony-potato/kuaky/releases/latest"><strong>Download</strong></a> ·
-  <a href="#install">Install</a> ·
-  <a href="./CONTRIBUTING.md">Contributing</a> ·
-  <a href="./docs/">Design notes</a>
+  <a href="https://github.com/Antony-potato/kuaky/releases/latest"><strong>Descargar</strong></a> ·
+  <a href="#instalar">Instalar</a> ·
+  <a href="./CONTRIBUTING.md">Contribuir</a> ·
+  <a href="./docs/">Notas de diseño</a>
 </p>
 
-kuaky puts your coding agents, your code and your git work in one window. It is written in Rust with [GPUI](https://github.com/zed-industries/zed) and [GPUI Kit](https://gpui-kit.com/), so it starts fast and stays light.
+kuaky junta en una sola ventana tus agentes de código, tu código y tu trabajo con git. Está escrito en Rust con [GPUI](https://github.com/zed-industries/zed) y [GPUI Kit](https://gpui-kit.com/), así que abre rápido y consume poco.
 
-It works with Claude Code, Codex, Gemini CLI, OpenCode and Antigravity. If an agent is installed and signed in on your computer, kuaky can drive it.
+Funciona con Claude Code, Codex, Gemini CLI, OpenCode y Antigravity. Si un agente está instalado y con sesión iniciada en tu computadora, kuaky lo puede usar.
 
-## What you get
+## Qué te da
 
-- **Your subscriptions.** kuaky does not sell tokens or ask for API keys. It runs the agents you are already signed in to.
-- **Usage at a glance.** Home shows the tokens and the equivalent API cost of all your agents and projects, next to your plan limits.
-- **A real chat with every agent.** Plans, tool calls, permission buttons, and a diff for each edit that you can keep or reject.
-- **Agents that work together.** An agent can open a session in another agent and hand it part of the work.
-- **A map of your work.** Sessions are grouped into lines by goal, with live status: working, needs you, done.
-- **Git built in.** A worktree per session, diffs between branches, and pull requests you can review, merge, or start a session from.
-- **An editor when you need it.** File tree, syntax highlighting, project search, terminals, and language servers for diagnostics, completion and go to definition.
-- **Diagrams and preview.** Agents can draw a diagram to explain something, or show your running app in a tab.
-- **Open.** The source code is [GPL-3.0](./LICENSE). See [License](#license).
+- **Tus suscripciones.** kuaky no vende tokens ni te pide API keys. Usa los agentes en los que ya iniciaste sesión.
+- **Tu consumo de un vistazo.** El inicio muestra los tokens y el costo equivalente en API de todos tus agentes y proyectos, junto a los límites de tu plan.
+- **Un chat de verdad con cada agente.** Planes, herramientas, botones para dar permisos y un diff de cada edición que puedes aceptar o rechazar.
+- **Agentes que trabajan juntos.** Un agente puede abrir una sesión en otro agente y pasarle parte del trabajo.
+- **Un mapa de tu trabajo.** Las sesiones se agrupan en líneas por meta, con su estado en vivo: trabajando, te necesita, terminado.
+- **Git integrado.** Un worktree por sesión, diffs entre ramas y pull requests que puedes revisar, fusionar o usar para empezar una sesión.
+- **Un editor cuando lo necesitas.** Árbol de archivos, resaltado de sintaxis, búsqueda en el proyecto, terminales y servidores de lenguaje para diagnósticos, autocompletado e ir a la definición.
+- **Diagramas y vista previa.** Los agentes pueden dibujar un diagrama para explicar algo, o mostrar tu app corriendo en una pestaña.
+- **Abierto.** El código es [GPL-3.0](./LICENSE). Ve [Licencia](#licencia).
 
-## Install
+## Instalar
 
-Download the latest version from [Releases](https://github.com/Antony-potato/kuaky/releases/latest):
+Descarga la última versión en [Releases](https://github.com/Antony-potato/kuaky/releases/latest):
 
-| Platform              | File                                 |
+| Plataforma            | Archivo                              |
 | --------------------- | ------------------------------------ |
 | macOS (Apple Silicon) | `kuaky-X.Y.Z-macos-arm64.zip`        |
 | Windows (x64)         | `kuaky-X.Y.Z-windows-x64-setup.exe`  |
 
-After that, kuaky updates itself: when a new version is out, an **Update** button shows up in the title bar.
+Después kuaky se actualiza sola: cuando sale una versión nueva, aparece el botón **Update** en la barra de título.
 
 > [!NOTE]
-> The builds are not signed yet.
-> - **Windows:** if you see "Windows protected your PC", click **More info → Run anyway**. The installer does not need admin rights.
-> - **macOS:** move `kuaky.app` to Applications, then run `xattr -dr com.apple.quarantine /Applications/kuaky.app` once.
+> Los instaladores todavía no están firmados.
+> - **Windows:** si ves "Windows protegió tu PC", da clic en **Más información → Ejecutar de todas formas**. El instalador no necesita permisos de administrador.
+> - **macOS:** mueve `kuaky.app` a Aplicaciones y corre una vez `xattr -dr com.apple.quarantine /Applications/kuaky.app`.
 
-### Sign in to an agent
+### Inicia sesión en un agente
 
-kuaky needs at least one agent installed and signed in, such as [Claude Code](https://claude.com/product/claude-code) or [Codex CLI](https://developers.openai.com/codex/cli). Open **Settings → Agents** to install the ones you are missing.
+kuaky necesita al menos un agente instalado y con sesión iniciada, como [Claude Code](https://claude.com/product/claude-code) o [Codex CLI](https://developers.openai.com/codex/cli). En **Settings → Agents** puedes instalar los que te falten.
 
-### Build from source
+### Compilar desde el código
 
 ```bash
-cargo run                  # open kuaky
-cargo test --workspace     # run the tests
-script/bundle-macos.sh     # macOS: build target/release/bundle/kuaky.app
+cargo run                  # abre kuaky
+cargo test --workspace     # corre las pruebas
+script/bundle-macos.sh     # macOS: crea target/release/bundle/kuaky.app
 ```
 
-## Contributing
+## Contribuir
 
-Small, focused fixes are the most likely to be merged. For a bigger change, open an issue first so we can agree on it.
+Los arreglos chicos y enfocados son los que más fácil entran. Para un cambio grande, abre primero un issue para ponernos de acuerdo.
 
-- Read [CONTRIBUTING.md](./CONTRIBUTING.md) before you open a pull request. You sign the [CLA](./CLA.md) once, on your first PR.
-- Found a security problem? Do not open an issue: see [SECURITY.md](./SECURITY.md).
-- The [design notes](./docs/) (in Spanish) explain the stack and the plan.
+- Lee [CONTRIBUTING.md](./CONTRIBUTING.md) antes de abrir un pull request. El [CLA](./CLA.md) se firma una sola vez, en tu primer PR.
+- ¿Encontraste un problema de seguridad? No abras un issue: ve [SECURITY.md](./SECURITY.md).
+- Las [notas de diseño](./docs/) explican el stack y el plan.
 
-## License
+## Licencia
 
-kuaky is free software: you can use, change and share it under the [GNU General Public License v3.0 or later](./LICENSE). Code from other projects is listed in [THIRD_PARTY.md](./THIRD_PARTY.md).
+kuaky es software libre: puedes usarlo, modificarlo y compartirlo bajo la [GNU General Public License v3.0 o posterior](./LICENSE). El código tomado de otros proyectos está en [THIRD_PARTY.md](./THIRD_PARTY.md).
 
-## Trademarks and forks
+## Marca y forks
 
-The GPL applies **only to the source code**. It does not give any rights to the **kuaky** name, logo or application icon.
+La GPL aplica **solo al código**. No da ningún derecho sobre el nombre **kuaky**, su logo ni su ícono.
 
-If you fork or redistribute kuaky:
+Si haces un fork o redistribuyes kuaky:
 
-- **Use your own name and icon** in any public fork, build, website or app listing.
-- **Make it clear that your project is unofficial** and not affiliated with or endorsed by kuaky.
+- **Usa tu propio nombre e ícono** en cualquier fork público, build, sitio web o tienda de apps.
+- **Deja claro que tu proyecto no es oficial** y que no está afiliado ni respaldado por kuaky.
 
 © 2026 Antonio Cortazar Jimenez
