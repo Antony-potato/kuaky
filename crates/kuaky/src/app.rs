@@ -506,7 +506,7 @@ impl KuakyApp {
                 .items_center()
                 .text_sm()
                 .when_some(self.current().map(|p| p.read(cx).sidebar_collapsed()), |d, collapsed| {
-                    d.child(crate::project::sidebar_toggle(collapsed).mr_1().on_mouse_down(MouseButton::Left, no_drag).on_click(cx.listener(|this, _, _, cx| {
+                    d.child(crate::project::sidebar_toggle(collapsed).mr_1().occlude().on_mouse_down(MouseButton::Left, no_drag).on_click(cx.listener(|this, _, _, cx| {
                         if let Some(p) = this.current() {
                             p.update(cx, |p, cx| p.toggle_sidebar(cx));
                         }
@@ -528,7 +528,8 @@ impl KuakyApp {
                             false => d.text_color(style::accent()),
                         })
                         .child("kuaky")
-                        .on_mouse_down(MouseButton::Left, no_drag)
+                        .child(div().text_xs().font_weight(FontWeight::NORMAL).text_color(style::faint()).child(env!("CARGO_PKG_VERSION")))
+                        .occlude().on_mouse_down(MouseButton::Left, no_drag)
                         .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
                 )
                 .child(
@@ -543,7 +544,7 @@ impl KuakyApp {
                         .hover(|d| d.bg(style::panel_hover()))
                         .tooltip(move |window, cx| Tooltip::new(home_tip.clone()).build(window, cx))
                         .child(icons::ui("house", px(14.), if on_home { style::text() } else { style::muted() }))
-                        .on_mouse_down(MouseButton::Left, no_drag)
+                        .occlude().on_mouse_down(MouseButton::Left, no_drag)
                         .on_click(cx.listener(|this, _, window, cx| this.go_home(window, cx))),
                 )
                 .when(!tabs.is_empty(), |d| d.child(div().w(px(1.)).h(px(14.)).mx_1().bg(style::border())))
@@ -567,7 +568,7 @@ impl KuakyApp {
                         .hover(|d| d.bg(style::panel_hover()))
                         .tooltip(move |window, cx| Tooltip::new(open_tip.clone()).build(window, cx))
                         .child(icons::ui("plus", px(14.), style::muted()))
-                        .on_mouse_down(MouseButton::Left, no_drag)
+                        .occlude().on_mouse_down(MouseButton::Left, no_drag)
                         .on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))),
                 )
                 .child(div().flex_1())
@@ -583,7 +584,7 @@ impl KuakyApp {
                             .hover(|d| d.bg(style::panel_hover()))
                             .tooltip(move |window, cx| Tooltip::new(search_tip.clone()).build(window, cx))
                             .child(icons::ui("search", px(15.), style::muted()))
-                            .on_mouse_down(MouseButton::Left, no_drag)
+                            .occlude().on_mouse_down(MouseButton::Left, no_drag)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(project) = this.current() {
                                     project.update(cx, |p, cx| p.open_search_tab(window, cx));
@@ -600,7 +601,7 @@ impl KuakyApp {
                         .hover(|d| d.bg(style::panel_hover()))
                         .tooltip(move |window, cx| Tooltip::new(settings_tip.clone()).build(window, cx))
                         .child(icons::ui("settings", px(15.), style::muted()))
-                        .on_mouse_down(MouseButton::Left, no_drag)
+                        .occlude().on_mouse_down(MouseButton::Left, no_drag)
                         .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
                 ),
         )
@@ -643,7 +644,7 @@ impl KuakyApp {
             .when(active, |d| d.bg(style::panel_hover()))
             .hover(|d| d.bg(style::panel_hover()))
             .tooltip(move |window, cx| Tooltip::new(path_tip.clone()).build(window, cx))
-            .on_mouse_down(MouseButton::Left, no_drag)
+            .occlude().on_mouse_down(MouseButton::Left, no_drag)
             .on_click(cx.listener(move |this, _, window, cx| this.activate(Some(i), window, cx)))
             .on_mouse_down(
                 MouseButton::Middle,
@@ -675,9 +676,11 @@ impl KuakyApp {
     }
 }
 
-/// Para cada botón de la barra de título. En Windows toda la barra es zona de
-/// arrastre: si nadie detiene el clic, Windows empieza a mover la ventana, se
-/// queda con el soltar del mouse y el `on_click` nunca llega.
+/// Para cada botón de la barra de título, junto con `.occlude()`. En Windows toda la
+/// barra es zona de arrastre: si nadie detiene el clic, Windows empieza a mover la
+/// ventana, se queda con el soltar del mouse y el `on_click` nunca llega.
+/// `.occlude()` saca al botón de esa zona: Windows lo trata como área normal y no
+/// depende de `WM_NCLBUTTONUP`, que en algunos equipos (touchpads, tap) no llega.
 pub(crate) fn no_drag(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
     cx.stop_propagation();
 }

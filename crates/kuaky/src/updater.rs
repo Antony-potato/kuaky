@@ -242,7 +242,7 @@ pub fn title_button(cx: &mut App) -> Option<AnyElement> {
             .text_xs()
             .border_1()
             .border_color(style::border())
-            .on_mouse_down(MouseButton::Left, crate::app::no_drag)
+            .occlude().on_mouse_down(MouseButton::Left, crate::app::no_drag)
     };
     match status {
         Status::Idle => None,
