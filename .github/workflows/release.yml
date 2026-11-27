@@ -1,18 +1,13 @@
 name: Release
 
 # Publica una versión de kuaky: la app de macOS (.zip) y el instalador de Windows.
-# - Con un tag:      git tag v0.2.0 && git push origin v0.2.0
-# - O a mano:        Actions → Release → Run (pide la versión; crea el tag).
+#   git tag v0.2.0 && git push origin v0.2.0
+# Solo los admins pueden crear tags (regla "tags" del repo): los colaboradores no publican.
 # kuaky revisa estos releases para ofrecer "Update" en la barra de título.
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (e.g. 0.2.0)"
-        required: true
 
 permissions:
   contents: read
@@ -28,12 +23,8 @@ jobs:
     steps:
       - id: v
         shell: bash
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          V="$INPUT_VERSION"
-          [ -z "$V" ] && V="${GITHUB_REF_NAME#v}"
-          V="${V#v}"
+          V="${GITHUB_REF_NAME#v}"
           [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Bad version: $V"; exit 1; }
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
