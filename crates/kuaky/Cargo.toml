@@ -18,6 +18,10 @@ lsp-types = "0.97"
 similar = "3"
 base64 = "0.22"
 regex = "1"
+# Mensajes de los webviews (lienzo, navegador) hacia GPUI.
+flume = "0.11"
+# Ventana padre de los webviews (ya viene con GPUI).
+raw-window-handle = "0.6"
 gpui-kit = { workspace = true, features = ["syntect"] }
 # GPUI Kit pide syntect con fancy-regex; con `syntect-onig` también activo gana
 # Oniguruma (en two-face y en syntect). Medido sobre 308 archivos TS/TSX/MD:

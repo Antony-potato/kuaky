@@ -2,18 +2,18 @@
 //! Los agentes dibujan con la herramienta `draw` de `kuaky mcp`: el texto va tal cual al lienzo
 //! (`kuaky.apply`) y su respuesta ("ok" o los errores) vuelve al agente.
 //!
-//! Cada diagrama es un artefacto con nombre, guardado por proyecto (ver `dir`): el lienzo muestra
-//! uno a la vez y se puede cerrar y volver a abrir desde el panel Artifacts.
+//! Cada diagrama es un artefacto con nombre, guardado por proyecto (ver `dir`) y ligado a las
+//! conversaciones que lo dibujaron. El lienzo muestra uno a la vez y se puede cerrar y volver a
+//! abrir desde el panel Artifacts.
 
 use crate::style;
-use crate::webview::{Source, WebPanel};
+use crate::webview::WebPanel;
+use base64::Engine as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use kuaky_mcp::Reply;
-use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 const HTML: &str = include_str!("../assets/canvas/canvas.html");
 const ROUGH: &str = include_str!("../assets/canvas/rough.js");
@@ -23,6 +23,8 @@ pub struct Artifact {
     pub name: String,
     pub title: String,
     pub modified: SystemTime,
+    /// Conversaciones (uid de kuaky) que lo dibujaron.
+    pub sessions: Vec<String>,
 }
 
 /// Artefactos del proyecto, fuera del repo: `<datos locales>/kuaky/artifacts/<carpeta>-<hash>/`.
@@ -46,16 +48,29 @@ pub fn slug(name: &str) -> String {
     out.trim_matches('-').chars().take(48).collect()
 }
 
-fn file(root: &Path, name: &str) -> PathBuf {
-    dir(root).join(format!("{name}.txt"))
+fn file(root: &Path, name: &str, ext: &str) -> PathBuf {
+    dir(root).join(format!("{name}.{ext}"))
 }
 
 pub fn read(root: &Path, name: &str) -> Option<String> {
-    std::fs::read_to_string(file(root, name)).ok()
+    std::fs::read_to_string(file(root, name, "txt")).ok()
 }
 
 pub fn delete(root: &Path, name: &str) {
-    std::fs::remove_file(file(root, name)).ok();
+    std::fs::remove_file(file(root, name, "txt")).ok();
+    std::fs::remove_file(file(root, name, "sessions")).ok();
+}
+
+/// Liga el artefacto a la conversación `session` (un uid por línea en `<name>.sessions`).
+pub fn link(root: &Path, name: &str, session: &str) {
+    let path = file(root, name, "sessions");
+    let mut all = std::fs::read_to_string(&path).unwrap_or_default();
+    if session.is_empty() || all.lines().any(|l| l == session) {
+        return;
+    }
+    all.push_str(session);
+    all.push('\n');
+    std::fs::create_dir_all(dir(root)).and_then(|_| std::fs::write(&path, all)).ok();
 }
 
 /// Los más recientes primero.
@@ -65,11 +80,12 @@ pub fn list(root: &Path) -> Vec<Artifact> {
         .flatten()
         .filter_map(|e| {
             let path = e.path();
-            let name = path.file_stem()?.to_str()?.to_string();
             (path.extension()? == "txt").then_some(())?;
+            let name = path.file_stem()?.to_str()?.to_string();
             let src = std::fs::read_to_string(&path).ok()?;
             let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-            Some(Artifact { title: title_of(&src).unwrap_or_else(|| name.clone()), name, modified })
+            let sessions = std::fs::read_to_string(path.with_extension("sessions")).unwrap_or_default().lines().map(str::to_string).collect();
+            Some(Artifact { title: title_of(&src).unwrap_or_else(|| name.clone()), name, modified, sessions })
         })
         .collect();
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -87,131 +103,109 @@ enum Job {
     Draw { name: String, id: String, text: String },
 }
 
+/// Cambió el artefacto que se ve (el proyecto lo recuerda para la próxima vez).
+pub struct CanvasChanged;
+
 pub struct CanvasView {
     root: PathBuf,
-    panel: Result<WebPanel, String>,
-    ready: Rc<Cell<bool>>,
+    /// Se crea al pintarse la primera vez (o al dibujar): una pestaña restaurada no gasta memoria
+    /// hasta que se ve.
+    panel: Option<Result<WebPanel, String>>,
+    creating: bool,
+    ready: bool,
     /// Artefacto que se ve; ahí se guarda lo que manda la página.
-    current: Rc<RefCell<Option<String>>>,
-    title: Rc<RefCell<String>>,
+    current: Option<String>,
+    /// El que se verá en cuanto cargue la página (pestaña restaurada que aún no se pinta).
+    pending: Option<String>,
+    title: String,
     /// Lo que llega antes de que cargue la página.
     queue: Vec<Job>,
 }
 
+impl EventEmitter<CanvasChanged> for CanvasView {}
+
 impl CanvasView {
-    pub fn new(root: PathBuf, window: &mut Window) -> Self {
-        let html = HTML
-            .replace(r#"<script src="rough.js"></script>"#, &format!("<script>{ROUGH}</script>"))
-            .replace(r#"<script src="dagre.js"></script>"#, &format!("<script>{DAGRE}</script>"));
-        let (ready, current, title) = (Rc::new(Cell::new(false)), Rc::new(RefCell::new(None::<String>)), Rc::new(RefCell::new(String::new())));
-        let (on_ready, on_current, on_title, on_root) = (ready.clone(), current.clone(), title.clone(), root.clone());
-        let panel = WebPanel::new(window, Source::Html(html), None, move |body| {
-            let msg: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-            if msg["ready"] == true {
-                on_ready.set(true);
-            }
-            if let (Some(src), Some(name)) = (msg["src"].as_str(), on_current.borrow().as_ref()) {
-                let path = file(&on_root, name);
-                if let Err(err) = std::fs::create_dir_all(dir(&on_root)).and_then(|_| std::fs::write(&path, src)) {
-                    tracing::warn!(%err, path = %path.display(), "no se pudo guardar el artefacto");
-                }
-            }
-            if let Some(t) = msg["title"].as_str() {
-                *on_title.borrow_mut() = t.to_string();
-            }
-            if let (Some(id), Some(out)) = (msg["id"].as_str(), msg["out"].as_str()) {
-                answer(id, &if out == "ok" { Reply::ok(out) } else { Reply::error(out) });
-            }
-        });
-        Self { root, panel, ready, current, title, queue: Vec::new() }
+    pub fn new(root: PathBuf) -> Self {
+        Self { root, panel: None, creating: false, ready: false, current: None, pending: None, title: String::new(), queue: Vec::new() }
     }
 
+    /// El artefacto que se ve, o el que se verá en cuanto cargue.
     pub fn current(&self) -> Option<String> {
-        self.current.borrow().clone()
+        self.current.clone().or_else(|| self.pending.clone())
     }
 
     /// Para la pestaña: el título del diagrama, o su nombre.
     pub fn title(&self) -> SharedString {
-        let t = self.title.borrow();
-        match (t.is_empty(), self.current.borrow().as_ref()) {
-            (false, _) => t.clone().into(),
-            (true, Some(name)) => name.clone().into(),
-            (true, None) => "Canvas".into(),
+        match (&self.current, self.title.is_empty()) {
+            (_, false) => self.title.clone().into(),
+            (Some(name), true) => name.clone().into(),
+            (None, true) => "Canvas".into(),
         }
     }
 
     pub fn open(&mut self, name: String, cx: &mut Context<Self>) {
+        self.expect(&name);
         self.push(Job::Open(name), cx);
-        cx.notify();
     }
 
-    /// Manda órdenes al artefacto `name` (lo crea si no existe). `None`: la respuesta llega después,
-    /// por el buzón.
-    pub fn draw(&mut self, name: String, call_id: String, text: String, cx: &mut Context<Self>) -> Option<Reply> {
-        if let Err(e) = &self.panel {
+    /// Título y nombre ya, aunque la página todavía no lo cargue.
+    fn expect(&mut self, name: &str) {
+        if self.current.as_deref() != Some(name) {
+            self.title = read(&self.root, name).and_then(|src| title_of(&src)).unwrap_or_default();
+            self.pending = Some(name.to_string());
+        }
+    }
+
+    /// Manda órdenes al artefacto `name` (lo crea si no existe). `None`: la respuesta llega
+    /// después, por el buzón.
+    pub fn draw(&mut self, name: String, call_id: String, text: String, window: &mut Window, cx: &mut Context<Self>) -> Option<Reply> {
+        // Aunque la pestaña quede detrás (otra se abrió después), el agente espera la respuesta.
+        self.ensure_panel(window, cx);
+        if let Some(Err(e)) = &self.panel {
             return Some(Reply::error(e.clone()));
         }
+        self.expect(&name);
         if let Some(t) = title_of(&text) {
-            *self.title.borrow_mut() = t;
+            self.title = t;
         }
         self.push(Job::Draw { name, id: call_id, text }, cx)
     }
 
     /// Se borró `name`: si es el que se ve, el lienzo queda vacío.
     pub fn forget(&mut self, name: &str, cx: &mut Context<Self>) {
-        if self.current.borrow().as_deref() == Some(name) {
-            *self.current.borrow_mut() = None;
-            self.title.borrow_mut().clear();
-            if let Ok(panel) = &self.panel {
+        if self.current().as_deref() == Some(name) {
+            self.current = None;
+            self.pending = None;
+            self.title.clear();
+            if let Some(Ok(panel)) = &self.panel {
                 panel.eval("kuaky.load('')").ok();
             }
+            cx.emit(CanvasChanged);
             cx.notify();
         }
     }
 
     fn push(&mut self, job: Job, cx: &mut Context<Self>) -> Option<Reply> {
-        if self.ready.get() {
-            return self.run(job);
+        if self.ready {
+            return self.run(job, cx);
         }
         self.queue.push(job);
-        if self.queue.len() == 1 {
-            // ponytail: espera la carga revisando cada 50 ms; solo pasa al abrir el lienzo (< 1 s).
-            let ready = self.ready.clone();
-            cx.spawn(async move |this, cx| {
-                for _ in 0..200 {
-                    cx.background_executor().timer(Duration::from_millis(50)).await;
-                    if ready.get() {
-                        break;
-                    }
-                }
-                this.update(cx, |this, cx| {
-                    for job in std::mem::take(&mut this.queue) {
-                        let id = match &job {
-                            Job::Draw { id, .. } => Some(id.clone()),
-                            Job::Open(_) => None,
-                        };
-                        if let (Some(reply), Some(id)) = (this.run(job), id) {
-                            answer(&id, &reply);
-                        }
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
+        cx.notify(); // que se pinte y cree el webview
         None
     }
 
-    fn run(&mut self, job: Job) -> Option<Reply> {
-        let Ok(panel) = &self.panel else { return None };
+    fn run(&mut self, job: Job, cx: &mut Context<Self>) -> Option<Reply> {
+        let Some(Ok(panel)) = &self.panel else { return None };
         let name = match &job {
             Job::Open(name) | Job::Draw { name, .. } => name.clone(),
         };
-        if self.current.borrow().as_deref() != Some(name.as_str()) {
+        if self.current.as_deref() != Some(name.as_str()) {
             let src = read(&self.root, &name).unwrap_or_default();
-            *self.title.borrow_mut() = title_of(&src).unwrap_or_default();
-            *self.current.borrow_mut() = Some(name);
+            self.title = title_of(&src).unwrap_or_default();
+            self.current = Some(name);
+            self.pending = None;
+            cx.emit(CanvasChanged);
+            cx.notify();
             if let Err(e) = panel.eval(&format!("kuaky.load({})", serde_json::json!(src))) {
                 return Some(Reply::error(format!("The canvas did not open it: {e}")));
             }
@@ -219,6 +213,72 @@ impl CanvasView {
         let Job::Draw { id, text, .. } = job else { return None };
         let js = format!("kuaky.apply({}, {})", serde_json::json!(text), serde_json::json!(id));
         panel.eval(&js).err().map(|e| Reply::error(format!("The canvas did not take it: {e}")))
+    }
+
+    fn flush(&mut self, cx: &mut Context<Self>) {
+        for job in std::mem::take(&mut self.queue) {
+            let id = match &job {
+                Job::Draw { id, .. } => Some(id.clone()),
+                Job::Open(_) => None,
+            };
+            let reply = match &self.panel {
+                Some(Err(e)) => Some(Reply::error(e.clone())),
+                _ => self.run(job, cx),
+            };
+            if let (Some(reply), Some(id)) = (reply, id) {
+                answer(&id, &reply);
+            }
+        }
+    }
+
+    fn on_message(&mut self, body: &str, cx: &mut Context<Self>) {
+        let msg: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        if let (Some(src), Some(name)) = (msg["src"].as_str(), &self.current) {
+            let path = file(&self.root, name, "txt");
+            if let Err(err) = std::fs::create_dir_all(dir(&self.root)).and_then(|_| std::fs::write(&path, src)) {
+                tracing::warn!(%err, path = %path.display(), "no se pudo guardar el artefacto");
+            }
+        }
+        if let Some(t) = msg["title"].as_str() {
+            if self.title != t {
+                self.title = t.to_string();
+                cx.notify();
+            }
+        }
+        if let (Some(id), Some(out)) = (msg["id"].as_str(), msg["out"].as_str()) {
+            answer(id, &if out == "ok" { Reply::ok(out) } else { Reply::error(out) });
+        }
+        if let (Some(kind), Some(data)) = (msg["export"].as_str(), msg["data"].as_str()) {
+            self.export(kind, data, cx);
+        }
+        if msg["ready"] == true {
+            self.ready = true;
+            self.flush(cx);
+        }
+    }
+
+    /// `copy`: PNG al portapapeles; `png` / `svg`: guardar con el diálogo del sistema.
+    fn export(&mut self, kind: &str, data: &str, cx: &mut Context<Self>) {
+        let bytes = match kind {
+            "svg" => data.as_bytes().to_vec(),
+            _ => match base64::engine::general_purpose::STANDARD.decode(data) {
+                Ok(b) => b,
+                Err(err) => return tracing::warn!(%err, "imagen del lienzo inválida"),
+            },
+        };
+        if kind == "copy" {
+            return cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(ImageFormat::Png, bytes)));
+        }
+        let name = format!("{}.{}", self.current.clone().unwrap_or_else(|| "diagram".into()), if kind == "svg" { "svg" } else { "png" });
+        let pick = cx.prompt_for_new_path(&self.root, Some(&name));
+        cx.spawn(async move |_, _| {
+            if let Ok(Ok(Some(path))) = pick.await {
+                if let Err(err) = std::fs::write(&path, bytes) {
+                    tracing::warn!(%err, path = %path.display(), "no se pudo exportar el diagrama");
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -230,14 +290,38 @@ fn answer(call_id: &str, reply: &Reply) {
     }
 }
 
+impl CanvasView {
+    fn ensure_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_some() || self.creating {
+            return;
+        }
+        self.creating = true;
+        let html = HTML
+            .replace(r#"<script src="rough.js"></script>"#, &format!("<script>{ROUGH}</script>"))
+            .replace(r#"<script src="dagre.js"></script>"#, &format!("<script>{DAGRE}</script>"));
+        let done = |this: &mut Self, panel: Result<WebPanel, String>, cx: &mut Context<Self>| {
+            this.creating = false;
+            let failed = panel.is_err();
+            this.panel = Some(panel);
+            if failed {
+                this.flush(cx); // contesta el error a quien esperaba
+            }
+            cx.notify();
+        };
+        WebPanel::create(html, None, Self::on_message, done, window, cx);
+    }
+}
+
 impl Render for CanvasView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_panel(window, cx);
         div()
             .size_full()
             .bg(rgb(0x111214))
             .map(|d| match &self.panel {
-                Ok(panel) => d.child(panel.element()),
-                Err(e) => d.p_4().text_sm().text_color(style::bad()).child(e.clone()),
+                Some(Ok(panel)) => d.child(panel.element()),
+                Some(Err(e)) => d.p_4().text_sm().text_color(style::bad()).child(e.clone()),
+                None => d,
             })
     }
 }

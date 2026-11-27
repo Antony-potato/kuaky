@@ -104,7 +104,7 @@ impl ProjectView {
         let result = match call.tool.as_str() {
             "draw" => return self.tool_draw(call, window, cx),
             "preview" => return self.tool_preview(call, window, cx),
-            "artifacts" => self.tool_artifacts(&call.args),
+            "artifacts" => self.tool_artifacts(call),
             "open_session" => self.tool_open_session(&call.session, &call.args, window, cx),
             "list_sessions" => Ok(self.tool_list_sessions(&call.session, cx)),
             "read_session" => self.tool_read_session(&call.session, &call.args, cx),

@@ -2,7 +2,7 @@
 
 use crate::home::{HomeEvent, HomeView, tilde};
 use crate::icons;
-use crate::project::{ProjectView, SearchProject};
+use crate::project::{OpenBrowser, ProjectView, SearchProject};
 use crate::settings::{SettingsEvent, SettingsView};
 use crate::state;
 use crate::style;
@@ -79,6 +79,7 @@ fn set_menus(cx: &mut App) {
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Quick Open…", QuickOpenFile),
             MenuItem::action("Search in Project…", SearchProject),
+            MenuItem::action("Browser", OpenBrowser),
             MenuItem::separator(),
             MenuItem::action("New Terminal", NewTerminal),
             MenuItem::action("Close Tab", CloseTab),
@@ -709,6 +710,8 @@ impl Render for KuakyApp {
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.pick_folder(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings(window, cx)))
             .on_action(|_: &Minimize, window, _| window.minimize_window())
+            // Un clic en kuaky devuelve el teclado si lo tenía el lienzo o el navegador.
+            .capture_any_mouse_down(|_, _, _| crate::webview::release_focus())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
             .child(self.title_bar(window, cx))
             .child(crate::motion::fade_in(

@@ -174,6 +174,12 @@ pub struct ProjectState {
     /// Filtro de actividad activo en la lista de sesiones (`""` = All).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_filter: String,
+    /// Pestaña del lienzo abierta, con el artefacto que mostraba ("" si ninguno).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<String>,
+    /// Pestaña del navegador abierta, con su dirección ("" si ninguna).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]

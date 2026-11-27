@@ -4262,11 +4262,12 @@ dependencies = [
 
 [[package]]
 name = "kuaky"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "dirs 6.0.0",
+ "flume 0.11.1",
  "gpui-kit",
  "ignore",
  "image",
@@ -4278,6 +4279,7 @@ dependencies = [
  "kuaky-term",
  "kuaky-usage",
  "lsp-types",
+ "raw-window-handle",
  "regex",
  "serde",
  "serde_json",
@@ -4290,7 +4292,7 @@ dependencies = [
 
 [[package]]
 name = "kuaky-acp"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "flume 0.11.1",
@@ -4299,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "kuaky-git"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "serde",
@@ -4309,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "kuaky-lsp"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "flume 0.11.1",
@@ -4318,14 +4320,14 @@ dependencies = [
 
 [[package]]
 name = "kuaky-mcp"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "kuaky-term"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4334,7 +4336,7 @@ dependencies = [
 
 [[package]]
 name = "kuaky-usage"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",

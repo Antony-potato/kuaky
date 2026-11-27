@@ -169,11 +169,9 @@ mod tests {
     use super::dispatch_inputs;
 
     #[test]
-    fn release_workflow_asks_for_a_version() {
-        let inputs = dispatch_inputs(include_str!("../../../.github/workflows/release.yml")).unwrap();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].name, "version");
-        assert!(inputs[0].required);
+    fn release_workflow_only_runs_from_tags() {
+        // Solo los tags (que crean los admins) publican: no se puede lanzar a mano.
+        assert!(dispatch_inputs(include_str!("../../../.github/workflows/release.yml")).is_none());
     }
 
     #[test]

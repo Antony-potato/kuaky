@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject, ToggleSidebar]);
+actions!(project, [NewTerminal, CloseTab, NextTab, PrevTab, QuickOpenFile, SearchProject, ToggleSidebar, OpenBrowser]);
 
 #[path = "metro.rs"]
 mod metro;
@@ -91,12 +91,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-]", NextTab, Some("Project")),
         KeyBinding::new("cmd-shift-[", PrevTab, Some("Project")),
         KeyBinding::new("cmd-b", ToggleSidebar, Some("Project")),
+        KeyBinding::new("cmd-shift-b", OpenBrowser, Some("Project")),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
         KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-p", QuickOpenFile, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-shift-f", SearchProject, Some("Project && !Terminal")),
+        KeyBinding::new("ctrl-shift-b", OpenBrowser, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-shift-w", CloseTab, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-tab", NextTab, Some("Project && !Terminal")),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Project && !Terminal")),
@@ -653,7 +655,17 @@ impl ProjectView {
                 this.open_file(path, window, cx);
             }
         }
-        if !saved.files.is_empty() {
+        // El lienzo y el navegador vuelven como estaban; su webview se crea cuando se ven.
+        if let Some(name) = saved.canvas.clone() {
+            match name.is_empty() {
+                true => drop(this.canvas_tab(window, cx)),
+                false => this.open_artifact(name, window, cx),
+            }
+        }
+        if let Some(url) = saved.browser.clone() {
+            this.browser_tab(Some(url).filter(|u| !u.is_empty()), window, cx);
+        }
+        if !saved.files.is_empty() || saved.canvas.is_some() || saved.browser.is_some() {
             this.active = this.tabs.len().checked_sub(1);
         }
         for session in reopen {
@@ -763,9 +775,17 @@ impl ProjectView {
         let mut collapsed_lines: Vec<String> = self.collapsed_lines.iter().filter(|id| self.lines.get(id).is_some()).cloned().collect();
         collapsed_lines.sort();
         let session_filter = self.session_filter.to_key();
+        let canvas = self.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Canvas(v) => Some(v.read(cx).current().unwrap_or_default()),
+            _ => None,
+        });
+        let browser = self.tabs.iter().find_map(|t| match &t.kind {
+            TabKind::Preview(v) => Some(v.read(cx).url.clone()),
+            _ => None,
+        });
         let key = self.root.to_string_lossy().into_owned();
         state::update(cx, |s| {
-            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open, collapsed_lines, session_filter });
+            s.projects.insert(key, state::ProjectState { files, sessions, subagents_open, collapsed_lines, session_filter, canvas, browser });
         });
     }
 
@@ -3201,6 +3221,19 @@ impl ProjectView {
                     )
             }))
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("open-browser")
+                    .flex_none()
+                    .ml_2()
+                    .p_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(style::panel_hover()))
+                    .tooltip(|window, cx| Tooltip::new(if cfg!(target_os = "macos") { "Browser (⌘⇧B)" } else { "Browser (Ctrl+Shift+B)" }).build(window, cx))
+                    .child(icons::ui("globe", px(14.), style::muted()))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_browser(window, cx))),
+            )
             .when(self.shown_session.is_some(), |d| {
                 d.child(
                     div()
@@ -4440,6 +4473,7 @@ impl Render for ProjectView {
             }))
             .on_action(cx.listener(|this, _: &QuickOpenFile, window, cx| this.toggle_quick_open(window, cx)))
             .on_action(cx.listener(|this, _: &SearchProject, window, cx| this.open_search(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenBrowser, window, cx| this.open_browser(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .size_full()
             .relative()

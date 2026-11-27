@@ -26,6 +26,17 @@ f.onload = () => {
   t("view 3d", (k.apply("view 3d"), k.dump().includes("view 3d")), true);
   t("unknown cmd", k.apply("hola mundo"), 'line 1: don\'t understand "hola mundo"');
   t("quotes", (k.apply('node q "dice \\"hola\\""'), k.dump().includes('node q "dice \\"hola\\""')), true);
-  document.getElementById("out").textContent = log.join("\n") + "\n---\n" + k.dump();
+  k.load('title "Exportado"\ngroup g "Grupo"\nnode a "API" "detalle" api in=g\nnode b "DB" db\na -> b "SQL"');
+  const svg = k.exportSvg().svg;
+  t("export svg", svg.startsWith("<svg") && svg.includes("Exportado") && !svg.includes("flow"), true);
+  k.exportPng().then(png => {
+    t("export png", png.length > 1000, true);
+    document.getElementById("out").textContent = log.join("\n") + "\n---\n" + k.dump();
+    // Lo exportado, para mirarlo.
+    const img = document.createElement("img");
+    img.src = "data:image/png;base64," + png;
+    img.style = "position:fixed;right:8px;top:8px;width:480px;z-index:10;border:1px solid #ccc";
+    document.body.append(img);
+  });
 };
 </script>
