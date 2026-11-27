@@ -8,6 +8,7 @@ version = "0.2.5"
 edition = "2024"
 rust-version = "1.90"
 publish = false
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 kuaky-usage = { path = "crates/kuaky-usage" }

@@ -37,4 +37,10 @@ cargo run --release -p kuaky-usage --example resumen   # consumo local en la ter
 
 Documentación de diseño en [`docs/`](docs/): investigación, stack, competencia y plan.
 
-¿Encontraste un problema de seguridad? Ve [`SECURITY.md`](SECURITY.md). Código de terceros: [`THIRD_PARTY.md`](THIRD_PARTY.md).
+¿Quieres contribuir? Ve [`CONTRIBUTING.md`](CONTRIBUTING.md). ¿Encontraste un problema de seguridad? Ve [`SECURITY.md`](SECURITY.md). Código de terceros: [`THIRD_PARTY.md`](THIRD_PARTY.md).
+
+## Licencia
+
+kuaky es software libre: puedes usarlo, modificarlo y redistribuirlo bajo la [GNU General Public License v3.0 o posterior](LICENSE). Las contribuciones se aceptan con el [CLA](CLA.md).
+
+© 2026 Antonio Cortazar Jimenez
